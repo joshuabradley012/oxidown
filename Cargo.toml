@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oxidown-core",
+    "crates/oxidown-wasm",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/joshuabradley012/oxidown"
+
+[workspace.dependencies]
+ropey = "1.6"
+pulldown-cmark = { version = "0.13", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# Optimize dependencies (ropey, pulldown-cmark) even in dev/test builds so the
+# perf smoke test measures something representative; our own crates stay debug.
+[profile.dev.package."*"]
+opt-level = 2

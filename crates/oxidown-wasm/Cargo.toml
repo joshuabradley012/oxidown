@@ -1,0 +1,17 @@
+[package]
+name = "oxidown-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wasm-bindgen boundary for oxidown-core, exposing the docs/boundary-v0.md TypeScript interface."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+oxidown-core = { path = "../oxidown-core" }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

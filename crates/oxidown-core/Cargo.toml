@@ -1,0 +1,14 @@
+[package]
+name = "oxidown-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Oxidown editor core: rope, markdown overlay, oplog/history, composition, decorations (M0 spike)."
+
+[dependencies]
+ropey = { workspace = true }
+pulldown-cmark = { workspace = true }
+
+[dev-dependencies]
+rand = "0.8"

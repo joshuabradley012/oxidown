@@ -1,0 +1,17 @@
+# Rust
+target/
+Cargo.lock
+
+# WASM build output
+crates/oxidown-wasm/pkg/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+.pnpm-store/
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/

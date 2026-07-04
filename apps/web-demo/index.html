@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Oxidown — M0 web demo</title>
+  </head>
+  <body>
+    <header id="chrome">
+      <strong>oxidown</strong>
+      <span id="core-banner" class="banner">core: …</span>
+      <label><input type="checkbox" id="source-toggle" /> Source mode</label>
+      <button id="load-large" type="button">Load large doc</button>
+      <span id="perf-hud" title="Last core call timings (measured JS-side)"></span>
+    </header>
+    <main id="editor"></main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
