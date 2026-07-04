@@ -142,3 +142,98 @@ describe("oxidown extension wiring (jsdom)", () => {
     view.destroy();
   });
 });
+
+describe("source mode (decorations: false)", () => {
+  function makeSourceView(doc: string, core: MockCore) {
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    return new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        extensions: [oxidown(core, { decorations: false, verifyMirror: true })],
+      }),
+    });
+  }
+
+  it("never builds decorations — not even via the mouseup rebuild path", async () => {
+    const core = new MockCore();
+    const spy = vi.spyOn(core, "decorations");
+    const view = makeSourceView("# Title\n\n**bold** text", core);
+    expect(spy).not.toHaveBeenCalled();
+
+    // Regression: clicking/highlighting used to repaint the decorated view.
+    // mousedown flows through CM6's event handlers; mouseup is window-level.
+    view.contentDOM.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    await flush();
+    view.dispatch({ changes: { from: 0, to: 0, insert: "x" } });
+    await flush();
+    expect(spy).not.toHaveBeenCalled();
+    // and edits still sync to the core
+    expect(core.getText()).toBe(view.state.doc.toString());
+    view.destroy();
+  });
+});
+
+describe("vertical-motion freeze (goal-column stability)", () => {
+  it("suppresses rebuilds during an Arrow run and catches up after the trailing delay", async () => {
+    vi.useFakeTimers();
+    try {
+      const core = new MockCore();
+      const spy = vi.spyOn(core, "decorations");
+      const view = makeView("line one\n\n**bold text is** the *thing*", core);
+      await vi.runAllTimersAsync(); // settle constructor build
+      const before = spy.mock.calls.length;
+
+      // Simulate what the Prec.high keymap does before each vertical command,
+      // then the selection change the command produces.
+      type P = { noteVerticalMotion(): void };
+      const plugins = (view as unknown as { plugins: { value: unknown }[] }).plugins
+        .map((p) => p.value)
+        .filter((v): v is P => !!v && typeof (v as P).noteVerticalMotion === "function");
+      expect(plugins.length).toBe(1);
+      const plugin = plugins[0];
+
+      plugin.noteVerticalMotion();
+      view.dispatch({ selection: { anchor: 9 } }); // "moved up"
+      plugin.noteVerticalMotion();
+      view.dispatch({ selection: { anchor: 14 } }); // "moved back down"
+      await vi.advanceTimersByTimeAsync(0);
+      // Frozen: no rebuild happened for either selection change.
+      expect(spy.mock.calls.length).toBe(before);
+
+      // Trailing timer (250ms) ends the run and performs ONE catch-up rebuild.
+      await vi.advanceTimersByTimeAsync(300);
+      expect(spy.mock.calls.length).toBe(before + 1);
+      view.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("typing ends the freeze immediately", async () => {
+    vi.useFakeTimers();
+    try {
+      const core = new MockCore();
+      const spy = vi.spyOn(core, "decorations");
+      const view = makeView("**bold**", core);
+      await vi.runAllTimersAsync();
+      const before = spy.mock.calls.length;
+
+      type P = { noteVerticalMotion(): void };
+      const plugin = (view as unknown as { plugins: { value: unknown }[] }).plugins
+        .map((p) => p.value)
+        .find((v): v is P => !!v && typeof (v as P).noteVerticalMotion === "function")!;
+
+      plugin.noteVerticalMotion();
+      view.dispatch({ changes: { from: 8, to: 8, insert: "x" } });
+      await vi.advanceTimersByTimeAsync(0);
+      // docChanged ends the gesture and rebuilds without waiting 250ms.
+      expect(spy.mock.calls.length).toBeGreaterThan(before);
+      view.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

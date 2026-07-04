@@ -2,6 +2,7 @@ import {
   Annotation,
   EditorSelection,
   type Extension,
+  Prec,
   type Range,
   type Transaction,
 } from "@codemirror/state";
@@ -78,16 +79,25 @@ function originOf(tr: Transaction, view: EditorView): EditOrigin {
   return "user";
 }
 
-function oxidownPlugin(core: OxidownCore, options: OxidownOptions) {
+function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
   const renderDecorations = options.decorations !== false;
   const verifyMirror = options.verifyMirror ?? defaultVerifyMirror;
 
-  return ViewPlugin.fromClass(
+  const plugin = ViewPlugin.fromClass(
     class OxidownView {
       decorations: DecorationSet = Decoration.none;
       private readonly view: EditorView;
       /** True between mousedown and mouseup: reveal recomputation is frozen. */
       dragging = false;
+      /**
+       * True during a run of vertical cursor motion (Arrow/Page Up/Down).
+       * Reveal recomputation is frozen so line geometry stays stable and
+       * CM6's goal column (a remembered visual X) keeps mapping to the same
+       * document positions — otherwise conceal/reveal width changes between
+       * an ArrowUp and the following ArrowDown make the cursor drift.
+       */
+      verticalMotion = false;
+      private verticalTimer: ReturnType<typeof setTimeout> | null = null;
       /** A rebuild is wanted (set by triggers, cleared by a successful rebuild). */
       dirty = false;
       /** Microtask guard: at most one rebuild flush per microtask batch/frame. */
@@ -145,10 +155,12 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions) {
         // Keep positions valid immediately; the real rebuild is coalesced.
         if (update.docChanged) {
           this.decorations = this.decorations.map(update.changes);
+          this.endVerticalMotion(); // typing ends the gesture
         }
         // 2) Recompute decorations on doc change, selection change, or
         //    viewport change — at most once per frame, and never while an IME
-        //    composition or a mouse drag-selection is in progress.
+        //    composition, a mouse drag-selection, or a vertical-motion run is
+        //    in progress (all three would shift geometry mid-gesture).
         if (update.docChanged || update.selectionSet || update.viewportChanged) {
           this.dirty = true;
           this.scheduleRebuild();
@@ -157,9 +169,32 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions) {
 
       destroy() {
         this.destroyed = true;
+        if (this.verticalTimer !== null) clearTimeout(this.verticalTimer);
         if (typeof window !== "undefined") {
           window.removeEventListener("mouseup", this.onWindowMouseUp);
         }
+      }
+
+      /**
+       * Called (from the vertical-motion keymap) BEFORE each Arrow/Page
+       * Up/Down command runs. Freezes rebuilds for the duration of the run;
+       * a trailing timer performs one rebuild shortly after the run ends so
+       * reveal state catches up with wherever the cursor stopped.
+       */
+      noteVerticalMotion() {
+        this.verticalMotion = true;
+        if (this.verticalTimer !== null) clearTimeout(this.verticalTimer);
+        this.verticalTimer = setTimeout(() => {
+          this.verticalTimer = null;
+          this.endVerticalMotion();
+        }, 250);
+      }
+
+      private endVerticalMotion() {
+        if (!this.verticalMotion) return;
+        this.verticalMotion = false;
+        this.dirty = true;
+        this.scheduleRebuild();
       }
 
       // -- rebuild machinery -------------------------------------------------
@@ -173,10 +208,14 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions) {
         });
       }
 
-      /** Rebuild now unless frozen (composition/drag) — those re-schedule on end. */
+      /** Rebuild now unless frozen (composition/drag/vertical run) — those re-schedule on end. */
       flushRebuild() {
+        // Source mode: decorations are disabled entirely. This guard must live
+        // HERE (the single build choke point), not only in update() — the
+        // mouseup and compositionend paths reach flushRebuild directly.
+        if (!renderDecorations) return;
         if (this.destroyed || !this.dirty) return;
-        if (this.view.composing || this.dragging) return; // frozen; dirty stays set
+        if (this.view.composing || this.dragging || this.verticalMotion) return; // frozen; dirty stays set
         this.dirty = false;
         const decos = this.buildDecorations();
         if (decos === this.decorations) return;
@@ -251,6 +290,26 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions) {
       },
     },
   );
+
+  // Observe vertical cursor motion BEFORE the default commands run (Prec.high),
+  // and return false so they still execute. Freezing rebuilds for the duration
+  // of an Arrow/Page Up/Down run keeps line geometry stable, so CM6's goal
+  // column (a remembered visual X) round-trips to the same document position.
+  const verticalKeys = ["ArrowUp", "ArrowDown", "PageUp", "PageDown"];
+  const observeVertical = (view: EditorView): boolean => {
+    view.plugin(plugin)?.noteVerticalMotion();
+    return false; // never consume — the default motion command runs next
+  };
+  const verticalMotionKeymap = Prec.high(
+    keymap.of(
+      verticalKeys.flatMap((key) => [
+        { key, run: observeVertical },
+        { key: `Shift-${key}`, run: observeVertical },
+      ]),
+    ),
+  );
+
+  return [plugin, verticalMotionKeymap];
 }
 
 function historyKeymap(core: OxidownCore): Extension {

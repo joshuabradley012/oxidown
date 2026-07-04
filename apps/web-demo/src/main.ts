@@ -93,6 +93,11 @@ const view = new EditorView({
 });
 view.focus();
 
+// Dev affordance: expose the view for debugging/automation (dev builds only).
+if (import.meta.env.DEV) {
+  (window as unknown as { __oxidownView?: EditorView }).__oxidownView = view;
+}
+
 // Source-mode toggle: swap out live-preview decorations; document syncing and
 // core-driven undo/redo keep working (the plugin re-attaches without reloading
 // the core, so history survives the toggle).
