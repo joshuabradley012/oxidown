@@ -9,7 +9,8 @@ import { describe, expect, it, vi } from "vitest";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { MockCore } from "../src/mock-core";
-import { oxidown } from "../src/extension";
+import { applyCoreChange, oxidown } from "../src/extension";
+import type { Decoration } from "../src/protocol";
 
 function makeView(doc: string, core: MockCore) {
   const parent = document.createElement("div");
@@ -235,5 +236,115 @@ describe("vertical-motion freeze (goal-column stability)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("v0.2 additions (M1)", () => {
+  it("applyCoreChange (commands/streaming) is not echoed back into applyEdit", async () => {
+    const core = new MockCore();
+    const applySpy = vi.spyOn(core, "applyEdit");
+    const view = makeView("hello world", core);
+    const callsAfterSetup = applySpy.mock.calls.length;
+
+    const change = core.command("toggleStrong", 6, 11);
+    expect(change).not.toBeNull();
+    applyCoreChange(view, change!, "oxidown.command");
+    expect(view.state.doc.toString()).toBe("hello **world**");
+    expect(core.getText()).toBe("hello **world**");
+    // The change came from the core already — forwarding it back into
+    // applyEdit would double-apply it and desync revisions.
+    expect(applySpy.mock.calls.length).toBe(callsAfterSetup);
+
+    // A plain (untagged) dispatch of an ordinary edit IS forwarded — proving
+    // the skip logic depends on the annotation, not some other heuristic.
+    view.dispatch({ changes: { from: 0, to: 0, insert: "X" } });
+    expect(applySpy.mock.calls.length).toBeGreaterThan(callsAfterSetup);
+    await flush();
+    view.destroy();
+  });
+
+  it("streaming appends (applyCoreChange with no selection) never move the user's cursor", async () => {
+    const core = new MockCore();
+    const view = makeView("top\n\nbottom", core);
+    // Park the cursor at the top of the document, as if the user were typing there.
+    view.dispatch({ selection: { anchor: 0 } });
+
+    const id = core.streamOpen(view.state.doc.length);
+    const change = core.streamAppend(id, " more");
+    expect(change.selection).toBeNull();
+    applyCoreChange(view, change, "oxidown.stream");
+    core.streamClose(id);
+
+    expect(view.state.doc.toString()).toBe("top\n\nbottom more");
+    // The stream's edit landed far below the cursor; the cursor must not move.
+    expect(view.state.selection.main.anchor).toBe(0);
+    await flush();
+    view.destroy();
+  });
+
+  it("task widget renders a checkbox; clicking it dispatches toggleTask via the CoreChange path", async () => {
+    const core = new MockCore();
+    const doc = "- [ ] buy milk";
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        // Cursor away from the checkbox's marker extent [0, 5) so it starts
+        // concealed (widget rendered) rather than revealed (delim mark).
+        selection: { anchor: doc.length },
+        extensions: [oxidown(core, { verifyMirror: true })],
+      }),
+    });
+    await flush();
+
+    const checkbox = view.contentDOM.querySelector(
+      "input.ox-task-checkbox",
+    ) as HTMLInputElement | null;
+    expect(checkbox).not.toBeNull();
+    expect(checkbox!.checked).toBe(false);
+
+    const applySpy = vi.spyOn(core, "applyEdit");
+    checkbox!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    await flush();
+
+    expect(core.getText()).toBe("- [x] buy milk");
+    expect(view.state.doc.toString()).toBe("- [x] buy milk");
+    // The toggle went through core.command → CoreChange → applyCoreChange,
+    // never through the ordinary applyEdit change-forwarding path.
+    expect(applySpy).not.toHaveBeenCalled();
+
+    const checkboxAfter = view.contentDOM.querySelector(
+      "input.ox-task-checkbox",
+    ) as HTMLInputElement | null;
+    expect(checkboxAfter!.checked).toBe(true);
+    view.destroy();
+  });
+
+  it("an unknown decoration style/widget kind from the core is ignored without crashing", async () => {
+    const core = new MockCore();
+    const view = makeView("hello world", core);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const fake: Decoration[] = [
+      { kind: "mark", from: 0, to: 5, style: "future-style" as never },
+      { kind: "line", at: 0, style: "future-line" as never },
+      { kind: "widget", from: 0, to: 1, widget: "future-widget" as never, checked: false },
+      { kind: "mark", from: 6, to: 11, style: "strong" }, // a known style alongside unknown ones
+    ];
+    const decoSpy = vi.spyOn(core, "decorations").mockReturnValue(fake);
+
+    view.dispatch({ selection: { anchor: 6 } });
+    await flush();
+    expect(errSpy).not.toHaveBeenCalled();
+
+    // The view keeps working normally afterward.
+    decoSpy.mockRestore();
+    view.dispatch({ changes: { from: 11, to: 11, insert: "!" } });
+    expect(core.getText()).toBe("hello world!");
+
+    errSpy.mockRestore();
+    await flush();
+    view.destroy();
   });
 });

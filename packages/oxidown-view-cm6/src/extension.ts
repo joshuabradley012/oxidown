@@ -13,23 +13,56 @@ import {
   keymap,
   ViewPlugin,
   type ViewUpdate,
+  WidgetType,
 } from "@codemirror/view";
 import type {
+  CoreChange,
   Decoration as CoreDecoration,
   EditOrigin,
   OxidownCore,
+  RangeCommandName,
   SelectionRange,
 } from "./protocol.js";
-import { changesToSplices, endOfLastSplice } from "./splices.js";
+import { changesToSplices } from "./splices.js";
 import { oxidownTheme } from "./theme.js";
 
 export { changesToSplices, endOfLastSplice } from "./splices.js";
 
 /**
- * Private annotation tagging transactions produced by core-driven undo/redo.
- * The change-forwarding path skips these — the core already applied them.
+ * Private annotation tagging transactions produced by core-driven changes
+ * (undo/redo, commands, streaming). The change-forwarding path skips these —
+ * the core already applied them; echoing them back into applyEdit would
+ * double-apply the edit and desync revisions.
  */
-const oxidownHistory = Annotation.define<"undo" | "redo">();
+const oxidownSkip = Annotation.define<true>();
+
+/**
+ * Apply a CoreChange (the shape shared by undo/redo/command/streamAppend) to
+ * the view: one transaction, splices tagged with the skip annotation so they
+ * are never echoed back into applyEdit.
+ *
+ * Selection handling is deliberate: when the core supplies a `selection`
+ * (undo/redo/most commands), the view places the cursor there and scrolls it
+ * into view. When it does NOT (streaming appends, checkbox toggles), the
+ * dispatch omits `selection` entirely — CM6's default behavior then maps the
+ * user's CURRENT selection through the change instead of moving it. This is
+ * what lets the user keep typing at the top of the document while an AI
+ * stream appends far below: the stream's edits never touch their cursor.
+ */
+export function applyCoreChange(view: EditorView, change: CoreChange, userEvent: string): void {
+  if (change.splices.length === 0 && !change.selection) return;
+  const changes = change.splices.map((s) => ({ from: s.at, to: s.at + s.delete, insert: s.insert }));
+  const selection = change.selection
+    ? EditorSelection.single(change.selection.anchor, change.selection.head)
+    : undefined;
+  view.dispatch({
+    changes,
+    selection,
+    annotations: oxidownSkip.of(true),
+    scrollIntoView: Boolean(change.selection),
+    userEvent,
+  });
+}
 
 export interface OxidownOptions {
   /**
@@ -57,11 +90,18 @@ const defaultVerifyMirror = (() => {
 
 // Decoration builders (marks/conceals are `mark` decorations — characters are
 // NEVER removed or replaced in the DOM; conceal is a visual collapse only).
+// v0.2 adds strike/link/url/list-marker mark styles and blockquote/code-fence/
+// code-block/hr line styles — same technique, new vocabulary (docs/boundary-v0.md
+// "Expanded decoration vocabulary"). Unknown styles are ignored (forward compat).
 const markDecos = {
   strong: Decoration.mark({ class: "ox-strong" }),
   em: Decoration.mark({ class: "ox-em" }),
   code: Decoration.mark({ class: "ox-code" }),
   delim: Decoration.mark({ class: "ox-delim" }),
+  strike: Decoration.mark({ class: "ox-strike" }),
+  link: Decoration.mark({ class: "ox-link" }),
+  url: Decoration.mark({ class: "ox-url" }),
+  "list-marker": Decoration.mark({ class: "ox-list-marker" }),
 } as const;
 const concealDeco = Decoration.mark({ class: "ox-conceal" });
 const lineDecos = {
@@ -71,7 +111,74 @@ const lineDecos = {
   h4: Decoration.line({ class: "ox-h4" }),
   h5: Decoration.line({ class: "ox-h5" }),
   h6: Decoration.line({ class: "ox-h6" }),
+  "code-block": Decoration.line({ class: "ox-code-block" }),
+  "code-fence": Decoration.line({ class: "ox-code-fence" }),
+  hr: Decoration.line({ class: "ox-hr" }),
 } as const;
+
+/** Blockquote line decorations are depth-dependent; cache one per depth (capped at 3 for styling). */
+const blockquoteLineDecos = new Map<number, Decoration>();
+function blockquoteLineDeco(depth: number): Decoration {
+  const capped = Math.max(1, Math.min(depth, 3));
+  let deco = blockquoteLineDecos.get(capped);
+  if (!deco) {
+    deco = Decoration.line({ class: `ox-blockquote ox-bq-${capped}` });
+    blockquoteLineDecos.set(capped, deco);
+  }
+  return deco;
+}
+
+/**
+ * The project's first widget island: a task-list checkbox that replaces the
+ * "[ ]"/"[x]" source span. `ignoreEvent` tells CM6 to leave DOM events on
+ * this widget alone (it never becomes a cursor position or selection target);
+ * the click handler is the only thing that reacts, and it goes through the
+ * SAME core-driven-change path as everything else (core.command → CoreChange
+ * → applyCoreChange) rather than mutating the DOM/doc directly.
+ */
+class TaskCheckboxWidget extends WidgetType {
+  constructor(
+    private readonly checked: boolean,
+    private readonly pos: number,
+    private readonly core: OxidownCore,
+  ) {
+    super();
+  }
+
+  eq(other: TaskCheckboxWidget): boolean {
+    return other.checked === this.checked && other.pos === this.pos;
+  }
+
+  toDOM(view: EditorView): HTMLElement {
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.className = "ox-task-checkbox";
+    input.checked = this.checked;
+    input.addEventListener("click", (event) => {
+      // Prevent the browser's own default checkbox toggle: the core is the
+      // only source of truth for `checked` — the next decoration rebuild
+      // reflects whatever the core returns, not the DOM's own click default.
+      event.preventDefault();
+      let change: CoreChange | null;
+      try {
+        change = this.core.command("toggleTask", this.pos);
+      } catch (err) {
+        console.error(
+          "[oxidown] core error during command(toggleTask) — re-loading core from view buffer:",
+          err,
+        );
+        this.core.load(view.state.doc.toString());
+        return;
+      }
+      if (change) applyCoreChange(view, change, "oxidown.command");
+    });
+    return input;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
 
 function originOf(tr: Transaction, view: EditorView): EditOrigin {
   if (tr.isUserEvent("input.paste") || tr.isUserEvent("input.drop")) return "paste";
@@ -131,7 +238,7 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         //    original-doc coordinates, matching ChangeSet semantics).
         for (const tr of update.transactions) {
           if (!tr.docChanged) continue;
-          if (tr.annotation(oxidownHistory)) continue; // core-driven history: already applied core-side
+          if (tr.annotation(oxidownSkip)) continue; // core-driven change: already applied core-side
           const splices = changesToSplices(tr.changes);
           try {
             core.applyEdit(core.revision(), splices, originOf(tr, this.view));
@@ -251,14 +358,34 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         try {
           const ranges: Range<Decoration>[] = [];
           for (const d of decos) {
+            // Forward compatibility: views MUST ignore decoration styles and
+            // widget kinds they don't recognize (docs/boundary-v0.md v0.2).
             if (d.kind === "line") {
+              if (d.style === "blockquote") {
+                const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
+                ranges.push(blockquoteLineDeco(d.depth ?? 1).range(line.from));
+                continue;
+              }
+              const deco = lineDecos[d.style as keyof typeof lineDecos];
+              if (!deco) continue; // unrecognized line style: ignore
               const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
-              ranges.push(lineDecos[d.style].range(line.from));
+              ranges.push(deco.range(line.from));
             } else if (d.kind === "mark") {
-              if (d.to > d.from) ranges.push(markDecos[d.style].range(d.from, d.to));
-            } else {
+              const deco = markDecos[d.style as keyof typeof markDecos];
+              if (!deco) continue; // unrecognized mark style: ignore
+              if (d.to > d.from) ranges.push(deco.range(d.from, d.to));
+            } else if (d.kind === "conceal") {
               // conceal: mark decoration — never a replace; chars stay in the DOM
               if (d.to > d.from) ranges.push(concealDeco.range(d.from, d.to));
+            } else if (d.kind === "widget") {
+              if (d.widget === "task" && d.to > d.from) {
+                ranges.push(
+                  Decoration.replace({
+                    widget: new TaskCheckboxWidget(d.checked, d.from, core),
+                  }).range(d.from, d.to),
+                );
+              }
+              // unrecognized widget kinds: ignore
             }
           }
           return Decoration.set(ranges, true);
@@ -317,21 +444,7 @@ function historyKeymap(core: OxidownCore): Extension {
     (kind: "undo" | "redo") =>
     (view: EditorView): boolean => {
       const result = kind === "undo" ? core.undo() : core.redo();
-      if (result && result.splices.length > 0) {
-        const changes = result.splices.map((s) => ({
-          from: s.at,
-          to: s.at + s.delete,
-          insert: s.insert,
-        }));
-        const cursor = endOfLastSplice(result.splices);
-        view.dispatch({
-          changes,
-          selection: cursor === null ? undefined : EditorSelection.cursor(cursor),
-          annotations: oxidownHistory.of(kind),
-          scrollIntoView: true,
-          userEvent: kind,
-        });
-      }
+      if (result) applyCoreChange(view, result, kind);
       return true; // always consume; never fall through to native undo
     };
   return keymap.of([
@@ -342,19 +455,61 @@ function historyKeymap(core: OxidownCore): Extension {
 }
 
 /**
+ * Mod-b/i/Shift-x/e toggle strong/em/strike/code over the current selection
+ * via `core.command` — the same core-driven-change path as undo/redo and
+ * streaming (command → CoreChange → applyCoreChange).
+ */
+function commandKeymap(core: OxidownCore): Extension {
+  const runToggle =
+    (name: RangeCommandName) =>
+    (view: EditorView): boolean => {
+      const { from, to } = view.state.selection.main;
+      let change: CoreChange | null;
+      try {
+        change = core.command(name, from, to);
+      } catch (err) {
+        console.error(
+          `[oxidown] core error during command(${name}) — re-loading core from view buffer:`,
+          err,
+        );
+        core.load(view.state.doc.toString());
+        return true;
+      }
+      if (change) applyCoreChange(view, change, "oxidown.command");
+      return true;
+    };
+  return keymap.of([
+    { key: "Mod-b", run: runToggle("toggleStrong"), preventDefault: true },
+    { key: "Mod-i", run: runToggle("toggleEm"), preventDefault: true },
+    { key: "Mod-Shift-x", run: runToggle("toggleStrike"), preventDefault: true },
+    { key: "Mod-e", run: runToggle("toggleCode"), preventDefault: true },
+  ]);
+}
+
+/**
+ * Mod-b / Mod-i / Mod-Shift-x / Mod-e keymap for toggleStrong/toggleEm/
+ * toggleStrike/toggleCode over the current selection. Exported standalone so
+ * it can be composed elsewhere; included in `oxidown()` by default.
+ */
+export function oxidownCommands(core: OxidownCore): Extension {
+  return commandKeymap(core);
+}
+
+/**
  * The Oxidown CM6 integration.
  *
  * - Forwards every document change to `core.applyEdit` (splices in
  *   original-doc coordinates, ascending — CM6 ChangeSet semantics).
- * - Renders core-computed decorations (mark/conceal/line) for the viewport,
- *   recomputing at most once per frame and never during IME composition or
- *   mouse drag-selection (the anti-flicker playbook, research/01 §4).
- * - Binds Mod-z / Mod-y / Mod-Shift-z to CORE-DRIVEN undo/redo.
+ * - Renders core-computed decorations (mark/conceal/line/widget) for the
+ *   viewport, recomputing at most once per frame and never during IME
+ *   composition or mouse drag-selection (the anti-flicker playbook, research/01 §4).
+ * - Binds Mod-z / Mod-y / Mod-Shift-z to CORE-DRIVEN undo/redo, and
+ *   Mod-b / Mod-i / Mod-Shift-x / Mod-e to CORE-DRIVEN formatting commands.
  *
  * IMPORTANT: do NOT include CM6's own history extension
  * (`@codemirror/commands` `history()` / `historyKeymap`) alongside this one —
  * the core is the only historian, and two undo systems will fight.
  */
 export function oxidown(core: OxidownCore, options: OxidownOptions = {}): Extension {
-  return [oxidownPlugin(core, options), historyKeymap(core), oxidownTheme];
+  return [oxidownPlugin(core, options), historyKeymap(core), oxidownCommands(core), oxidownTheme];
 }

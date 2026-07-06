@@ -119,6 +119,32 @@ impl TextBuffer {
     pub fn text(&self) -> String {
         self.rope.to_string()
     }
+
+    /// The raw byte at `idx`, or `None` past the end. Used for cheap
+    /// single-byte probes (e.g. "is the previous byte a newline"); safe on
+    /// any index — no char-boundary requirement.
+    pub fn byte_at(&self, idx: usize) -> Option<u8> {
+        (idx < self.rope.len_bytes()).then(|| self.rope.byte(idx))
+    }
+
+    /// Byte range of the line containing `byte` (char-boundary aligned),
+    /// excluding the trailing line terminator (`\n` or `\r\n`).
+    pub fn line_range_at(&self, byte: usize) -> Range<usize> {
+        let line = self.rope.byte_to_line(byte.min(self.rope.len_bytes()));
+        let start = self.rope.line_to_byte(line);
+        let mut end = if line + 1 < self.rope.len_lines() {
+            self.rope.line_to_byte(line + 1)
+        } else {
+            self.rope.len_bytes()
+        };
+        if end > start && self.rope.byte(end - 1) == b'\n' {
+            end -= 1;
+        }
+        if end > start && self.rope.byte(end - 1) == b'\r' {
+            end -= 1;
+        }
+        start..end
+    }
 }
 
 #[cfg(test)]

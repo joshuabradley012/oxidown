@@ -12,19 +12,39 @@
  *     `js_name` to the same effect):
  *       load(text: string): number
  *       applyEdit(baseRevision: number, splices: JsValue /* Splice[] *\/, origin: string): number
- *       undo(): { revision, splices } | null | undefined
- *       redo(): { revision, splices } | null | undefined
+ *       undo(): CoreChange | null | undefined
+ *       redo(): CoreChange | null | undefined
  *       decorations(revision, from, to, selections: JsValue): Decoration[]
  *       compositionBegin(from: number, to: number): void
  *       compositionEnd(): void
  *       getText(): string
  *       docLength(): number
  *       revision(): number
- *   - splices/selections/decorations cross the boundary as plain JS values
- *     (serde-wasm-bindgen style); errors surface as thrown JS exceptions.
+ *
+ *   v0.2 (M1) additions — same guessing style, assumed camelCase 1:1 with the
+ *   contract (docs/boundary-v0.md "v0.2 additions"):
+ *       createAnchor(pos: number, bias: string): number
+ *       resolveAnchor(id: number): number | null | undefined
+ *       dropAnchor(id: number): void
+ *       command(name: string, a: number, b?: number): CoreChange | null | undefined
+ *         — TS's overloaded `command(name, from, to)` / `command(name,
+ *           pos, level)` / `command(name, pos)` signatures don't exist at
+ *           the JS/wasm-bindgen call boundary; we ASSUME the exported Rust
+ *           fn is a single method taking the variant's positional args with
+ *           the trailing one optional (`b?`), dispatched by `name` Rust-side.
+ *           If the real crate instead exports one method per command name
+ *           (`toggleStrong`, `setHeading`, ...), only this file's `command`
+ *           wrapper needs to change.
+ *       streamOpen(pos: number): number
+ *       streamAppend(id: number, chunk: string): CoreChange
+ *       streamClose(id: number): void
+ *
+ *   splices/selections/decorations cross the boundary as plain JS values
+ *   (serde-wasm-bindgen style); errors surface as thrown JS exceptions.
  */
 
 import type {
+  CoreChange,
   Decoration,
   EditOrigin,
   OxidownCore,
@@ -36,14 +56,23 @@ import type {
 interface WasmCoreInstance {
   load(text: string): number;
   applyEdit(baseRevision: number, splices: unknown, origin: string): number;
-  undo(): { revision: number; splices: Splice[] } | null | undefined;
-  redo(): { revision: number; splices: Splice[] } | null | undefined;
+  undo(): CoreChange | null | undefined;
+  redo(): CoreChange | null | undefined;
   decorations(revision: number, from: number, to: number, selections: unknown): Decoration[];
   compositionBegin(from: number, to: number): void;
   compositionEnd(): void;
   getText(): string;
   docLength(): number;
   revision(): number;
+
+  // v0.2 additions
+  createAnchor(pos: number, bias: string): number;
+  resolveAnchor(id: number): number | null | undefined;
+  dropAnchor(id: number): void;
+  command(name: string, a: number, b?: number): CoreChange | null | undefined;
+  streamOpen(pos: number): number;
+  streamAppend(id: number, chunk: string): CoreChange;
+  streamClose(id: number): void;
 }
 
 /** Thin adapter: normalizes null/undefined and keeps payloads as plain values. */
@@ -61,6 +90,18 @@ function adaptWasmCore(inner: WasmCoreInstance): OxidownCore {
     getText: () => inner.getText(),
     docLength: () => inner.docLength(),
     revision: () => inner.revision(),
+
+    createAnchor: (pos: number, bias: "before" | "after") => inner.createAnchor(pos, bias),
+    resolveAnchor: (id: number) => inner.resolveAnchor(id) ?? null,
+    dropAnchor: (id: number) => inner.dropAnchor(id),
+
+    // Overloaded at the TS surface; a single (name, a, b?) call underneath.
+    command: ((name: string, a: number, b?: number) =>
+      inner.command(name, a, b) ?? null) as OxidownCore["command"],
+
+    streamOpen: (pos: number) => inner.streamOpen(pos),
+    streamAppend: (id: number, chunk: string) => inner.streamAppend(id, chunk),
+    streamClose: (id: number) => inner.streamClose(id),
   };
 }
 

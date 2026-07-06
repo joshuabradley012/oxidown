@@ -15,10 +15,17 @@ pub enum EditOrigin {
     Paste,
     Undo,
     Redo,
+    /// M1: command ops (`toggleStrong`, `setHeading`, …). Never coalesces.
+    Command,
+    /// M1: AI stream ops (`stream_append`). Never coalesces via the normal
+    /// path — stream chunks merge into their stream's single undo unit
+    /// through `History::record_stream_append` instead.
+    Ai,
 }
 
 impl EditOrigin {
-    /// Parse the boundary string form ("user" | "ime" | "paste" | "undo" | "redo").
+    /// Parse the boundary string form
+    /// ("user" | "ime" | "paste" | "undo" | "redo" | "command" | "ai").
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "user" => Some(EditOrigin::User),
@@ -26,6 +33,8 @@ impl EditOrigin {
             "paste" => Some(EditOrigin::Paste),
             "undo" => Some(EditOrigin::Undo),
             "redo" => Some(EditOrigin::Redo),
+            "command" => Some(EditOrigin::Command),
+            "ai" => Some(EditOrigin::Ai),
             _ => None,
         }
     }
@@ -37,6 +46,8 @@ impl EditOrigin {
             EditOrigin::Paste => "paste",
             EditOrigin::Undo => "undo",
             EditOrigin::Redo => "redo",
+            EditOrigin::Command => "command",
+            EditOrigin::Ai => "ai",
         }
     }
 }

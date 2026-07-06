@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (test + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Perf smoke test (informational, non-fatal)
+        run: |
+          echo "::group::perf smoke (--ignored, release, non-fatal)"
+          cargo test --release -p oxidown-core -- --ignored --nocapture || true
+          echo "::endgroup::"
+
+  wasm:
+    name: Wasm build + size budget
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm32-unknown-unknown target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@wasm-pack
+
+      - name: wasm-pack build
+        run: wasm-pack build crates/oxidown-wasm --target web --out-dir pkg
+
+      - name: Report wasm size + enforce budget
+        run: |
+          set -euo pipefail
+
+          WASM_FILE=$(find crates/oxidown-wasm/pkg -maxdepth 1 -name '*.wasm' | head -n1)
+          if [ -z "${WASM_FILE}" ]; then
+            echo "::error::No .wasm file found in crates/oxidown-wasm/pkg after wasm-pack build"
+            exit 1
+          fi
+
+          RAW_BYTES=$(wc -c < "${WASM_FILE}")
+          GZIP_BYTES=$(gzip -c "${WASM_FILE}" | wc -c)
+          BUDGET_BYTES=$((400 * 1024))
+
+          RAW_KB=$(awk "BEGIN { printf \"%.1f\", ${RAW_BYTES}/1024 }")
+          GZIP_KB=$(awk "BEGIN { printf \"%.1f\", ${GZIP_BYTES}/1024 }")
+          BUDGET_KB=$(awk "BEGIN { printf \"%.1f\", ${BUDGET_BYTES}/1024 }")
+
+          {
+            echo "### Wasm bundle size"
+            echo ""
+            echo "| File | Raw | Gzipped | Budget (gzip) |"
+            echo "|---|---|---|---|"
+            echo "| \`$(basename "${WASM_FILE}")\` | ${RAW_KB} KB | ${GZIP_KB} KB | ${BUDGET_KB} KB |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "raw:   ${RAW_BYTES} bytes (${RAW_KB} KB)"
+          echo "gzip:  ${GZIP_BYTES} bytes (${GZIP_KB} KB)"
+          echo "budget: ${BUDGET_BYTES} bytes (${BUDGET_KB} KB, gzipped)"
+
+          if [ "${GZIP_BYTES}" -gt "${BUDGET_BYTES}" ]; then
+            echo "::error::Gzipped wasm size ${GZIP_BYTES} bytes exceeds the ${BUDGET_BYTES}-byte (400KB) budget"
+            exit 1
+          fi
+
+  web:
+    name: pnpm build + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Detect packageManager field
+        id: pm
+        run: |
+          if grep -q '"packageManager"' package.json; then
+            echo "present=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "present=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # If package.json pins a pnpm version via "packageManager", let the
+      # action read it (Corepack-style). Otherwise fall back to the pinned
+      # 11.x line that's known-green locally (pnpm 11.9.0).
+      - name: Setup pnpm (from packageManager field)
+        if: steps.pm.outputs.present == 'true'
+        uses: pnpm/action-setup@v6
+
+      - name: Setup pnpm (pinned 11.x)
+        if: steps.pm.outputs.present != 'true'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm -r build
+
+      - name: Test
+        run: pnpm -r test

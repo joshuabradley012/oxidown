@@ -15,6 +15,8 @@ pub enum CoreError {
     SurrogateSplit { pos: usize },
     /// A range with `from > to`.
     InvalidRange { from: usize, to: usize },
+    /// `stream_append` on an id that was never opened or is already closed.
+    UnknownStream { id: u64 },
 }
 
 impl CoreError {
@@ -26,6 +28,7 @@ impl CoreError {
             CoreError::OutOfBounds { .. } => "OutOfBounds",
             CoreError::SurrogateSplit { .. } => "SurrogateSplit",
             CoreError::InvalidRange { .. } => "InvalidRange",
+            CoreError::UnknownStream { .. } => "UnknownStream",
         }
     }
 }
@@ -50,6 +53,9 @@ impl fmt::Display for CoreError {
             ),
             CoreError::InvalidRange { from, to } => {
                 write!(f, "InvalidRange: from {from} > to {to}")
+            }
+            CoreError::UnknownStream { id } => {
+                write!(f, "UnknownStream: stream {id} is unknown or already closed")
             }
         }
     }

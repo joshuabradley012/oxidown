@@ -1,6 +1,7 @@
 //! wasm-bindgen boundary for `oxidown-core`, exposing the `OxidownCore`
-//! TypeScript interface from docs/boundary-v0.md. Positions are already
-//! UTF-16 code units at the core API, so this is a thin shim.
+//! TypeScript interface from docs/boundary-v0.md (v0/v0.1 plus the v0.2 M1
+//! additions). Positions are already UTF-16 code units at the core API, so
+//! this is a thin shim.
 //!
 //! Payload strategy: structured values (splice batches in, decoration/splice
 //! batches out) cross the boundary as **one JSON string** per call —
@@ -12,6 +13,11 @@
 //! single large blobs are fine") and it keeps this crate's dependency
 //! surface to `serde_json` only.
 //!
+//! Wire shapes (v0.2): `undo`/`redo`/`command`/`streamAppend` all return the
+//! `CoreChange` shape `{ revision, splices, selection? }`; M1 line styles
+//! serialize as `{ kind: "line", at, style, depth? }` and task checkboxes as
+//! `{ kind: "widget", from, to, widget: "task", checked }`.
+//!
 //! Timestamps: the core never reads clocks (std::time panics on
 //! wasm32-unknown-unknown); `applyEdit` injects `js_sys::Date::now()`.
 //!
@@ -22,7 +28,9 @@
 //! No `rand`/`getrandom`: `replica_id` is a constructor parameter
 //! (default 1).
 
-use oxidown_core::{CoreError, Decoration, EditOrigin, Editor, HistoryResult, SelectionRange, Splice};
+use oxidown_core::{
+    Bias, Command, CoreChange, CoreError, Decoration, EditOrigin, Editor, SelectionRange, Splice,
+};
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
@@ -60,17 +68,36 @@ fn to_js(value: &serde_json::Value) -> Result<JsValue, JsError> {
         .map_err(|_| JsError::new("InternalError: produced invalid JSON"))
 }
 
-fn history_to_js(result: Option<HistoryResult>) -> Result<JsValue, JsError> {
-    match result {
+fn splices_json(splices: &[Splice]) -> serde_json::Value {
+    serde_json::Value::Array(
+        splices
+            .iter()
+            .map(|s| {
+                json!({
+                    "at": s.at,
+                    "delete": s.delete,
+                    "insert": s.insert,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn core_change_json(change: &CoreChange) -> serde_json::Value {
+    let mut obj = json!({
+        "revision": change.revision,
+        "splices": splices_json(&change.splices),
+    });
+    if let Some(sel) = &change.selection {
+        obj["selection"] = json!({ "anchor": sel.anchor, "head": sel.head });
+    }
+    obj
+}
+
+fn change_to_js(change: Option<CoreChange>) -> Result<JsValue, JsError> {
+    match change {
         None => Ok(JsValue::NULL),
-        Some(r) => to_js(&json!({
-            "revision": r.revision,
-            "splices": r.splices.iter().map(|s| json!({
-                "at": s.at,
-                "delete": s.delete,
-                "insert": s.insert,
-            })).collect::<Vec<_>>(),
-        })),
+        Some(c) => to_js(&core_change_json(&c)),
     }
 }
 
@@ -91,6 +118,24 @@ fn decoration_json(d: &Decoration) -> serde_json::Value {
             "kind": "line",
             "at": at,
             "style": format!("h{level}"),
+        }),
+        Decoration::Block { at, style } => {
+            let mut obj = json!({
+                "kind": "line",
+                "at": at,
+                "style": style.as_str(),
+            });
+            if let Some(depth) = style.depth() {
+                obj["depth"] = json!(depth);
+            }
+            obj
+        }
+        Decoration::Widget { from, to, checked } => json!({
+            "kind": "widget",
+            "from": from,
+            "to": to,
+            "widget": "task",
+            "checked": checked,
         }),
     }
 }
@@ -142,14 +187,16 @@ impl OxidownCore {
             .map_err(core_err)
     }
 
-    /// `{ revision, splices } | null` — splices in current-doc coordinates.
+    /// `CoreChange | null` — splices in current-doc coordinates plus
+    /// optional cursor placement (v0.2 shape; supersets the v0 shape).
     pub fn undo(&mut self) -> Result<JsValue, JsError> {
-        history_to_js(self.inner.undo())
+        change_to_js(self.inner.undo())
     }
 
-    /// `{ revision, splices } | null` — splices in current-doc coordinates.
+    /// `CoreChange | null` — splices in current-doc coordinates plus
+    /// optional cursor placement (v0.2 shape; supersets the v0 shape).
     pub fn redo(&mut self) -> Result<JsValue, JsError> {
-        history_to_js(self.inner.redo())
+        change_to_js(self.inner.redo())
     }
 
     /// `Decoration[]` for viewport `[from, to)` against `revision` (must be
@@ -188,6 +235,110 @@ impl OxidownCore {
     pub fn composition_end(&mut self) {
         self.inner.composition_end();
     }
+
+    // ---- anchors (v0.2) --------------------------------------------------
+
+    /// `createAnchor(pos, bias)` — bias is `"before"` or `"after"`. Returns
+    /// the anchor id.
+    #[wasm_bindgen(js_name = createAnchor)]
+    pub fn create_anchor(&mut self, pos: u32, bias: &str) -> Result<f64, JsError> {
+        let bias = match bias {
+            "before" => Bias::Before,
+            "after" => Bias::After,
+            other => return Err(JsError::new(&format!("InvalidBias: {other:?}"))),
+        };
+        self.inner
+            .create_anchor(pos as usize, bias)
+            .map(|id| id as f64)
+            .map_err(core_err)
+    }
+
+    /// Current position of the anchor, or `null` if unresolvable
+    /// (unknown/dropped id, or the document was replaced by `load`).
+    #[wasm_bindgen(js_name = resolveAnchor)]
+    pub fn resolve_anchor(&self, id: f64) -> JsValue {
+        match self.inner.resolve_anchor(id as u64) {
+            Some(pos) => JsValue::from_f64(pos as f64),
+            None => JsValue::NULL,
+        }
+    }
+
+    #[wasm_bindgen(js_name = dropAnchor)]
+    pub fn drop_anchor(&mut self, id: f64) {
+        self.inner.drop_anchor(id as u64);
+    }
+
+    // ---- commands (v0.2) -------------------------------------------------
+
+    /// Flattened command entry point:
+    /// - `command("toggleStrong"|"toggleEm"|"toggleStrike"|"toggleCode", from, to)`
+    /// - `command("setHeading", pos, level)` (level 0–6; 0 = paragraph)
+    /// - `command("toggleTask", pos)`
+    ///
+    /// Returns `CoreChange | null` (`null` when the command doesn't apply at
+    /// the target). Throws on unknown names, missing arguments, or invalid
+    /// positions.
+    pub fn command(&mut self, name: &str, a: f64, b: Option<f64>) -> Result<JsValue, JsError> {
+        let need_b = |what: &str| -> Result<f64, JsError> {
+            b.ok_or_else(|| JsError::new(&format!("InvalidArgs: {name} requires {what}")))
+        };
+        let cmd = match name {
+            "toggleStrong" | "toggleEm" | "toggleStrike" | "toggleCode" => {
+                let from = a as usize;
+                let to = need_b("a `to` position")? as usize;
+                match name {
+                    "toggleStrong" => Command::ToggleStrong { from, to },
+                    "toggleEm" => Command::ToggleEm { from, to },
+                    "toggleStrike" => Command::ToggleStrike { from, to },
+                    _ => Command::ToggleCode { from, to },
+                }
+            }
+            "setHeading" => {
+                let level = need_b("a heading level")?;
+                if !(0.0..=6.0).contains(&level) || level.fract() != 0.0 {
+                    return Err(JsError::new(&format!(
+                        "InvalidArgs: setHeading level must be an integer 0..=6, got {level}"
+                    )));
+                }
+                Command::SetHeading {
+                    pos: a as usize,
+                    level: level as u8,
+                }
+            }
+            "toggleTask" => Command::ToggleTask { pos: a as usize },
+            other => return Err(JsError::new(&format!("InvalidCommand: {other:?}"))),
+        };
+        change_to_js(self.inner.command(cmd).map_err(core_err)?)
+    }
+
+    // ---- streaming (v0.2) ------------------------------------------------
+
+    /// Open a stream at `pos`; the insertion point becomes an internal
+    /// after-bias anchor. Returns the stream id.
+    #[wasm_bindgen(js_name = streamOpen)]
+    pub fn stream_open(&mut self, pos: u32) -> Result<f64, JsError> {
+        self.inner
+            .stream_open(pos as usize)
+            .map(|id| id as f64)
+            .map_err(core_err)
+    }
+
+    /// Append a chunk; returns `CoreChange` (splices for the view to apply
+    /// under its skip annotation). Throws `UnknownStream` on never-opened or
+    /// closed ids.
+    #[wasm_bindgen(js_name = streamAppend)]
+    pub fn stream_append(&mut self, id: f64, chunk: &str) -> Result<JsValue, JsError> {
+        let change = self.inner.stream_append(id as u64, chunk).map_err(core_err)?;
+        change_to_js(Some(change))
+    }
+
+    /// Close a stream. No-op on unknown/already-closed ids.
+    #[wasm_bindgen(js_name = streamClose)]
+    pub fn stream_close(&mut self, id: f64) {
+        self.inner.stream_close(id as u64);
+    }
+
+    // ---- debug/verification ----------------------------------------------
 
     #[wasm_bindgen(js_name = getText)]
     pub fn get_text(&self) -> String {

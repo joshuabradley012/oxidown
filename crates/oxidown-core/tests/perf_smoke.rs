@@ -49,7 +49,7 @@ fn apply_edit_plus_decorations_under_5ms_on_100kb() {
         // each run so positions near multiples are fine — we insert at an
         // ASCII-only region by choosing a position right after a newline).
         let raw = (i * 331) % len16;
-        let pos = nearest_boundary(&ed, raw);
+        let pos = nearest_boundary(&mut ed, raw);
 
         let t = Instant::now();
         rev = ed
@@ -65,8 +65,9 @@ fn apply_edit_plus_decorations_under_5ms_on_100kb() {
         // Snapping the viewport to valid boundaries is a test artifact
         // (a real view passes positions from its own buffer), so it is
         // excluded from the measurement.
-        let vp_from = nearest_boundary(&ed, pos.saturating_sub(viewport_cu / 2));
-        let vp_to = nearest_boundary(&ed, (vp_from + viewport_cu).min(ed.doc_len_utf16()));
+        let vp_from = nearest_boundary(&mut ed, pos.saturating_sub(viewport_cu / 2));
+        let vp_raw = (vp_from + viewport_cu).min(ed.doc_len_utf16());
+        let vp_to = nearest_boundary(&mut ed, vp_raw);
 
         let t = Instant::now();
         let _decos = ed
@@ -98,12 +99,23 @@ fn apply_edit_plus_decorations_under_5ms_on_100kb() {
 }
 
 /// Snap a raw CU offset to a valid boundary (never inside a surrogate pair).
-fn nearest_boundary(ed: &Editor, raw: usize) -> usize {
+///
+/// Probes with an all-no-op splice batch: `apply_edit` strictly validates
+/// splice positions (SurrogateSplit) BEFORE discovering the batch is a
+/// no-op, and a no-op batch never mutates or bumps the revision — so this
+/// is a pure validity check. (The previous probe used `decorations(pos,
+/// pos)`, which stopped rejecting mid-surrogate positions when contract
+/// v0.1 made query positions SNAP instead of error — a latent test-helper
+/// bug that let strict `apply_edit` positions through unvalidated.)
+fn nearest_boundary(ed: &mut Editor, raw: usize) -> usize {
     let mut pos = raw.min(ed.doc_len_utf16());
-    // Probe with a zero-length no-op decoration call; instead just try the
-    // conversion via a 0-delete splice validation path: walk down until valid.
     loop {
-        let probe = ed.decorations(ed.revision(), pos, pos, &[]);
+        let probe = ed.apply_edit(
+            ed.revision(),
+            &[Splice { at: pos, delete: 0, insert: String::new() }],
+            EditOrigin::User,
+            0.0,
+        );
         match probe {
             Ok(_) => return pos,
             Err(_) if pos > 0 => pos -= 1,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MockCore, applySplices } from "../src/mock-core";
-import type { Decoration, SelectionRange, Splice } from "../src/protocol";
+import type { Decoration, RangeCommandName, SelectionRange, Splice } from "../src/protocol";
 
 function makeCore(text: string) {
   let t = 0;
@@ -459,5 +459,296 @@ describe("MockCore composition stability rule", () => {
       { kind: "mark", from: 13, to: 15, style: "delim" },
     ]);
     core.compositionEnd();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.2 (M1) additions
+// ---------------------------------------------------------------------------
+
+describe("MockCore decorations — M1 subset (v0.2)", () => {
+  it("strikethrough ~~x~~: content mark + delimiter conceals", () => {
+    const doc = "a ~~b~~ c";
+    const { core } = makeCore(doc);
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(9));
+    expect(marks(ds, "strike")).toEqual([{ kind: "mark", from: 4, to: 5, style: "strike" }]);
+    expect(conceals(ds)).toEqual([
+      { kind: "conceal", from: 2, to: 4 },
+      { kind: "conceal", from: 5, to: 7 },
+    ]);
+  });
+
+  it("blockquote (depth 1): line decoration + conceal over the marker; reveal is per-line", () => {
+    const doc = "> hello\nworld";
+    const { core } = makeCore(doc);
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
+    expect(lines(ds)).toEqual([{ kind: "line", at: 0, style: "blockquote", depth: 1 }]);
+    expect(conceals(ds)).toEqual([{ kind: "conceal", from: 0, to: 2 }]);
+
+    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(3));
+    expect(conceals(revealed)).toEqual([]);
+    expect(marks(revealed, "delim")).toEqual([{ kind: "mark", from: 0, to: 2, style: "delim" }]);
+  });
+
+  it("fenced code block: fence lines + body line/mark; fences never concealed", () => {
+    const doc = "```js\nconst x = 1;\n```\nafter";
+    const { core } = makeCore(doc);
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
+    expect(lines(ds)).toEqual([
+      { kind: "line", at: 0, style: "code-fence" },
+      { kind: "line", at: 6, style: "code-block" },
+      { kind: "line", at: 19, style: "code-fence" },
+    ]);
+    expect(marks(ds, "code")).toEqual([{ kind: "mark", from: 6, to: 18, style: "code" }]);
+    expect(conceals(ds)).toEqual([]);
+  });
+
+  it("thematic break: styled line only, no marks/conceals, not inline-parsed", () => {
+    const doc = "before\n---\nafter";
+    const { core } = makeCore(doc);
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
+    expect(lines(ds)).toEqual([{ kind: "line", at: 7, style: "hr" }]);
+    expect(marks(ds)).toEqual([]);
+    expect(conceals(ds)).toEqual([]);
+  });
+
+  it("list markers (bullet and ordered) are always visible, never concealed", () => {
+    const doc = "- item\n1. other";
+    const { core } = makeCore(doc);
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(0));
+    expect(marks(ds, "list-marker")).toEqual([
+      { kind: "mark", from: 0, to: 2, style: "list-marker" },
+      { kind: "mark", from: 7, to: 10, style: "list-marker" },
+    ]);
+    expect(conceals(ds)).toEqual([]);
+  });
+
+  it("task list item: list-marker mark + widget:task (concealed) or delim (revealed)", () => {
+    const doc = "- [ ] buy milk";
+    const { core } = makeCore(doc);
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
+    expect(marks(ds, "list-marker")).toEqual([{ kind: "mark", from: 0, to: 2, style: "list-marker" }]);
+    const widgets = ds.filter((d) => d.kind === "widget");
+    expect(widgets).toEqual([{ kind: "widget", from: 2, to: 5, widget: "task", checked: false }]);
+
+    // Reveal extent = the LIST ITEM's marker extent [0, 5) — a cursor inside it withholds the widget.
+    const revealedDs = core.decorations(core.revision(), 0, doc.length, cursor(3));
+    expect(revealedDs.filter((d) => d.kind === "widget")).toEqual([]);
+    expect(marks(revealedDs, "delim")).toEqual([{ kind: "mark", from: 2, to: 5, style: "delim" }]);
+  });
+
+  it("checked task items report checked: true", () => {
+    const doc = "- [x] done";
+    const { core } = makeCore(doc);
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
+    const widgets = ds.filter((d) => d.kind === "widget");
+    expect(widgets).toEqual([{ kind: "widget", from: 2, to: 5, widget: "task", checked: true }]);
+  });
+
+  it("link [text](url) concealed: mark:link over text + two conceal spans", () => {
+    const doc = "see [docs](https://example.com) now";
+    const { core } = makeCore(doc);
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
+    expect(marks(ds, "link")).toEqual([{ kind: "mark", from: 5, to: 9, style: "link" }]);
+    expect(conceals(ds)).toEqual([
+      { kind: "conceal", from: 4, to: 5 },
+      { kind: "conceal", from: 9, to: 31 },
+    ]);
+    expect(marks(ds, "url")).toEqual([]);
+  });
+
+  it("link revealed: delimiters as mark:delim, destination as mark:url", () => {
+    const doc = "see [docs](https://example.com) now";
+    const { core } = makeCore(doc);
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(6));
+    expect(conceals(ds)).toEqual([]);
+    expect(marks(ds, "delim")).toEqual([
+      { kind: "mark", from: 4, to: 5, style: "delim" },
+      { kind: "mark", from: 9, to: 11, style: "delim" },
+      { kind: "mark", from: 30, to: 31, style: "delim" },
+    ]);
+    expect(marks(ds, "url")).toEqual([{ kind: "mark", from: 11, to: 30, style: "url" }]);
+    expect(marks(ds, "link")).toEqual([{ kind: "mark", from: 5, to: 9, style: "link" }]);
+  });
+
+  it("autolink <url>: mark:link over the whole span, never concealed", () => {
+    const doc = "go to <https://example.com> now";
+    const { core } = makeCore(doc);
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
+    expect(marks(ds, "link")).toEqual([{ kind: "mark", from: 6, to: 27, style: "link" }]);
+    expect(conceals(ds)).toEqual([]);
+  });
+});
+
+describe("MockCore anchors (v0.2)", () => {
+  it("before-bias anchor stays put when an insertion lands exactly on it", () => {
+    const { core } = makeCore("abcdef");
+    const id = core.createAnchor(3, "before");
+    core.applyEdit(core.revision(), [{ at: 3, delete: 0, insert: "XYZ" }], "user");
+    expect(core.resolveAnchor(id)).toBe(3);
+  });
+
+  it("after-bias anchor moves with an insertion landing exactly on it", () => {
+    const { core } = makeCore("abcdef");
+    const id = core.createAnchor(3, "after");
+    core.applyEdit(core.revision(), [{ at: 3, delete: 0, insert: "XYZ" }], "user");
+    expect(core.resolveAnchor(id)).toBe(6);
+  });
+
+  it("anchors shift with edits earlier in the document regardless of bias", () => {
+    const { core } = makeCore("abcdef");
+    const before = core.createAnchor(4, "before");
+    const after = core.createAnchor(4, "after");
+    core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "123" }], "user");
+    expect(core.resolveAnchor(before)).toBe(7);
+    expect(core.resolveAnchor(after)).toBe(7);
+  });
+
+  it("deleting the anchored text collapses the anchor to the deletion site (not null)", () => {
+    const { core } = makeCore("abcdef");
+    const id = core.createAnchor(3, "after");
+    core.applyEdit(core.revision(), [{ at: 1, delete: 4, insert: "" }], "user"); // deletes "bcde"
+    expect(core.resolveAnchor(id)).not.toBeNull();
+    expect(core.resolveAnchor(id)).toBe(1);
+  });
+
+  it("dropAnchor makes resolveAnchor return null", () => {
+    const { core } = makeCore("abc");
+    const id = core.createAnchor(1, "before");
+    core.dropAnchor(id);
+    expect(core.resolveAnchor(id)).toBeNull();
+  });
+});
+
+describe("MockCore command (v0.2)", () => {
+  it("toggleStrong wraps a plain selection, then double-toggle is byte-identical", () => {
+    const { core } = makeCore("hello world");
+    const c1 = core.command("toggleStrong", 6, 11); // "world"
+    expect(c1).not.toBeNull();
+    expect(core.getText()).toBe("hello **world**");
+    const sel = c1!.selection!;
+    const c2 = core.command("toggleStrong", sel.anchor, sel.head);
+    expect(c2).not.toBeNull();
+    expect(core.getText()).toBe("hello world"); // byte-identical to the original
+  });
+
+  it("toggleEm/toggleStrike/toggleCode wrap and unwrap symmetrically", () => {
+    const cases: Array<[RangeCommandName, string]> = [
+      ["toggleEm", "*"],
+      ["toggleStrike", "~~"],
+      ["toggleCode", "`"],
+    ];
+    for (const [name, delim] of cases) {
+      const { core } = makeCore("hello world");
+      const c1 = core.command(name, 6, 11);
+      expect(core.getText()).toBe(`hello ${delim}world${delim}`);
+      const sel = c1!.selection!;
+      core.command(name, sel.anchor, sel.head);
+      expect(core.getText()).toBe("hello world");
+    }
+  });
+
+  it("commands are single, non-coalescing undo units", () => {
+    const { core } = makeCore("hello world");
+    core.command("toggleStrong", 6, 11);
+    core.undo();
+    expect(core.getText()).toBe("hello world");
+  });
+
+  it("setHeading sets, no-ops when already at the level, and clears back to a paragraph", () => {
+    const { core } = makeCore("Title\n\ntail");
+    const c1 = core.command("setHeading", 2, 2);
+    expect(c1).not.toBeNull();
+    expect(core.getText()).toBe("## Title\n\ntail");
+    expect(core.command("setHeading", 2, 2)).toBeNull(); // already level 2: no-op
+    core.command("setHeading", 2, 0);
+    expect(core.getText()).toBe("Title\n\ntail");
+  });
+
+  it("toggleTask flips the checkbox in place and is idempotent", () => {
+    const { core } = makeCore("- [ ] buy milk");
+    const c1 = core.command("toggleTask", 5);
+    expect(c1).not.toBeNull();
+    expect(core.getText()).toBe("- [x] buy milk");
+    core.command("toggleTask", 5);
+    expect(core.getText()).toBe("- [ ] buy milk");
+  });
+
+  it("toggleTask returns null when not inside a task item", () => {
+    const { core } = makeCore("plain paragraph");
+    expect(core.command("toggleTask", 3)).toBeNull();
+  });
+});
+
+describe("MockCore streaming (v0.2)", () => {
+  it("streamOpen/Append/Close: appends land at the (mapped) insertion anchor", () => {
+    const { core } = makeCore("head\n");
+    const id = core.streamOpen(core.docLength());
+    const c1 = core.streamAppend(id, "Hello");
+    expect(c1.splices).toEqual([{ at: 5, delete: 0, insert: "Hello" }]);
+    const c2 = core.streamAppend(id, ", world");
+    expect(c2.splices).toEqual([{ at: 10, delete: 0, insert: ", world" }]);
+    core.streamClose(id);
+    expect(core.getText()).toBe("head\nHello, world");
+  });
+
+  it("streamAppend never moves the selection — user edits elsewhere are unaffected", () => {
+    const { core } = makeCore("");
+    const id = core.streamOpen(0);
+    const change = core.streamAppend(id, "abc");
+    expect(change.selection).toBeNull();
+  });
+
+  it("an entire stream session is one undo unit when uninterrupted", () => {
+    const { core } = makeCore("X");
+    const id = core.streamOpen(1);
+    core.streamAppend(id, "a");
+    core.streamAppend(id, "b");
+    core.streamAppend(id, "c");
+    core.streamClose(id);
+    expect(core.getText()).toBe("Xabc");
+    core.undo();
+    expect(core.getText()).toBe("X");
+  });
+
+  it("a user edit interleaved between appends gets its own unit; each still undoes cleanly", () => {
+    const { core, clock } = makeCore("head\n\ntail");
+    const id = core.streamOpen(core.docLength());
+    core.streamAppend(id, "A");
+    clock.advance(10);
+    core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "USER" }], "user");
+    core.streamAppend(id, "B");
+    core.streamClose(id);
+    expect(core.getText()).toBe("USERhead\n\ntailAB");
+
+    // undo unwinds in strict temporal order: last stream chunk, then the
+    // interleaved user edit, then the first stream chunk — the user's edit is
+    // never corrupted by, or merged into, the stream's own unit(s).
+    core.undo();
+    expect(core.getText()).toBe("USERhead\n\ntailA");
+    core.undo();
+    expect(core.getText()).toBe("head\n\ntailA");
+    core.undo();
+    expect(core.getText()).toBe("head\n\ntail");
+  });
+
+  it("streamAppend on an unknown/closed id throws; streamClose on one is a no-op", () => {
+    const { core } = makeCore("x");
+    expect(() => core.streamAppend(999, "a")).toThrow();
+    const id = core.streamOpen(1);
+    core.streamClose(id);
+    expect(() => core.streamAppend(id, "a")).toThrow();
+    expect(() => core.streamClose(id)).not.toThrow();
+    expect(() => core.streamClose(999)).not.toThrow();
+  });
+
+  it("the stream anchor maps through a user edit earlier in the document", () => {
+    const { core } = makeCore("head\n");
+    const id = core.streamOpen(core.docLength()); // anchor at 5
+    core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "XXXX" }], "user"); // shifts anchor to 9
+    const change = core.streamAppend(id, "Z");
+    expect(change.splices).toEqual([{ at: 9, delete: 0, insert: "Z" }]);
+    core.streamClose(id);
+    expect(core.getText()).toBe("XXXXhead\nZ");
   });
 });

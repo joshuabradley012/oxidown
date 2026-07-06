@@ -10,6 +10,7 @@
 //! applied edit batch; IME-origin insertions touching the range grow it (the
 //! contract's "may grow as composition updates arrive").
 
+use crate::mapping::{self, Bias};
 use crate::text::ByteSplice;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,8 +26,8 @@ impl Composition {
     /// (IME-origin edits), inserted regions touching the mapped range are
     /// unioned into it.
     pub fn map_through(&mut self, batch: &[ByteSplice], grow: bool) {
-        let mut start = map_pos(self.start, batch);
-        let mut end = map_pos(self.end, batch);
+        let mut start = mapping::map_pos(self.start, batch, Bias::Before);
+        let mut end = mapping::map_pos(self.end, batch, Bias::Before);
         if grow {
             let mut delta: isize = 0;
             for s in batch {
@@ -42,30 +43,6 @@ impl Composition {
         self.start = start;
         self.end = end.max(start);
     }
-}
-
-/// Map a byte position through an ascending, non-overlapping splice batch,
-/// with left bias: positions inside a deleted range collapse to the start of
-/// the replacement, and an insertion exactly at the position stays after it
-/// (the position does not move). Growth of the composition range comes only
-/// from the IME-insertion union in [`Composition::map_through`], never from
-/// bias.
-fn map_pos(p: usize, batch: &[ByteSplice]) -> usize {
-    let mut delta: isize = 0;
-    for s in batch {
-        let del_end = s.at + s.delete;
-        if del_end < p || (del_end == p && s.delete > 0) {
-            // Splice entirely before p (a deletion ending exactly at p
-            // still shifts it; a pure insertion exactly at p does not).
-            delta += s.insert.len() as isize - s.delete as isize;
-        } else if s.at < p {
-            // p strictly inside the deleted range: collapse left.
-            return usize::try_from(s.at as isize + delta).unwrap_or(0);
-        } else {
-            break; // batch is ascending: everything else is after p
-        }
-    }
-    usize::try_from(p as isize + delta).unwrap_or(0)
 }
 
 #[cfg(test)]

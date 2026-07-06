@@ -1,18 +1,33 @@
 //! Undo/redo as inverted-op stacks.
 //!
-//! Stack discipline makes coordinate mapping unnecessary: a unit's inverse
-//! splices are expressed against the document state that existed right after
-//! that unit's edit — and because units above it must be popped first, that
-//! state *is* the current document whenever the unit reaches the top.
+//! Stack discipline makes coordinate mapping unnecessary for the normal
+//! path: a unit's inverse splices are expressed against the document state
+//! that existed right after that unit's edit — and because units above it
+//! must be popped first, that state *is* the current document whenever the
+//! unit reaches the top.
 //!
 //! Coalescing (contract): consecutive `user`/`ime` edits within 500 ms that
-//! are positionally adjacent merge into one undo unit; `paste` (and undo/redo)
-//! never coalesce; coalescing pauses while a composition session is active.
-//! "Positionally adjacent" is implemented as: the new single splice falls
-//! entirely within (or touches the ends of) the region the unit's undo would
-//! remove — which covers typing runs, insert-at-front, and backspace runs
-//! over just-typed text.
+//! are positionally adjacent merge into one undo unit; `paste` (and undo/redo,
+//! `command`, `ai`) never coalesce; coalescing pauses while a composition
+//! session is active. "Positionally adjacent" is implemented as: the new
+//! single splice falls entirely within (or touches the ends of) the region
+//! the unit's undo would remove — which covers typing runs, insert-at-front,
+//! and backspace runs over just-typed text.
+//!
+//! ## Stream units (M1, plan.md §5.9 + boundary v0.2 clarification 2)
+//!
+//! An open AI stream owns exactly ONE undo unit no matter how many appends
+//! arrive, while interleaved user edits still get their own correctly
+//! ordered units. This is the one place stack discipline alone isn't
+//! enough: an append may need to merge into a unit that is **not** on top
+//! (user edits recorded since sit above it). [`History::record_stream_append`]
+//! keeps every unit's frame invariant intact by cascading the append
+//! insertion down through the stack — see its docs for the exact algebra.
+//! The result: undoing after close reverts the entire stream in one step,
+//! deleting exactly the streamed spans (mapped through whatever else
+//! happened), without touching user edits made during the stream.
 
+use crate::mapping::{self, Bias};
 use crate::oplog::EditOrigin;
 use crate::text::ByteSplice;
 
@@ -27,6 +42,9 @@ pub struct UndoUnit {
     /// the unit is still eligible to absorb more (single-splice user/ime edit
     /// made outside a composition session).
     coalesce_last_ms: Option<f64>,
+    /// Set when this unit is an AI stream's single unit — appends of that
+    /// stream merge here instead of pushing new units.
+    stream_id: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -91,8 +109,62 @@ impl History {
         self.undo.push(UndoUnit {
             inverse,
             coalesce_last_ms: (eligible && forward_single.is_some()).then_some(now_ms),
+            stream_id: None,
         });
         self.break_next = false;
+    }
+
+    /// Record a stream append: a pure insertion of `len` bytes at `at`
+    /// (post-append current-doc byte coordinates — for a pure insertion the
+    /// pre- and post-edit start position coincide).
+    ///
+    /// If the stream's unit is still in the undo stack, the append merges
+    /// into it; otherwise (first append, or the unit was undone/redone away)
+    /// a fresh unit tagged with `stream_id` is pushed.
+    ///
+    /// Merging into a non-top unit must preserve the stack's frame
+    /// invariant (each unit's inverse valid in the doc obtained by applying
+    /// the inverses above it). The insertion is therefore *cascaded down*:
+    /// for each unit above the stream unit, from top to bottom, (a) the
+    /// insertion position is translated into the next-deeper frame by
+    /// mapping it through that unit's (old) inverse, and (b) that unit's
+    /// inverse is rewritten as if the insertion had always been present in
+    /// its frame ([`map_batch_through_insertion`] — positions at/after the
+    /// insertion shift; a delete-span strictly containing it splits around
+    /// it so no unit ever deletes streamed text). At the stream unit's own
+    /// frame the same rewrite runs, and then the chunk's inverse (delete
+    /// `[at', at'+len)`) merges into its splice list.
+    pub fn record_stream_append(&mut self, stream_id: u64, at: usize, len: usize) {
+        self.redo.clear();
+        let Some(idx) = self
+            .undo
+            .iter()
+            .rposition(|u| u.stream_id == Some(stream_id))
+        else {
+            self.undo.push(UndoUnit {
+                inverse: vec![ByteSplice {
+                    at,
+                    delete: len,
+                    insert: String::new(),
+                }],
+                coalesce_last_ms: None,
+                stream_id: Some(stream_id),
+            });
+            return;
+        };
+        let mut pos = at;
+        for k in (idx + 1..self.undo.len()).rev() {
+            let old_inverse = std::mem::take(&mut self.undo[k].inverse);
+            // Frame translation uses the OLD inverse (before rewriting).
+            // Bias::Before: if this unit's undo restores text exactly at the
+            // insertion point, the streamed chunk stays before it.
+            let deeper_pos = mapping::map_pos(pos, &old_inverse, Bias::Before);
+            self.undo[k].inverse = map_batch_through_insertion(old_inverse, pos, len);
+            pos = deeper_pos;
+        }
+        let unit = &mut self.undo[idx];
+        unit.inverse = map_batch_through_insertion(std::mem::take(&mut unit.inverse), pos, len);
+        merge_delete(&mut unit.inverse, pos, len);
     }
 
     fn try_coalesce(&mut self, at: usize, delete: usize, insert_len: usize, now_ms: f64) -> bool {
@@ -133,15 +205,101 @@ impl History {
         self.redo.push(UndoUnit {
             inverse,
             coalesce_last_ms: None,
+            stream_id: None,
         });
     }
 
     /// Push a unit produced by `redo()` back onto the undo stack. Never
-    /// coalescible: redo restores a completed unit.
+    /// coalescible: redo restores a completed unit. Deliberately untagged
+    /// even if the redone unit was a stream unit: once a stream unit has
+    /// been undone and redone, later appends of a still-open stream start a
+    /// fresh unit rather than merging into a resurrected one (documented
+    /// edge — the "one unit per stream" guarantee holds for the normal
+    /// open→append*→close life cycle, not across the user unwinding the
+    /// stream mid-flight).
     pub fn push_undo_unit(&mut self, inverse: Vec<ByteSplice>) {
         self.undo.push(UndoUnit {
             inverse,
             coalesce_last_ms: None,
+            stream_id: None,
         });
+    }
+}
+
+/// Rewrite an inverse batch as if a pure insertion of `len` bytes at `at`
+/// (same frame as the batch) had always been present:
+///
+/// * splices starting at or after `at` shift right by `len` (an insertion
+///   exactly at a splice's start is *not* owned by that splice — streamed
+///   text must never be deleted by a non-stream unit);
+/// * a delete-span strictly containing `at` splits around the inserted
+///   region: `[s, at) ++ [at+len, e+len)`, with the splice's restore text
+///   staying with the first piece (sound: the streamed chunk survives this
+///   unit's undo and the restored text lands immediately before it — the
+///   stream's own unit deletes the chunk later).
+fn map_batch_through_insertion(batch: Vec<ByteSplice>, at: usize, len: usize) -> Vec<ByteSplice> {
+    let mut out = Vec::with_capacity(batch.len());
+    for s in batch {
+        let end = s.at + s.delete;
+        if at <= s.at {
+            out.push(ByteSplice {
+                at: s.at + len,
+                delete: s.delete,
+                insert: s.insert,
+            });
+        } else if at >= end {
+            out.push(s);
+        } else {
+            out.push(ByteSplice {
+                at: s.at,
+                delete: at - s.at,
+                insert: s.insert,
+            });
+            out.push(ByteSplice {
+                at: at + len,
+                delete: end - at,
+                insert: String::new(),
+            });
+        }
+    }
+    out
+}
+
+/// Insert a pure delete `[at, at+len)` into an ascending, non-overlapping
+/// inverse batch, coalescing with pure-delete neighbors it touches. The
+/// caller guarantees (via [`map_batch_through_insertion`]) that no existing
+/// splice overlaps the new range.
+fn merge_delete(batch: &mut Vec<ByteSplice>, at: usize, len: usize) {
+    let idx = batch.partition_point(|s| s.at + s.delete < at);
+    // Try extending the previous/current splice whose delete-range ends
+    // exactly at `at` (pure deletes only — a splice with restore text keeps
+    // its own identity).
+    if idx < batch.len() && batch[idx].at + batch[idx].delete == at && batch[idx].insert.is_empty()
+    {
+        batch[idx].delete += len;
+        try_absorb_next(batch, idx);
+        return;
+    }
+    let insert_at = batch.partition_point(|s| s.at < at);
+    batch.insert(
+        insert_at,
+        ByteSplice {
+            at,
+            delete: len,
+            insert: String::new(),
+        },
+    );
+    try_absorb_next(batch, insert_at);
+}
+
+/// After growing `batch[idx]`, absorb the next splice if it is a pure delete
+/// starting exactly where `batch[idx]`'s delete-range now ends.
+fn try_absorb_next(batch: &mut Vec<ByteSplice>, idx: usize) {
+    if idx + 1 < batch.len() {
+        let end = batch[idx].at + batch[idx].delete;
+        if batch[idx + 1].at == end && batch[idx + 1].insert.is_empty() {
+            batch[idx].delete += batch[idx + 1].delete;
+            batch.remove(idx + 1);
+        }
     }
 }

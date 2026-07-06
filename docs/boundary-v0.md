@@ -149,6 +149,127 @@ p95 in the core** (excluding DOM work), measured from the JS side of the wasm bo
    ranges) snap outward to the nearest code-point boundary instead of erroring — they are
    range filters, not mutations.
 
+---
+
+# v0.2 additions (M1)
+
+Additive only — every v0/v0.1 rule above still holds. Views MUST ignore decoration styles and
+widget kinds they don't recognize (forward compatibility).
+
+## Expanded decoration vocabulary
+
+```ts
+// mark styles (added): "strike" | "link" | "url" | "list-marker"
+//   link  = the visible text of a link
+//   url   = the destination part, emitted only when the link node is revealed
+//   list-marker = bullet/number markers ("- ", "1. ") — always visible, styled, never concealed
+// line styles (added): "blockquote" (with depth) | "code-block" | "code-fence" | "hr"
+export interface DecorationLineV2 {
+  kind: "line";
+  at: number;
+  style: "h1"|"h2"|"h3"|"h4"|"h5"|"h6"|"blockquote"|"code-block"|"code-fence"|"hr";
+  /** blockquote nesting depth (1-based); present only for style "blockquote". */
+  depth?: number;
+}
+export interface DecorationWidget {
+  kind: "widget";
+  from: number;
+  to: number;                 // source range the widget REPLACES visually ("[ ]" / "[x]")
+  widget: "task";
+  checked: boolean;
+}
+```
+
+M1 emission scope (parser may understand more than it decorates):
+- Strikethrough `~~x~~` — mark `strike` + conceal/delim pairs, same reveal rules as strong/em.
+- Links `[text](url)` — concealed: `mark:link` over text, conceal `[` and `](url)`.
+  Revealed: delimiters as `mark:delim`, destination as `mark:url`. Autolinks: `mark:link` whole.
+- Blockquotes — `line:blockquote` per line with depth; `> ` markers conceal, reveal per-line.
+- Fenced code blocks — `line:code-fence` on fence lines, `line:code-block` on body lines,
+  `mark:code` on body content. Fences stay visible in M1 (styled, never concealed).
+- Lists — `mark:list-marker` on markers (never concealed). Task items additionally emit a
+  `widget:task` replacing exactly the `[ ]`/`[x]` span; when the node is revealed the widget is
+  withheld and the checkbox source shows as `mark:delim`.
+- Thematic break — `line:hr` (styled only in M1).
+- Headings/strong/em/inline-code unchanged from v0.
+
+Reveal semantics are unchanged: per-node selection∩extent (task widget reveal = the LIST ITEM's
+marker extent, so clicking the rendered checkbox — which sits inside the range — still works).
+
+## Core-driven changes (generalization of the undo rule)
+
+`undo`/`redo`, `command`, and `streamAppend` all return the SAME shape — splices the view must
+apply verbatim under its skip annotation:
+
+```ts
+export interface CoreChange {
+  revision: number;
+  splices: Splice[];                       // current-doc coordinates
+  selection?: { anchor: number; head: number } | null;  // optional cursor placement
+}
+```
+
+## Anchors (public position type, plan §5.3)
+
+```ts
+createAnchor(pos: number, bias: "before" | "after"): number;  // anchor id
+resolveAnchor(id: number): number | null;   // current position; null if unresolvable
+dropAnchor(id: number): void;
+```
+
+Anchors survive arbitrary edits (mapped through every splice, bias-aware: "before" stays put
+when an insertion lands exactly on it; "after" moves with the insertion). Deleting the anchored
+text collapses the anchor to the deletion site; it does not become null in M1.
+
+## Commands
+
+```ts
+command(name: "toggleStrong"|"toggleEm"|"toggleStrike"|"toggleCode", from: number, to: number): CoreChange | null;
+command(name: "setHeading", pos: number, level: 0|1|2|3|4|5|6): CoreChange | null;   // 0 = paragraph
+command(name: "toggleTask", pos: number): CoreChange | null;  // pos anywhere in the list item
+```
+
+Commands are text transforms computed against the overlay (plan §5.8): they emit minimal
+splices (toggle = add or remove delimiters), enter the op log with origin `"command"`, and are
+single undo units (never coalesce). Returns null when the command doesn't apply at the target.
+
+## Streaming (plan §5.9)
+
+```ts
+streamOpen(pos: number): number;                    // stream id; insertion point becomes an internal anchor
+streamAppend(id: number, chunk: string): CoreChange; // splices for the view to apply (skip annotation)
+streamClose(id: number): void;
+```
+
+Rules:
+- Ops carry origin `"ai"`. An ENTIRE stream session (open→close) is exactly ONE undo unit.
+- The user may keep editing while a stream is open; the stream's insertion anchor maps through
+  user edits, so concurrent edits above/below the stream point interleave correctly.
+  Editing *inside* the already-streamed region while open is not blocked in M1, but the demo
+  should not encourage it (review/suggestion mode is deferred per plan §5.9).
+- Append fast-path: an append that only extends the open tail block must not force
+  full-document work beyond Phase-A parsing; with Phase A this means the decoration/damage
+  computation is O(tail block), and the parser call itself stays within the perf budget.
+- `streamClose` on an unknown/closed id is a no-op; `streamAppend` on one throws.
+
+## New edit origins
+
+`EditOrigin` gains `"ai"` (stream ops) and `"command"` (command ops). Neither ever coalesces.
+
+## v0.2 clarifications (pinned after first implementations)
+
+1. **`undo`/`redo` return `CoreChange | null`** — the same shape as `command`/`streamAppend`
+   (structurally supersets the v0 shape). The core supplies `selection`; views use it instead
+   of guessing cursor placement from splice ends.
+2. **Stream undo grouping**: chunks of the same uninterrupted stream coalesce into that
+   stream's single unit; an interleaved user edit gets its own unit and the stream's unit
+   remains sound (reverts the streamed spans, mapped). **Undo order is unit-creation order
+   (LIFO)**: a user edit made mid-stream pops before the stream's unit, because its unit was
+   created after the stream's unit began.
+3. **`list-marker` spans include the required trailing whitespace** (`"- "`, `"1. "`).
+4. **Link conceal spans** are two spans (`[` and `](url)`); on reveal they are emitted as
+   delim/url/delim pieces.
+
 ## Error handling
 
 Stale revision, overlapping splices, or out-of-bounds positions: throw (wasm: `Err` → JS
