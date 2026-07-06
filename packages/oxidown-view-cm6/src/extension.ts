@@ -24,6 +24,7 @@ import type {
   SelectionRange,
 } from "./protocol.js";
 import { changesToSplices } from "./splices.js";
+import { collectFenceRegions, highlightRegions } from "./highlight.js";
 import { oxidownTheme } from "./theme.js";
 
 export { changesToSplices, endOfLastSplice } from "./splices.js";
@@ -429,6 +430,18 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
               }
               // unrecognized widget kinds: ignore
             }
+          }
+          // Syntax highlighting for fenced code: view-side derived state
+          // (disposable, never touches the core). Languages load lazily; a
+          // load completion schedules one more rebuild to paint them in.
+          const regions = collectFenceRegions(decos, state);
+          if (regions.length > 0) {
+            ranges.push(
+              ...highlightRegions(state, regions, () => {
+                this.dirty = true;
+                this.scheduleRebuild();
+              }),
+            );
           }
           return Decoration.set(ranges, true);
         } catch (err) {

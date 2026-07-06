@@ -88,9 +88,13 @@ export const oxidownTheme = EditorView.baseTheme({
   // size, optical centering (vertical-align: middle), and the gap to the
   // item text are exact and font-independent. The box stays compact so
   // first-level items hug the margin.
+  // The box matches `.ox-list-marker` (1.5em, right-aligned) so bullet,
+  // number, and checkbox columns share one alignment, at every nesting level
+  // (nested indent comes from the source's leading spaces, identically).
   ".ox-bullet": {
     display: "inline-block",
-    minWidth: "1em",
+    minWidth: "1.5em",
+    textAlign: "right",
     opacity: "0.85",
   },
   ".ox-bullet::before": {
@@ -101,8 +105,7 @@ export const oxidownTheme = EditorView.baseTheme({
     borderRadius: "50%",
     backgroundColor: "currentColor",
     verticalAlign: "middle",
-    marginLeft: "0.08em",
-    marginRight: "0.55em",
+    marginRight: "0.5em",
   },
 
   // Blockquotes: one vertical bar PER nesting level, drawn as layered
@@ -170,6 +173,27 @@ export const oxidownTheme = EditorView.baseTheme({
     backgroundImage: "none",
   },
 
+  // Syntax highlighting tokens (fenced code): @lezer/highlight's
+  // classHighlighter emits `tok-*` classes; colors here, parsing in
+  // highlight.ts. Muted, theme-aware palette.
+  "&light .tok-keyword": { color: "#9333ea" },
+  "&dark .tok-keyword": { color: "#c678dd" },
+  "&light .tok-string, &light .tok-string2": { color: "#16a34a" },
+  "&dark .tok-string, &dark .tok-string2": { color: "#98c379" },
+  ".tok-comment": { fontStyle: "italic" },
+  "&light .tok-comment": { color: "#9ca3af" },
+  "&dark .tok-comment": { color: "#7f848e" },
+  "&light .tok-number, &light .tok-bool, &light .tok-literal": { color: "#ea580c" },
+  "&dark .tok-number, &dark .tok-bool, &dark .tok-literal": { color: "#d19a66" },
+  "&light .tok-typeName, &light .tok-className": { color: "#0d9488" },
+  "&dark .tok-typeName, &dark .tok-className": { color: "#e5c07b" },
+  "&light .tok-propertyName": { color: "#2563eb" },
+  "&dark .tok-propertyName": { color: "#61afef" },
+  "&light .tok-operator, &light .tok-punctuation": { color: "#6b7280" },
+  "&dark .tok-operator, &dark .tok-punctuation": { color: "#abb2bf" },
+  "&light .tok-meta": { color: "#78716c" },
+  "&dark .tok-meta": { color: "#8b949e" },
+
   // Task checkbox widget (the first widget island): pure-CSS custom checkbox
   // (Tailwind-forms style — `appearance: none` + inline SVG check), aligned
   // to the text baseline so it sits inline without nudging line height (the
@@ -183,8 +207,15 @@ export const oxidownTheme = EditorView.baseTheme({
     border: "1.5px solid rgba(120, 120, 128, 0.55)",
     backgroundColor: "transparent",
     display: "inline-block",
-    verticalAlign: "text-bottom",
-    margin: "0 0.4em 0 0",
+    // Optically centered against the text: vertical-align middle plus an
+    // empirically measured nudge (box center was ~1.8px below line center).
+    verticalAlign: "middle",
+    position: "relative",
+    top: "-0.13em",
+    // The task item's "- " marker is concealed (~0 width), so the checkbox
+    // provides its own lead-in: box ends at ~1.1em + 0.4em gap puts the item
+    // text at ~1.5em — the same column as bullet and ordered item text.
+    margin: "0 0.4em 0 0.05em",
     cursor: "pointer",
     transition: "background-color 80ms ease, border-color 80ms ease",
   },
