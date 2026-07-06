@@ -194,8 +194,14 @@ M1 emission scope (parser may understand more than it decorates):
   replacing the whole marker span (`"- "`)**, revealed as `mark:list-marker` under STRICT
   interior overlap (`a < end && b > start`) — the cursor at the item text's first character or
   at line start does not flash the raw marker. Task items additionally emit a `widget:task`
-  replacing exactly the `[ ]`/`[x]` span; when the item is revealed the widget is withheld and
-  the checkbox source shows as `mark:delim`.
+  replacing exactly the `[ ]`/`[x]` span; **the task item's `- ` marker conceals and reveals in
+  LOCKSTEP with the checkbox** (both key off the item marker extent, closed-interval) — the
+  dash and the brackets always show together, as `mark:delim`.
+- **Nested list items (depth ≥ 2)** emit `{kind:"line", style:"list-item", depth}` on the
+  item's line plus a `conceal` over the raw leading indent whitespace (revealed as
+  `mark:delim`). The view supplies exact per-depth padding (1.5em per level — each nested
+  marker's left edge aligns with its parent's text column) instead of rendering the source
+  spaces at their natural width.
 - Thematic break — `line:hr` on the line, plus `conceal` over the raw dashes (revealed as
   `mark:delim` when the cursor is on the line). The view draws the actual rule on the hr line;
   nested blockquote bars are likewise the view's job (one bar per depth level).

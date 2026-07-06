@@ -23,6 +23,7 @@ import type {
   RangeCommandName,
   SelectionRange,
 } from "./protocol.js";
+import { indentLess, indentMore } from "@codemirror/commands";
 import { changesToSplices } from "./splices.js";
 import { collectFenceRegions, highlightRegions } from "./highlight.js";
 import { oxidownTheme } from "./theme.js";
@@ -118,6 +119,22 @@ const lineDecos = {
 } as const;
 /** hr line whose dashes are revealed: same class family, rule suppressed. */
 const hrRevealedLineDeco = Decoration.line({ class: "ox-hr ox-hr-revealed" });
+/** Fence line whose raw ``` is concealed: code-band background suppressed. */
+const fenceConcealedLineDeco = Decoration.line({
+  class: "ox-code-fence ox-code-fence-concealed",
+});
+
+/** Nested list-item lines: per-depth padding classes (capped at 4). */
+const listItemLineDecos = new Map<number, Decoration>();
+function listItemLineDeco(depth: number): Decoration {
+  const capped = Math.max(2, Math.min(depth, 4));
+  let deco = listItemLineDecos.get(capped);
+  if (!deco) {
+    deco = Decoration.line({ class: `ox-list-item ox-li-${capped}` });
+    listItemLineDecos.set(capped, deco);
+  }
+  return deco;
+}
 
 /** Blockquote line decorations are depth-dependent; cache one per depth (capped at 3 for styling). */
 const blockquoteLineDecos = new Map<number, Decoration>();
@@ -156,6 +173,9 @@ class TaskCheckboxWidget extends WidgetType {
     const input = document.createElement("input");
     input.type = "checkbox";
     input.className = "ox-task-checkbox";
+    // Not focusable: Tab must stay with the editor (it indents), never jump
+    // into embedded widgets. Clicking still works.
+    input.tabIndex = -1;
     input.checked = this.checked;
     input.addEventListener("click", (event) => {
       // Prevent the browser's own default checkbox toggle: the core is the
@@ -400,9 +420,21 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
                 ranges.push(blockquoteLineDeco(d.depth ?? 1).range(line.from));
                 continue;
               }
+              if (d.style === "list-item") {
+                const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
+                ranges.push(listItemLineDeco(d.depth ?? 2).range(line.from));
+                continue;
+              }
               if (d.style === "hr" && delimStarts.has(d.at)) {
                 const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
                 ranges.push(hrRevealedLineDeco.range(line.from));
+                continue;
+              }
+              if (d.style === "code-fence" && !delimStarts.has(d.at)) {
+                // Concealed fence: no code-band background — the strip reads
+                // as ordinary blank space above/below the block body.
+                const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
+                ranges.push(fenceConcealedLineDeco.range(line.from));
                 continue;
               }
               const deco = lineDecos[d.style as keyof typeof lineDecos];
@@ -538,6 +570,9 @@ function commandKeymap(core: OxidownCore): Extension {
     { key: "Mod-i", run: runToggle("toggleEm"), preventDefault: true },
     { key: "Mod-Shift-x", run: runToggle("toggleStrike"), preventDefault: true },
     { key: "Mod-e", run: runToggle("toggleCode"), preventDefault: true },
+    // Tab indents (2-space indentUnit) instead of moving focus — the
+    // standard editor tradeoff; Escape then Tab leaves the editor.
+    { key: "Tab", run: indentMore, shift: indentLess, preventDefault: true },
   ]);
 }
 

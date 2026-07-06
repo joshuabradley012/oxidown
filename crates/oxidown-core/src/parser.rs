@@ -47,9 +47,13 @@ pub enum NodeKind {
     /// A list item's marker span (`- `, `1. `, `1) `, or the bullet portion
     /// of a task item before its checkbox). Always visible, never concealed.
     /// A list-item marker run (`"- "`, `"1. "`). `task` marks the marker of
-    /// a task item, whose glyph conceals entirely when not revealed (the
-    /// checkbox widget alone represents the item).
+    /// a task item, which conceals/reveals in lockstep with its checkbox
+    /// (shared reveal extent) rather than by the bullet's strict rule.
     ListMarker { task: bool },
+    /// The leading indentation whitespace of a NESTED list item (depth >= 2).
+    /// Emits a `line:list-item` decoration carrying the depth (the view
+    /// provides exact per-depth padding) and conceals the raw spaces.
+    ListItemIndent { depth: u8 },
     /// A task item's checkbox span (`[ ]`/`[x]`), rendered as a widget
     /// unless revealed.
     TaskWidget { checked: bool },
@@ -208,7 +212,8 @@ pub fn parse_document(src: &str) -> ParseResult {
     // content-indentation rules, which pulldown has already computed for us
     // by locating where the item's real content begins. The full item range
     // is kept alongside so task widgets can record their item's extent.
-    let mut pending_item: Option<Range<usize>> = None;
+    let mut pending_item: Option<(Range<usize>, u8)> = None;
+    let mut list_depth: u8 = 0;
 
     for (event, range) in Parser::new_ext(src, options()).into_offset_iter() {
         // Top-level block collection (kind + full span at `Start`).
@@ -230,11 +235,34 @@ pub fn parse_document(src: &str) -> ParseResult {
             _ => {}
         }
 
-        if let Some(item) = pending_item.take() {
+        if let Some((item, item_depth)) = pending_item.take() {
             let item_start = item.start;
+            // Nested items (depth >= 2): the run of spaces/tabs immediately
+            // before the marker is its own node — a `line:list-item` line
+            // decoration (per-depth padding in the view) + concealed spaces.
+            // Scanning back only over blanks keeps blockquote `>` markers
+            // (their own nodes) out of the span.
+            if item_depth >= 2 {
+                let mut ws_start = item_start;
+                while ws_start > 0 && matches!(bytes[ws_start - 1], b' ' | b'\t') {
+                    ws_start -= 1;
+                }
+                if ws_start < item_start {
+                    nodes.push(leaf(
+                        NodeKind::ListItemIndent { depth: item_depth },
+                        ws_start..item_start,
+                        item_start..item_start,
+                        vec![],
+                    ));
+                }
+            }
             if let Event::TaskListMarker(checked) = &event {
                 if range.start > item_start {
-                    nodes.push(leaf(NodeKind::ListMarker { task: true }, item_start..range.start, range.end..range.end, vec![]));
+                    // Reveal in lockstep with the checkbox: same extent as
+                    // the task widget's reveal extent (item marker extent).
+                    let mut marker = leaf(NodeKind::ListMarker { task: true }, item_start..range.start, range.end..range.end, vec![]);
+                    marker.reveal_extent = Some(item_start..range.end);
+                    nodes.push(marker);
                 }
                 let mut task = leaf(NodeKind::TaskWidget { checked: *checked }, range.clone(), range.end..range.end, vec![]);
                 task.reveal_extent = Some(item_start..range.end);
@@ -279,8 +307,14 @@ pub fn parse_document(src: &str) -> ParseResult {
             Event::Rule => {
                 nodes.extend(thematic_break_node(bytes, range.clone()));
             }
+            Event::Start(Tag::List(_)) => {
+                list_depth = list_depth.saturating_add(1);
+            }
+            Event::End(TagEnd::List(_)) => {
+                list_depth = list_depth.saturating_sub(1);
+            }
             Event::Start(Tag::Item) => {
-                pending_item = Some(range.clone());
+                pending_item = Some((range.clone(), list_depth));
             }
             _ => {}
         }

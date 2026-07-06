@@ -75,6 +75,9 @@ pub enum BlockStyle {
     CodeBlock,
     CodeFence,
     ThematicBreak,
+    /// A NESTED list item's line (depth >= 2): the view supplies exact
+    /// per-depth padding while the raw indent whitespace conceals.
+    ListItem(u8),
 }
 
 impl BlockStyle {
@@ -84,12 +87,13 @@ impl BlockStyle {
             BlockStyle::CodeBlock => "code-block",
             BlockStyle::CodeFence => "code-fence",
             BlockStyle::ThematicBreak => "hr",
+            BlockStyle::ListItem(_) => "list-item",
         }
     }
 
     pub fn depth(&self) -> Option<u8> {
         match self {
-            BlockStyle::BlockQuote(d) => Some(*d),
+            BlockStyle::BlockQuote(d) | BlockStyle::ListItem(d) => Some(*d),
             _ => None,
         }
     }
@@ -175,7 +179,26 @@ pub fn compute(
                 let to = text.byte_to_utf16(node.extent.end);
                 let is_bullet =
                     matches!(text.byte_at(node.extent.start), Some(b'-' | b'*' | b'+'));
-                if is_bullet {
+                if is_bullet && task {
+                    // Task items: the checkbox alone represents the item, so
+                    // the `- ` conceals — and reveals IN LOCKSTEP with the
+                    // checkbox (`revealed` here uses the marker node's
+                    // reveal_extent = the item marker extent, the same range
+                    // the task widget keys off), so the dash and the
+                    // brackets always show together.
+                    let in_composition = composition.is_some_and(|c| {
+                        touches(c.start, c.end, node.extent.start, node.extent.end)
+                    });
+                    if revealed || in_composition {
+                        out.push(Decoration::Mark {
+                            from,
+                            to,
+                            style: MarkStyle::Delim,
+                        });
+                    } else {
+                        out.push(Decoration::Conceal { from, to });
+                    }
+                } else if is_bullet {
                     // Bullets render as a `•` widget. Reveal uses STRICT
                     // interior overlap (`a < end && b > start`), not the
                     // closed-interval `touches`: a cursor at the item text's
@@ -194,10 +217,6 @@ pub fn compute(
                             to,
                             style: MarkStyle::ListMarker,
                         });
-                    } else if task {
-                        // Task items: the checkbox widget alone represents
-                        // the item — the `- ` conceals entirely (no bullet).
-                        out.push(Decoration::Conceal { from, to });
                     } else {
                         out.push(Decoration::Widget {
                             from,
@@ -290,6 +309,26 @@ pub fn compute(
                     style: BlockStyle::CodeBlock,
                 });
                 Some(MarkStyle::Code)
+            }
+            NodeKind::ListItemIndent { depth } => {
+                out.push(Decoration::Block {
+                    at: text.byte_to_utf16(node.extent.start),
+                    style: BlockStyle::ListItem(depth),
+                });
+                let in_composition = composition
+                    .is_some_and(|c| touches(c.start, c.end, node.extent.start, node.extent.end));
+                let from = text.byte_to_utf16(node.extent.start);
+                let to = text.byte_to_utf16(node.extent.end);
+                if revealed || in_composition {
+                    out.push(Decoration::Mark {
+                        from,
+                        to,
+                        style: MarkStyle::Delim,
+                    });
+                } else {
+                    out.push(Decoration::Conceal { from, to });
+                }
+                None
             }
             NodeKind::ThematicBreak => {
                 out.push(Decoration::Block {

@@ -4,12 +4,12 @@ import { EditorView } from "@codemirror/view";
  * Oxidown base theme.
  *
  * The conceal trick: delimiters are never removed from the DOM (that would
- * break IME and cursor math) — they are visually collapsed with a tiny
- * font-size + negative letter-spacing. Because heading sizes are set on the
- * LINE element (`.ox-h1`…`.ox-h6`), revealed delimiters inherit the line's
- * font-size, and concealed delimiters (0.01em relative to the line) are far
- * too small to influence the line box: line height does not change between
- * concealed and revealed states.
+ * break IME and cursor math) — they are visually collapsed to a ZERO-WIDTH
+ * inline-block (normal font metrics, no horizontal space; see .ox-conceal
+ * for why not a tiny font-size). Because heading sizes are set on the LINE
+ * element (`.ox-h1`…`.ox-h6`), revealed delimiters inherit the line's
+ * font-size: line height does not change between concealed and revealed
+ * states.
  *
  * `min-height: <line-height>em` on every line guards against collapse when a
  * line consists solely of concealed characters (em resolves against the
@@ -47,9 +47,22 @@ export const oxidownTheme = EditorView.baseTheme({
   ".ox-delim": { opacity: "0.45" },
 
   // Concealed delimiters: visually collapsed, characters stay in the DOM.
+  // Zero-width inline-block, NOT a tiny font-size: a 0.01em span's glyph
+  // rects collapse to a sliver at the text baseline, which corrupts the
+  // y-geometry CodeMirror's vertical cursor motion steps through — with
+  // line-start conceals (blockquote `>`, list indents) ArrowUp would
+  // randomly skip multiple lines. width:0 + overflow:hidden keeps normal
+  // font metrics (sane line boxes) while occupying no horizontal space.
   ".ox-conceal": {
-    fontSize: "0.01em",
-    letterSpacing: "-0.01em",
+    display: "inline-block",
+    width: "0",
+    maxWidth: "0",
+    overflow: "hidden",
+    verticalAlign: "baseline",
+    // Critical: at width 0 the hidden text would otherwise WRAP one glyph
+    // per row, inflating the line box to N rows (giant bands around code
+    // fences, heading gaps). nowrap keeps the box exactly one line tall.
+    whiteSpace: "nowrap",
   },
 
   // Heading line decorations (font-size on the line, so delimiters inherit it)
@@ -142,10 +155,16 @@ export const oxidownTheme = EditorView.baseTheme({
   },
 
   // Fenced code blocks: fence + body share one font-family/background so the
-  // whole block reads as one unit; the fence line is dimmed relative to body.
+  // whole block reads as one unit. No line-level opacity — it would wash out
+  // the line BACKGROUND too; revealed fence text is dimmed by its delim mark.
   ".ox-code-fence": {
     fontFamily: MONO_FONT,
-    opacity: "0.55",
+  },
+  // Concealed fences: transparent — the strip reads as plain blank space,
+  // so the visible code band is exactly the body lines. Compound selector
+  // (two classes) outweighs the `&light .ox-code-fence` background rule.
+  "&light .ox-code-fence.ox-code-fence-concealed, &dark .ox-code-fence.ox-code-fence-concealed": {
+    backgroundColor: "transparent",
   },
   ".ox-code-block": {
     fontFamily: MONO_FONT,
@@ -156,6 +175,24 @@ export const oxidownTheme = EditorView.baseTheme({
   "&dark .ox-code-fence, &dark .ox-code-block": {
     backgroundColor: "rgba(255, 255, 255, 0.08)",
   },
+  // Inside fenced blocks the LINE carries the background — the inline code
+  // mark must be transparent or every text run gets a double-shaded band.
+  "&light .ox-code-block .ox-code, &light .ox-code-fence .ox-code": {
+    backgroundColor: "transparent",
+  },
+  "&dark .ox-code-block .ox-code, &dark .ox-code-fence .ox-code": {
+    backgroundColor: "transparent",
+  },
+
+  // Nested list items (depth >= 2): the raw indent whitespace conceals and
+  // the line gets EXACT per-depth padding instead — 1.5em per level, i.e.
+  // each nested marker's left edge aligns with its parent's text column
+  // (which starts after the parent's own 1.5em marker box).
+  // calc: our padding REPLACES the line's default (CM6 base: 6px left), so
+  // add it back — otherwise every depth sits 6px left of its target column.
+  ".ox-li-2": { paddingLeft: "calc(6px + 1.5em)" },
+  ".ox-li-3": { paddingLeft: "calc(6px + 3em)" },
+  ".ox-li-4": { paddingLeft: "calc(6px + 4.5em)" },
 
   // Thematic break: the raw `---` is concealed (per the amended contract) and
   // the line draws an actual centered 1px rule; revealing the line shows the
@@ -201,6 +238,9 @@ export const oxidownTheme = EditorView.baseTheme({
   ".ox-task-checkbox": {
     appearance: "none",
     WebkitAppearance: "none",
+    // Inputs do NOT inherit font-size; without this, every em unit below
+    // resolves against the UA's ~13px default instead of the line's font.
+    fontSize: "inherit",
     width: "1.05em",
     height: "1.05em",
     borderRadius: "0.28em",
@@ -213,9 +253,11 @@ export const oxidownTheme = EditorView.baseTheme({
     position: "relative",
     top: "-0.13em",
     // The task item's "- " marker is concealed (~0 width), so the checkbox
-    // provides its own lead-in: box ends at ~1.1em + 0.4em gap puts the item
-    // text at ~1.5em — the same column as bullet and ordered item text.
-    margin: "0 0.4em 0 0.05em",
+    // provides its own lead-in. Margins center the checkbox on the SAME
+    // column center as the bullet dot (0.83em: dot spans [0.66em, 1.0em] in
+    // its 1.5em box) while keeping item text at the shared 1.5em column:
+    // 0.3em + 1.05em box + 0.15em = 1.5em.
+    margin: "0 0.15em 0 0.3em",
     cursor: "pointer",
     transition: "background-color 80ms ease, border-color 80ms ease",
   },
@@ -227,7 +269,9 @@ export const oxidownTheme = EditorView.baseTheme({
     borderColor: "#3b82f6",
     backgroundImage:
       "url(\"data:image/svg+xml,%3csvg viewBox='0 0 16 16' fill='white' xmlns='http://www.w3.org/2000/svg'%3e%3cpath d='M12.207 4.793a1 1 0 010 1.414l-5 5a1 1 0 01-1.414 0l-2-2a1 1 0 011.414-1.414L6.5 9.086l4.293-4.293a1 1 0 011.414 0z'/%3e%3c/svg%3e\")",
-    backgroundSize: "100% 100%",
+    // >100% zooms the check glyph itself (the SVG carries internal padding);
+    // center keeps it symmetric inside the blue square.
+    backgroundSize: "135% 135%",
     backgroundPosition: "center",
     backgroundRepeat: "no-repeat",
   },

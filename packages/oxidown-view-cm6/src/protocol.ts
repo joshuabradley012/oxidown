@@ -52,8 +52,9 @@ export interface DecorationLine {
     | "blockquote"
     | "code-block"
     | "code-fence"
-    | "hr";
-  /** blockquote nesting depth (1-based); present only for style "blockquote". */
+    | "hr"
+    | "list-item";
+  /** Nesting depth (1-based); present for styles "blockquote" and "list-item". */
   depth?: number;
 }
 /**

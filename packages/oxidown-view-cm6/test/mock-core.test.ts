@@ -566,7 +566,11 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     // it withholds the task widget.
     const revealedDs = core.decorations(core.revision(), 0, doc.length, cursor(3));
     expect(revealedDs.filter((d) => d.kind === "widget" && d.widget === "task")).toEqual([]);
-    expect(marks(revealedDs, "delim")).toEqual([{ kind: "mark", from: 2, to: 5, style: "delim" }]);
+    // Lockstep reveal: the dash AND the brackets show together as delims.
+    expect(marks(revealedDs, "delim")).toEqual([
+      { kind: "mark", from: 0, to: 2, style: "delim" },
+      { kind: "mark", from: 2, to: 5, style: "delim" },
+    ]);
   });
 
   it("checked task items report checked: true", () => {

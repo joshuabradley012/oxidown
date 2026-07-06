@@ -346,6 +346,19 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
   if (listM) {
     const { markerFrom, contentFrom } = listM;
     const isBullet = /[-*+]/.test(content[markerFrom]);
+    // Nested items (approximated as depth = floor(indent/2) + 1, matching
+    // 2-space bullet / 3-space ordered nesting closely enough for the mock):
+    // a line:list-item decoration + the raw indent concealed.
+    const depth = Math.floor(markerFrom / 2) + 1;
+    if (depth >= 2 && markerFrom > 0) {
+      nodes.push({
+        start: base,
+        end: base + markerFrom,
+        conceals: [[base, base + markerFrom]],
+        marks: [],
+        line: { kind: "line", at: base, style: "list-item", depth },
+      });
+    }
     const afterMarker = content.slice(contentFrom);
     const taskM = TASK_RE.exec(afterMarker);
     if (taskM) {
@@ -719,19 +732,12 @@ export class MockCore implements OxidownCore {
       }
 
       if (node.widget) {
-        // Task-item marker (`- `): concealed unless the cursor is STRICTLY
-        // inside the marker span (core parity), in which case it shows as a
-        // list-marker mark.
+        // Task-item marker (`- `): reveals IN LOCKSTEP with the checkbox —
+        // both key off the node-level `revealed` (extent = marker..checkbox),
+        // so the dash and the brackets always show together (core parity).
         for (const [cf, ct] of node.conceals) {
-          const strictMarker =
-            selections.some((sel) => {
-              const lo = Math.min(sel.anchor, sel.head);
-              const hi = Math.max(sel.anchor, sel.head);
-              return lo < ct && hi > cf;
-            }) ||
-            (this.composing && this.compFrom <= ct && this.compTo >= cf);
-          if (strictMarker) {
-            out.push({ kind: "mark", from: cf, to: ct, style: "list-marker" });
+          if (revealed) {
+            out.push({ kind: "mark", from: cf, to: ct, style: "delim" });
           } else {
             out.push({ kind: "conceal", from: cf, to: ct });
           }

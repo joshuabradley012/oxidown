@@ -312,10 +312,10 @@ fn task_item_widget_withheld_when_item_marker_extent_revealed() {
     assert_eq!(
         d,
         vec![
-            // Cursor at line start: the task marker stays concealed (strict
-            // interior rule) while the task widget is withheld (its reveal
-            // extent is the item marker extent, closed-interval).
-            conceal(0, 2),
+            // Lockstep reveal: the dash and the brackets share the item
+            // marker extent, so a cursor anywhere in [0, 5] shows BOTH as
+            // raw delim text together — never one without the other.
+            mark(0, 2, MarkStyle::Delim),
             mark(2, 5, MarkStyle::Delim),
         ]
     );
@@ -393,4 +393,42 @@ fn viewport_filters_new_constructs() {
     let first = ed.decorations(rev, 0, 5, &[]).unwrap();
     assert!(first.iter().any(|d| matches!(d, Decoration::Mark { style: MarkStyle::Strike, .. })));
     assert!(!first.iter().any(|d| matches!(d, Decoration::Widget { .. })));
+}
+
+
+#[test]
+fn nested_list_items_emit_list_item_lines_with_concealed_indent() {
+    // depth-2 bullet under a bullet (2-space indent), depth-3 (4 spaces),
+    // and a bullet nested under an ordered item (3-space indent).
+    let doc = "- a\n  - b\n    - c\n1. x\n   - y\n";
+    let d = decos(doc, &[]);
+    assert!(d.contains(&block(4, BlockStyle::ListItem(2))), "depth 2: {d:?}");
+    assert!(d.contains(&conceal(4, 6)), "depth-2 indent conceals");
+    assert!(d.contains(&block(10, BlockStyle::ListItem(3))), "depth 3");
+    assert!(d.contains(&conceal(10, 14)), "depth-3 indent conceals");
+    assert!(d.contains(&block(23, BlockStyle::ListItem(2))), "under ordered: {d:?}");
+    assert!(d.contains(&conceal(23, 26)), "3-space indent conceals");
+    // Top-level items emit NO list-item line.
+    assert!(!d.contains(&block(0, BlockStyle::ListItem(1))));
+    // Cursor inside the indent reveals it as delim.
+    let d = decos(doc, &[(5, 5)]);
+    assert!(d.contains(&mark(4, 6, MarkStyle::Delim)));
+}
+
+#[test]
+fn task_marker_reveals_in_lockstep_with_checkbox() {
+    let doc = "- [ ] todo\n";
+    // Cursor anywhere in the item marker extent [0, 5] reveals BOTH the
+    // dash and the brackets together...
+    for pos in 0..=5 {
+        let d = decos(doc, &[(pos, pos)]);
+        assert!(
+            d.contains(&mark(0, 2, MarkStyle::Delim)) && d.contains(&mark(2, 5, MarkStyle::Delim)),
+            "pos {pos}: {d:?}"
+        );
+    }
+    // ...and outside it, both conceal together (widget + concealed dash).
+    let d = decos(doc, &[(8, 8)]);
+    assert!(d.contains(&conceal(0, 2)));
+    assert!(d.contains(&widget(2, 5, false)));
 }

@@ -3,16 +3,67 @@
 // (soft-wrapping is the view's job, via EditorView.lineWrapping) — hard-
 // wrapping prose at ~72 columns would render those wraps literally.
 
-export const SAMPLE_DOC = `# Oxidown M0 demo
+/**
+ * Every currently-supported mark, in one block (contract v0.2 + amendments):
+ * headings h1–h6, bold/italic in both delimiter flavors, bold-italic, inline
+ * code, strikethrough, links + autolinks, nested blockquotes, a fenced code
+ * block with syntax highlighting, bullet/ordered/task lists incl. deep and
+ * MIXED nesting, and a thematic break. Shared by the default document and
+ * the streaming demo (the stream just repeats it).
+ */
+const ALL_MARKS = `## Inline marks
 
-## Hybrid live preview
+**Bold** and __also bold__, *italic* and _also italic_, ***bold italic***, \`inline code\`, ~~strikethrough~~, a [link](https://example.com), and an autolink <https://oxidown.dev>. Put the cursor inside any of them to reveal the raw syntax.
 
-Some **bold text**, some *italic text*, and \`inline code\`. Move the cursor into a formatted span to reveal its delimiters; move away to conceal them.
+## Headings
 
-### Nesting
+# Heading 1
+## Heading 2
+### Heading 3
+#### Heading 4
+##### Heading 5
+###### Heading 6
 
-Here is **bold with *italic* inside** and ***both at once***. Alternate delimiters work too: __strong__ and _emphasis_.
+## Blockquotes
 
+> Level one quote — the bar on the left marks the depth.
+> > Level two nests with a second bar and more indent.
+> > > Level three, same idea.
+
+## Code
+
+\`\`\`ts
+function greet(name: string): string {
+  // comments, keywords, strings, and numbers all highlight
+  const excitement = 3;
+  return \`hello, \${name}\` + "!".repeat(excitement);
+}
+\`\`\`
+
+## Lists — plain, ordered, tasks, nested, mixed
+
+- bullet level one
+- another bullet
+  - nested bullet — its dot starts where the parent's text starts
+    - third level, one more step in
+- [ ] a task item
+- [x] a completed task
+  - [ ] a task nested under a task
+1. ordered one
+2. ordered two
+   1. nested ordered item
+   - a bullet nested under an ordered item
+   - [x] a task nested under an ordered item
+3. ordered three
+
+---
+`;
+
+export const SAMPLE_DOC = `# Oxidown demo
+
+Everything below is plain markdown — the file is the document. Move the cursor into any formatted span to reveal its delimiters; move away to conceal them. Toggle source mode above to see the raw text.
+
+${ALL_MARKS}
 ## 日本語の段落（IME テスト）
 
 これは日本語の段落です。**太字**と*斜体*、\`コード\`も混ざっています。この行でかな漢字変換を試してください。変換中（未確定文字列がある間）は装飾の再計算が凍結され、確定した時点で再描画されます。
@@ -23,73 +74,23 @@ Emoji 😀 in plain text, **bold 🎉 emoji**, and *italic 🚀 emoji* — all p
 
 ## What to try
 
-Type, undo (Cmd/Ctrl-Z), redo (Cmd/Ctrl-Shift-Z or Ctrl-Y), paste, drag-select across formatted spans, and toggle source mode above.
+Type, undo (Cmd/Ctrl-Z), redo (Cmd/Ctrl-Shift-Z or Ctrl-Y), paste, drag-select across formatted spans, Tab/Shift-Tab to indent, click the checkboxes, and toggle source mode above.
 `;
 
 /**
- * Hardcoded "LLM answer" for the streaming demo (no network). Exercises the
- * ENTIRE currently-supported decoration vocabulary (contract v0.2): headings
- * h2-h4, bold/italic (both delimiter flavors), inline code, strikethrough,
- * links + autolinks, nested blockquotes, a fenced code block, bullet lists
- * (nested), an ordered list, task checkboxes, and a thematic break — so the
- * append fast-path is exercised across every construct. main.ts delivers
- * this via streamOpen/streamAppend/streamClose in randomly-sized chunks that
- * do NOT align to token or markdown boundaries, on purpose.
+ * Hardcoded "LLM answer" for the streaming demo (no network): a short intro,
+ * then the full ALL_MARKS block — so the append fast-path is exercised across
+ * every supported construct, delivered in randomly-sized chunks that do NOT
+ * align to token or markdown boundaries, on purpose.
  */
 export const STREAM_TEXT = `## Streaming into a live document
 
-Here's what's happening while this text appears.
+Watch this answer type itself in, then try editing the top of the document at the same time — your cursor never moves, because the stream's edits are mapped around it by the core.
 
-### What's new in M1
+Everything Oxidown can render will now stream in, chunk by unpredictable chunk. Mid-construct states (an unterminated fence, a half-typed \`**bold\`) render honestly for a moment and snap into shape when the closing syntax arrives.
 
-The core now understands more markdown, and the view renders it without ever losing the source text underneath: **bold**, *italic*, and even ~~struck-through~~ runs stay concealed until your cursor visits them. Links work too — the design borrows from [Peritext](https://www.inkandswitch.com/peritext/) and [lezer-markdown](https://github.com/lezer-parser/markdown), and bare autolinks like <https://oxidown.dev> render as links as well. Put your cursor inside one to reveal its destination.
-
-#### The full vocabulary, in one list
-
-- **Bold** (\`**\` or \`__\`) and *italic* (\`*\` or \`_\`)
-- ~~Strikethrough~~ and \`inline code\`
-- [Links](https://example.com) and <https://autolinks.example>
-  - nested bullets indent like this
-  - and render as proper dots until your cursor enters the marker
-- Blockquotes, fences, tasks, and ordered lists — all shown below
-
-> Concealment never removes characters from the DOM — it only collapses them visually. That discipline is exactly what keeps this stream from corrupting anything while it types itself in.
-
-### Try this right now
-
-1. Leave this answer streaming.
-2. Click into the **top** of the document and keep typing.
-3. Notice your own edits are never interrupted — the stream keeps appending exactly where it left off, underneath your cursor.
-
-### A tiny code sample
-
-\`\`\`ts
-function toggle(doc: string, from: number, to: number): string {
-  return doc.slice(0, from) + "**" + doc.slice(from, to) + "**" + doc.slice(to);
-}
-\`\`\`
-
-### Progress checklist
-
-- [x] Protocol extended additively: marks, lines, widgets, anchors
-- [x] MockCore implements commands, anchors, and streaming
-- [x] The view renders the new vocabulary with no layout shift
-- [ ] Wire up the real Rust/wasm core once it lands
-- [ ] Bring the same widget pattern to tables and images
-
-### Why streaming is the headline feature
-
-Most editors treat AI output as a read-only bubble bolted onto the side of the real document. Oxidown treats it as *first-class input*: the same splice-based pipe that carries your keystrokes carries the model's tokens, chunk by chunk, arriving at unpredictable byte boundaries.
-
-That means the parser has to stay honest about partial input — an unterminated fence or a half-typed \`**bold\` never gets to corrupt anything, because the document is never anything other than plain text.
-
-> "The file is the document." Everything else — decorations, widgets, reveal state — is disposable and re-derivable. If it's wrong, it just repaints; it can never corrupt what you actually wrote.
->
-> > Blockquotes nest, too — depth gets its own styling.
-
----
-
-That's the whole pitch — thanks for reading. Now go try editing while this finishes streaming in.
+${ALL_MARKS}
+That's the whole vocabulary — streamed into a document you could keep editing the entire time. One undo (Cmd/Ctrl-Z) reverts this whole answer as a single unit without touching your own edits.
 `;
 
 export function largeDocFiller(paragraphs = 200): string {
