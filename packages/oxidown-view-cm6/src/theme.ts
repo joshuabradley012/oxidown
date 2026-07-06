@@ -90,6 +90,12 @@ export const oxidownTheme = EditorView.baseTheme({
     minWidth: "1.5em",
     textAlign: "right",
     opacity: "0.85",
+    // The caret adjacent to a widget inherits the widget box's rect height;
+    // an uncapped inline-block strut is the full line height (24px), so the
+    // caret rendered enlarged next to bullets. Cap the box near text height;
+    // text-bottom keeps the dot optically centered (~0.6px off).
+    height: "1.2em",
+    verticalAlign: "text-bottom",
   },
   ".ox-bullet::before": {
     content: '""',
