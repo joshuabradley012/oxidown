@@ -174,9 +174,9 @@ export interface DecorationLineV2 {
 export interface DecorationWidget {
   kind: "widget";
   from: number;
-  to: number;                 // source range the widget REPLACES visually ("[ ]" / "[x]")
-  widget: "task";
-  checked: boolean;
+  to: number;                 // source range the widget REPLACES visually
+  widget: "task" | "bullet";  // task: "[ ]"/"[x]" (carries checked); bullet: the whole "- " marker
+  checked?: boolean;
 }
 ```
 
@@ -186,11 +186,19 @@ M1 emission scope (parser may understand more than it decorates):
   Revealed: delimiters as `mark:delim`, destination as `mark:url`. Autolinks: `mark:link` whole.
 - Blockquotes — `line:blockquote` per line with depth; `> ` markers conceal, reveal per-line.
 - Fenced code blocks — `line:code-fence` on fence lines, `line:code-block` on body lines,
-  `mark:code` on body content. Fences stay visible in M1 (styled, never concealed).
-- Lists — `mark:list-marker` on markers (never concealed). Task items additionally emit a
-  `widget:task` replacing exactly the `[ ]`/`[x]` span; when the node is revealed the widget is
-  withheld and the checkbox source shows as `mark:delim`.
-- Thematic break — `line:hr` (styled only in M1).
+  `mark:code` on body content. The raw fence text (``` + info string) conceals like the
+  thematic break (revealed as `mark:delim` when the cursor is on that fence line); the styled
+  fence line itself reads as the code block's top/bottom edge.
+- Lists — ordered markers emit `mark:list-marker` (always visible; alignment is view styling:
+  fixed-width right-aligned box + tabular numerals). **Unordered markers emit `widget:bullet`
+  replacing the whole marker span (`"- "`)**, revealed as `mark:list-marker` under STRICT
+  interior overlap (`a < end && b > start`) — the cursor at the item text's first character or
+  at line start does not flash the raw marker. Task items additionally emit a `widget:task`
+  replacing exactly the `[ ]`/`[x]` span; when the item is revealed the widget is withheld and
+  the checkbox source shows as `mark:delim`.
+- Thematic break — `line:hr` on the line, plus `conceal` over the raw dashes (revealed as
+  `mark:delim` when the cursor is on the line). The view draws the actual rule on the hr line;
+  nested blockquote bars are likewise the view's job (one bar per depth level).
 - Headings/strong/em/inline-code unchanged from v0.
 
 Reveal semantics are unchanged: per-node selection∩extent (task widget reveal = the LIST ITEM's

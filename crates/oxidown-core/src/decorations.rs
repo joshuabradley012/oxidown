@@ -118,14 +118,28 @@ pub enum Decoration {
         at: usize,
         style: BlockStyle,
     },
-    /// M1: a task item's checkbox, replacing the `[ ]`/`[x]` source span.
-    /// Withheld (in favor of `mark:delim` over the same span) when the
-    /// node is revealed or under active composition.
+    /// M1: a widget replacing a source span visually. Withheld (in favor of
+    /// a mark over the same span) when the node is revealed or under active
+    /// composition.
     Widget {
         from: usize,
         to: usize,
-        checked: bool,
+        kind: WidgetKind,
     },
+}
+
+/// Widget vocabulary (wire: the `widget` field of `{kind:"widget", ...}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WidgetKind {
+    /// A task item's checkbox, replacing the `[ ]`/`[x]` source span.
+    /// Withheld as `mark:delim` on reveal.
+    Task { checked: bool },
+    /// An unordered list item's bullet, replacing the whole marker span
+    /// (glyph + trailing whitespace, e.g. `"- "`). Withheld as
+    /// `mark:list-marker` on reveal. Reveal is STRICT containment (the
+    /// cursor sitting at the item text's first character does not reveal),
+    /// so ordinary typing at the item start never flashes the raw marker.
+    Bullet,
 }
 
 /// Closed-interval intersection: empty ranges (cursors) at a boundary count.
@@ -153,11 +167,50 @@ pub fn compute(
             .any(|&(a, b)| touches(a, b, reveal_extent.start, reveal_extent.end));
 
         match node.kind {
-            NodeKind::ListMarker => {
-                if node.extent.end > node.extent.start {
+            NodeKind::ListMarker { task } => {
+                if node.extent.end <= node.extent.start {
+                    continue;
+                }
+                let from = text.byte_to_utf16(node.extent.start);
+                let to = text.byte_to_utf16(node.extent.end);
+                let is_bullet =
+                    matches!(text.byte_at(node.extent.start), Some(b'-' | b'*' | b'+'));
+                if is_bullet {
+                    // Bullets render as a `•` widget. Reveal uses STRICT
+                    // interior overlap (`a < end && b > start`), not the
+                    // closed-interval `touches`: a cursor at the item text's
+                    // first character (== extent end, the most common typing
+                    // position) or at the line start must not flash the raw
+                    // `- `; entering the marker or selecting across it does.
+                    let strictly_inside = selections
+                        .iter()
+                        .any(|&(a, b)| a < node.extent.end && b > node.extent.start);
+                    let in_composition = composition.is_some_and(|c| {
+                        touches(c.start, c.end, node.extent.start, node.extent.end)
+                    });
+                    if strictly_inside || in_composition {
+                        out.push(Decoration::Mark {
+                            from,
+                            to,
+                            style: MarkStyle::ListMarker,
+                        });
+                    } else if task {
+                        // Task items: the checkbox widget alone represents
+                        // the item — the `- ` conceals entirely (no bullet).
+                        out.push(Decoration::Conceal { from, to });
+                    } else {
+                        out.push(Decoration::Widget {
+                            from,
+                            to,
+                            kind: WidgetKind::Bullet,
+                        });
+                    }
+                } else {
+                    // Ordered markers stay visible text, always (alignment is
+                    // the view's job via styling).
                     out.push(Decoration::Mark {
-                        from: text.byte_to_utf16(node.extent.start),
-                        to: text.byte_to_utf16(node.extent.end),
+                        from,
+                        to,
                         style: MarkStyle::ListMarker,
                     });
                 }
@@ -175,7 +228,11 @@ pub fn compute(
                         style: MarkStyle::Delim,
                     });
                 } else {
-                    out.push(Decoration::Widget { from, to, checked });
+                    out.push(Decoration::Widget {
+                        from,
+                        to,
+                        kind: WidgetKind::Task { checked },
+                    });
                 }
                 continue;
             }
@@ -207,6 +264,24 @@ pub fn compute(
                     at: text.byte_to_utf16(node.extent.start),
                     style: BlockStyle::CodeFence,
                 });
+                // Like the thematic break: the raw fence (``` + info string)
+                // conceals unless the cursor is on the fence line — the
+                // styled fence line itself reads as the code block's edge.
+                let in_composition = composition
+                    .is_some_and(|c| touches(c.start, c.end, node.extent.start, node.extent.end));
+                let from = text.byte_to_utf16(node.extent.start);
+                let to = text.byte_to_utf16(node.extent.end);
+                if to > from {
+                    if revealed || in_composition {
+                        out.push(Decoration::Mark {
+                            from,
+                            to,
+                            style: MarkStyle::Delim,
+                        });
+                    } else {
+                        out.push(Decoration::Conceal { from, to });
+                    }
+                }
                 None
             }
             NodeKind::CodeBlockLine => {
@@ -221,9 +296,25 @@ pub fn compute(
                     at: text.byte_to_utf16(node.extent.start),
                     style: BlockStyle::ThematicBreak,
                 });
+                // The `---` source participates in reveal like any delimiter:
+                // concealed (the view draws the rule via the hr line style)
+                // unless the cursor is on the line or composition touches it.
+                let in_composition = composition
+                    .is_some_and(|c| touches(c.start, c.end, node.extent.start, node.extent.end));
+                let from = text.byte_to_utf16(node.extent.start);
+                let to = text.byte_to_utf16(node.extent.end);
+                if revealed || in_composition {
+                    out.push(Decoration::Mark {
+                        from,
+                        to,
+                        style: MarkStyle::Delim,
+                    });
+                } else {
+                    out.push(Decoration::Conceal { from, to });
+                }
                 None
             }
-            NodeKind::ListMarker | NodeKind::TaskWidget { .. } => {
+            NodeKind::ListMarker { .. } | NodeKind::TaskWidget { .. } => {
                 unreachable!("handled above with `continue`")
             }
         };

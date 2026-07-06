@@ -348,3 +348,25 @@ describe("v0.2 additions (M1)", () => {
     view.destroy();
   });
 });
+
+describe("hr rule suppression while editing", () => {
+  it("swaps ox-hr for ox-hr-revealed when the cursor is on the hr line", async () => {
+    const core = new MockCore();
+    const view = makeView("before\n---\nafter", core);
+    await flush();
+    const hrLine = () =>
+      [...view.contentDOM.querySelectorAll(".cm-line")].find((l) =>
+        l.textContent?.includes("---"),
+      ) as HTMLElement;
+    // Cursor away from the hr: rule class present, revealed class absent.
+    view.dispatch({ selection: { anchor: 0 } });
+    await flush();
+    expect(hrLine().classList.contains("ox-hr")).toBe(true);
+    expect(hrLine().classList.contains("ox-hr-revealed")).toBe(false);
+    // Cursor on the hr line (inside "---"): revealed class appears.
+    view.dispatch({ selection: { anchor: 8 } });
+    await flush();
+    expect(hrLine().classList.contains("ox-hr-revealed")).toBe(true);
+    view.destroy();
+  });
+});

@@ -32,7 +32,19 @@ fn block(at: usize, style: BlockStyle) -> Decoration {
 }
 
 fn widget(from: usize, to: usize, checked: bool) -> Decoration {
-    Decoration::Widget { from, to, checked }
+    Decoration::Widget {
+        from,
+        to,
+        kind: oxidown_core::WidgetKind::Task { checked },
+    }
+}
+
+fn bullet(from: usize, to: usize) -> Decoration {
+    Decoration::Widget {
+        from,
+        to,
+        kind: oxidown_core::WidgetKind::Bullet,
+    }
 }
 
 // --------------------------------------------------------- strikethrough --
@@ -197,18 +209,26 @@ fn blockquote_cjk_marker_offsets() {
 // --------------------------------------------------------------- fences --
 
 #[test]
-fn fenced_code_block_lines_styled_never_concealed() {
+fn fenced_code_block_fences_conceal_and_reveal_per_line() {
     let doc = "```rust\nfn main() {}\n```\n";
+    // Concealed: fence lines keep their line style; the raw ``` + info
+    // string conceal (the styled fence line reads as the block's edge).
     let d = decos(doc, &[]);
     assert_eq!(
         d,
         vec![
             block(0, BlockStyle::CodeFence),
+            conceal(0, 7),
             block(8, BlockStyle::CodeBlock),
             mark(8, 20, MarkStyle::Code),
             block(21, BlockStyle::CodeFence),
+            conceal(21, 24),
         ]
     );
+    // Cursor on the opening fence reveals ONLY that fence's raw source.
+    let d = decos(doc, &[(2, 2)]);
+    assert!(d.contains(&mark(0, 7, MarkStyle::Delim)));
+    assert!(d.contains(&conceal(21, 24)));
 }
 
 #[test]
@@ -219,11 +239,13 @@ fn fenced_code_multi_line_body() {
         d,
         vec![
             block(0, BlockStyle::CodeFence),
+            conceal(0, 3),
             block(4, BlockStyle::CodeBlock),
             mark(4, 9, MarkStyle::Code),
             block(10, BlockStyle::CodeBlock),
             mark(10, 14, MarkStyle::Code),
             block(15, BlockStyle::CodeFence),
+            conceal(15, 18),
         ]
     );
 }
@@ -231,16 +253,26 @@ fn fenced_code_multi_line_body() {
 // ------------------------------------------------------------------ lists --
 
 #[test]
-fn unordered_list_marker_always_visible() {
+fn unordered_list_marker_bullet_widget_and_strict_reveal() {
+    // Concealed: bullets render as a widget over the whole marker span.
     let d = decos("- one\n- two\n", &[]);
-    assert_eq!(
-        d,
-        vec![
-            mark(0, 2, MarkStyle::ListMarker),
-            mark(6, 8, MarkStyle::ListMarker),
-        ]
-    );
-    // Even with no selection touching it at all, the marker never conceals.
+    assert_eq!(d, vec![bullet(0, 2), bullet(6, 8)]);
+    // Cursor at the item text's first character (== extent end, the common
+    // typing position) does NOT reveal — strict interior overlap only.
+    let d = decos("- one\n- two\n", &[(2, 2)]);
+    assert_eq!(d[0], bullet(0, 2));
+    // Cursor strictly inside the marker reveals the raw source as a mark.
+    let d = decos("- one\n- two\n", &[(1, 1)]);
+    assert_eq!(d[0], mark(0, 2, MarkStyle::ListMarker));
+    // A selection crossing the marker reveals it too.
+    let d = decos("- one\n- two\n", &[(1, 4)]);
+    assert_eq!(d[0], mark(0, 2, MarkStyle::ListMarker));
+    // Composition touching the marker reveals it (stability rule).
+    let mut ed = Editor::new(1);
+    let rev = ed.load("- one\n");
+    ed.composition_begin(1, 1).unwrap();
+    let d = ed.decorations(rev, 0, ed.doc_len_utf16(), &[]).unwrap();
+    assert_eq!(d[0], mark(0, 2, MarkStyle::ListMarker));
 }
 
 #[test]
@@ -261,9 +293,11 @@ fn task_item_widget_when_not_revealed() {
     assert_eq!(
         d,
         vec![
-            mark(0, 2, MarkStyle::ListMarker),
+            // Task-item markers conceal entirely (no bullet): the checkbox
+            // widget alone represents the item.
+            conceal(0, 2),
             widget(2, 5, false),
-            mark(11, 13, MarkStyle::ListMarker),
+            conceal(11, 13),
             widget(13, 16, true),
         ]
     );
@@ -278,14 +312,19 @@ fn task_item_widget_withheld_when_item_marker_extent_revealed() {
     assert_eq!(
         d,
         vec![
-            mark(0, 2, MarkStyle::ListMarker),
+            // Cursor at line start: the task marker stays concealed (strict
+            // interior rule) while the task widget is withheld (its reveal
+            // extent is the item marker extent, closed-interval).
+            conceal(0, 2),
             mark(2, 5, MarkStyle::Delim),
         ]
     );
     // Cursor inside the checkbox glyphs themselves also withholds it.
     let d = decos("- [ ] todo\n", &[(3, 3)]);
     assert!(d.contains(&mark(2, 5, MarkStyle::Delim)));
-    assert!(!d.iter().any(|d| matches!(d, Decoration::Widget { .. })));
+    assert!(!d
+        .iter()
+        .any(|d| matches!(d, Decoration::Widget { kind: oxidown_core::WidgetKind::Task { .. }, .. })));
     // Cursor well past the item's marker extent (in the body text) leaves
     // the widget in place.
     let d = decos("- [ ] todo\n", &[(8, 8)]);
@@ -299,7 +338,9 @@ fn task_item_composition_over_checkbox_withholds_widget() {
     ed.composition_begin(3, 3).unwrap();
     let d = ed.decorations(rev, 0, ed.doc_len_utf16(), &[]).unwrap();
     assert!(d.contains(&mark(2, 5, MarkStyle::Delim)));
-    assert!(!d.iter().any(|d| matches!(d, Decoration::Widget { .. })));
+    assert!(!d
+        .iter()
+        .any(|d| matches!(d, Decoration::Widget { kind: oxidown_core::WidgetKind::Task { .. }, .. })));
 }
 
 #[test]
@@ -308,15 +349,23 @@ fn list_inside_blockquote_gets_marker_and_blockquote_line() {
     let d = decos(doc, &[]);
     assert!(d.contains(&block(0, BlockStyle::BlockQuote(1))));
     assert!(d.contains(&conceal(0, 2)));
-    assert!(d.contains(&mark(2, 4, MarkStyle::ListMarker)));
+    assert!(d.contains(&bullet(2, 4)));
 }
 
 // ----------------------------------------------------------- thematic break --
 
 #[test]
-fn thematic_break_line_style() {
+fn thematic_break_line_style_and_reveal() {
+    // Concealed: the hr line style plus a conceal over the raw dashes (the
+    // view draws the rule; the source collapses).
     let d = decos("a\n\n---\n\nb\n", &[]);
     assert!(d.contains(&block(3, BlockStyle::ThematicBreak)));
+    assert!(d.contains(&conceal(3, 6)));
+    // Cursor on the hr line reveals the dashes as delim text.
+    let d = decos("a\n\n---\n\nb\n", &[(4, 4)]);
+    assert!(d.contains(&block(3, BlockStyle::ThematicBreak)));
+    assert!(d.contains(&mark(3, 6, MarkStyle::Delim)));
+    assert!(!d.contains(&conceal(3, 6)));
 }
 
 // --------------------------------------------------------- viewport/misc --

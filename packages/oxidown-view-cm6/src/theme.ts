@@ -72,19 +72,71 @@ export const oxidownTheme = EditorView.baseTheme({
   "&dark .ox-link": { color: "#7db2ff" },
   ".ox-url": { opacity: "0.6", fontStyle: "italic" },
 
-  // List markers: always visible, never concealed.
-  ".ox-list-marker": { opacity: "0.7" },
-
-  // Blockquotes: left border + muted text, depth-dependent indent. Never a
-  // font-size change, so the `> ` marker's reveal/conceal cannot shift height.
-  ".ox-blockquote": {
-    borderLeft: "3px solid currentColor",
-    opacity: "0.8",
-    paddingLeft: "0.75em",
+  // List markers. Ordered markers stay text ("1. ") and get a fixed-width,
+  // right-aligned box with tabular numerals so single/double-digit items
+  // align; the bullet widget (below) shares the same box metrics so
+  // conceal↔reveal never shifts the item text.
+  ".ox-list-marker": {
+    opacity: "0.7",
+    fontVariantNumeric: "tabular-nums",
+    display: "inline-block",
+    minWidth: "1.5em",
+    textAlign: "right",
   },
-  ".ox-bq-1": { borderLeftColor: "rgba(100, 100, 100, 0.5)" },
-  ".ox-bq-2": { paddingLeft: "1.5em", borderLeftColor: "rgba(100, 100, 100, 0.35)" },
-  ".ox-bq-3": { paddingLeft: "2.25em", borderLeftColor: "rgba(100, 100, 100, 0.2)" },
+  // Unordered bullet widget (replaces the raw "- " span when concealed).
+  // The dot is a pure-CSS circle (`::before`), NOT a text glyph — so its
+  // size, optical centering (vertical-align: middle), and the gap to the
+  // item text are exact and font-independent. The box stays compact so
+  // first-level items hug the margin.
+  ".ox-bullet": {
+    display: "inline-block",
+    minWidth: "1em",
+    opacity: "0.85",
+  },
+  ".ox-bullet::before": {
+    content: '""',
+    display: "inline-block",
+    width: "0.34em",
+    height: "0.34em",
+    borderRadius: "50%",
+    backgroundColor: "currentColor",
+    verticalAlign: "middle",
+    marginLeft: "0.08em",
+    marginRight: "0.55em",
+  },
+
+  // Blockquotes: one vertical bar PER nesting level, drawn as layered
+  // background gradients at increasing offsets (a single border-left cannot
+  // render nested bars). Never a font-size change, so the `> ` marker's
+  // reveal/conceal cannot shift height.
+  "&light .cm-content": {
+    "--ox-bq-bar": "linear-gradient(rgba(0,0,0,0.28), rgba(0,0,0,0.28))",
+    "--ox-hr-line": "linear-gradient(rgba(0,0,0,0.25), rgba(0,0,0,0.25))",
+  },
+  "&dark .cm-content": {
+    "--ox-bq-bar": "linear-gradient(rgba(255,255,255,0.32), rgba(255,255,255,0.32))",
+    "--ox-hr-line": "linear-gradient(rgba(255,255,255,0.28), rgba(255,255,255,0.28))",
+  },
+  ".ox-blockquote": {
+    opacity: "0.85",
+    backgroundRepeat: "no-repeat",
+    backgroundSize: "3px 100%",
+  },
+  ".ox-bq-1": {
+    backgroundImage: "var(--ox-bq-bar)",
+    backgroundPosition: "0 0",
+    paddingLeft: "0.9em",
+  },
+  ".ox-bq-2": {
+    backgroundImage: "var(--ox-bq-bar), var(--ox-bq-bar)",
+    backgroundPosition: "0 0, 0.8em 0",
+    paddingLeft: "1.7em",
+  },
+  ".ox-bq-3": {
+    backgroundImage: "var(--ox-bq-bar), var(--ox-bq-bar), var(--ox-bq-bar)",
+    backgroundPosition: "0 0, 0.8em 0, 1.6em 0",
+    paddingLeft: "2.5em",
+  },
 
   // Fenced code blocks: fence + body share one font-family/background so the
   // whole block reads as one unit; the fence line is dimmed relative to body.
@@ -102,15 +154,57 @@ export const oxidownTheme = EditorView.baseTheme({
     backgroundColor: "rgba(255, 255, 255, 0.08)",
   },
 
-  // Thematic break: styled only (M1) — dimmed, spaced-out text, no conceal.
-  ".ox-hr": { opacity: "0.4", letterSpacing: "0.2em" },
+  // Thematic break: the raw `---` is concealed (per the amended contract) and
+  // the line draws an actual centered 1px rule; revealing the line shows the
+  // dashes (as dimmed delim marks) on top of the rule. (Light/dark
+  // `--ox-hr-line` values are defined alongside `--ox-bq-bar` above.)
+  ".ox-hr": {
+    backgroundImage: "var(--ox-hr-line)",
+    backgroundSize: "100% 1px",
+    backgroundPosition: "0 50%",
+    backgroundRepeat: "no-repeat",
+  },
+  // While the hr line is being edited (dashes revealed), hide the rule so
+  // the raw `---` isn't overstruck by it.
+  ".ox-hr-revealed": {
+    backgroundImage: "none",
+  },
 
-  // Task checkbox widget (the first widget island): aligned to the text
-  // baseline so it sits inline with surrounding text without nudging line
-  // height (the CM6 replace decoration keeps the line box's own metrics).
+  // Task checkbox widget (the first widget island): pure-CSS custom checkbox
+  // (Tailwind-forms style — `appearance: none` + inline SVG check), aligned
+  // to the text baseline so it sits inline without nudging line height (the
+  // CM6 replace decoration keeps the line box's own metrics).
   ".ox-task-checkbox": {
+    appearance: "none",
+    WebkitAppearance: "none",
+    width: "1.05em",
+    height: "1.05em",
+    borderRadius: "0.28em",
+    border: "1.5px solid rgba(120, 120, 128, 0.55)",
+    backgroundColor: "transparent",
+    display: "inline-block",
     verticalAlign: "text-bottom",
-    margin: "0 0.35em 0 0",
+    margin: "0 0.4em 0 0",
     cursor: "pointer",
+    transition: "background-color 80ms ease, border-color 80ms ease",
+  },
+  ".ox-task-checkbox:hover": {
+    borderColor: "rgba(59, 130, 246, 0.8)",
+  },
+  ".ox-task-checkbox:checked": {
+    backgroundColor: "#3b82f6",
+    borderColor: "#3b82f6",
+    backgroundImage:
+      "url(\"data:image/svg+xml,%3csvg viewBox='0 0 16 16' fill='white' xmlns='http://www.w3.org/2000/svg'%3e%3cpath d='M12.207 4.793a1 1 0 010 1.414l-5 5a1 1 0 01-1.414 0l-2-2a1 1 0 011.414-1.414L6.5 9.086l4.293-4.293a1 1 0 011.414 0z'/%3e%3c/svg%3e\")",
+    backgroundSize: "100% 100%",
+    backgroundPosition: "center",
+    backgroundRepeat: "no-repeat",
+  },
+  "&dark .ox-task-checkbox": {
+    border: "1.5px solid rgba(180, 180, 190, 0.5)",
+  },
+  "&dark .ox-task-checkbox:checked": {
+    backgroundColor: "#3b82f6",
+    borderColor: "#3b82f6",
   },
 });

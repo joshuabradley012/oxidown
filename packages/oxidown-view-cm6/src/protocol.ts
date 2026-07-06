@@ -65,8 +65,14 @@ export interface DecorationWidget {
   kind: "widget";
   from: number;
   to: number;
-  widget: "task";
-  checked: boolean;
+  /**
+   * "task": replaces the `[ ]`/`[x]` span (carries `checked`).
+   * "bullet": replaces an unordered item's whole marker span (`"- "`); reveal
+   * is STRICT interior overlap, so the cursor at the item text's first
+   * character never flashes the raw marker.
+   */
+  widget: "task" | "bullet";
+  checked?: boolean;
 }
 export type Decoration = DecorationMark | DecorationConceal | DecorationLine | DecorationWidget;
 

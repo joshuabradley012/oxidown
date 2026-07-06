@@ -28,7 +28,7 @@ pub mod parser;
 pub mod text;
 
 pub use commands::Command;
-pub use decorations::{BlockStyle, Decoration, MarkStyle};
+pub use decorations::{BlockStyle, Decoration, MarkStyle, WidgetKind};
 pub use editor::{CoreChange, Editor, SelectionRange, Splice};
 pub use error::CoreError;
 pub use mapping::Bias;

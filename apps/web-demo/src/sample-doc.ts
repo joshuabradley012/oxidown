@@ -1,31 +1,29 @@
+// NOTE: paragraphs in these documents are deliberately single source lines.
+// In a source-truth editor a newline in the source IS a line break on screen
+// (soft-wrapping is the view's job, via EditorView.lineWrapping) — hard-
+// wrapping prose at ~72 columns would render those wraps literally.
+
 export const SAMPLE_DOC = `# Oxidown M0 demo
 
 ## Hybrid live preview
 
-Some **bold text**, some *italic text*, and \`inline code\`. Move the cursor
-into a formatted span to reveal its delimiters; move away to conceal them.
+Some **bold text**, some *italic text*, and \`inline code\`. Move the cursor into a formatted span to reveal its delimiters; move away to conceal them.
 
 ### Nesting
 
-Here is **bold with *italic* inside** and ***both at once***.
-Alternate delimiters work too: __strong__ and _emphasis_.
+Here is **bold with *italic* inside** and ***both at once***. Alternate delimiters work too: __strong__ and _emphasis_.
 
 ## 日本語の段落（IME テスト）
 
-これは日本語の段落です。**太字**と*斜体*、\`コード\`も混ざっています。
-この行でかな漢字変換を試してください。変換中（未確定文字列がある間）は
-装飾の再計算が凍結され、確定した時点で再描画されます。
+これは日本語の段落です。**太字**と*斜体*、\`コード\`も混ざっています。この行でかな漢字変換を試してください。変換中（未確定文字列がある間）は装飾の再計算が凍結され、確定した時点で再描画されます。
 
 ## Emoji width test
 
-Emoji 😀 in plain text, **bold 🎉 emoji**, and *italic 🚀 emoji* — all
-positions cross the boundary as UTF-16 code units, so astral characters
-count as two.
+Emoji 😀 in plain text, **bold 🎉 emoji**, and *italic 🚀 emoji* — all positions cross the boundary as UTF-16 code units, so astral characters count as two.
 
 ## What to try
 
-Type, undo (Cmd/Ctrl-Z), redo (Cmd/Ctrl-Shift-Z or Ctrl-Y), paste,
-drag-select across formatted spans, and toggle source mode above.
+Type, undo (Cmd/Ctrl-Z), redo (Cmd/Ctrl-Shift-Z or Ctrl-Y), paste, drag-select across formatted spans, and toggle source mode above.
 `;
 
 /**
@@ -44,14 +42,7 @@ Here's what's happening while this text appears.
 
 ### What's new in M1
 
-The core now understands more markdown, and the view renders it without
-ever losing the source text underneath: **bold**, *italic*, and even
-~~struck-through~~ runs stay concealed until your cursor visits them.
-Links work too — the design borrows from
-[Peritext](https://www.inkandswitch.com/peritext/) and
-[lezer-markdown](https://github.com/lezer-parser/markdown), and bare
-autolinks like <https://oxidown.dev> render as links as well. Put your
-cursor inside one to reveal its destination.
+The core now understands more markdown, and the view renders it without ever losing the source text underneath: **bold**, *italic*, and even ~~struck-through~~ runs stay concealed until your cursor visits them. Links work too — the design borrows from [Peritext](https://www.inkandswitch.com/peritext/) and [lezer-markdown](https://github.com/lezer-parser/markdown), and bare autolinks like <https://oxidown.dev> render as links as well. Put your cursor inside one to reveal its destination.
 
 #### The full vocabulary, in one list
 
@@ -59,19 +50,16 @@ cursor inside one to reveal its destination.
 - ~~Strikethrough~~ and \`inline code\`
 - [Links](https://example.com) and <https://autolinks.example>
   - nested bullets indent like this
-  - and keep their markers visible, styled — never concealed
+  - and render as proper dots until your cursor enters the marker
 - Blockquotes, fences, tasks, and ordered lists — all shown below
 
-> Concealment never removes characters from the DOM — it only collapses
-> them visually. That discipline is exactly what keeps this stream from
-> corrupting anything while it types itself in.
+> Concealment never removes characters from the DOM — it only collapses them visually. That discipline is exactly what keeps this stream from corrupting anything while it types itself in.
 
 ### Try this right now
 
 1. Leave this answer streaming.
 2. Click into the **top** of the document and keep typing.
-3. Notice your own edits are never interrupted — the stream keeps
-   appending exactly where it left off, underneath your cursor.
+3. Notice your own edits are never interrupted — the stream keeps appending exactly where it left off, underneath your cursor.
 
 ### A tiny code sample
 
@@ -91,25 +79,17 @@ function toggle(doc: string, from: number, to: number): string {
 
 ### Why streaming is the headline feature
 
-Most editors treat AI output as a read-only bubble bolted onto the side of
-the real document. Oxidown treats it as *first-class input*: the same
-splice-based pipe that carries your keystrokes carries the model's tokens,
-chunk by chunk, arriving at unpredictable byte boundaries.
+Most editors treat AI output as a read-only bubble bolted onto the side of the real document. Oxidown treats it as *first-class input*: the same splice-based pipe that carries your keystrokes carries the model's tokens, chunk by chunk, arriving at unpredictable byte boundaries.
 
-That means the parser has to stay honest about partial input — an
-unterminated fence or a half-typed \`**bold\` never gets to corrupt
-anything, because the document is never anything other than plain text.
+That means the parser has to stay honest about partial input — an unterminated fence or a half-typed \`**bold\` never gets to corrupt anything, because the document is never anything other than plain text.
 
-> "The file is the document." Everything else — decorations, widgets,
-> reveal state — is disposable and re-derivable. If it's wrong, it just
-> repaints; it can never corrupt what you actually wrote.
+> "The file is the document." Everything else — decorations, widgets, reveal state — is disposable and re-derivable. If it's wrong, it just repaints; it can never corrupt what you actually wrote.
 >
 > > Blockquotes nest, too — depth gets its own styling.
 
 ---
 
-That's the whole pitch — thanks for reading. Now go try editing while
-this finishes streaming in.
+That's the whole pitch — thanks for reading. Now go try editing while this finishes streaming in.
 `;
 
 export function largeDocFiller(paragraphs = 200): string {

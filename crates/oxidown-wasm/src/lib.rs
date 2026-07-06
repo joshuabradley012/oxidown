@@ -130,13 +130,21 @@ fn decoration_json(d: &Decoration) -> serde_json::Value {
             }
             obj
         }
-        Decoration::Widget { from, to, checked } => json!({
-            "kind": "widget",
-            "from": from,
-            "to": to,
-            "widget": "task",
-            "checked": checked,
-        }),
+        Decoration::Widget { from, to, kind } => match kind {
+            oxidown_core::WidgetKind::Task { checked } => json!({
+                "kind": "widget",
+                "from": from,
+                "to": to,
+                "widget": "task",
+                "checked": checked,
+            }),
+            oxidown_core::WidgetKind::Bullet => json!({
+                "kind": "widget",
+                "from": from,
+                "to": to,
+                "widget": "bullet",
+            }),
+        },
     }
 }
 

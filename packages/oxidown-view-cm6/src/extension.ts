@@ -115,6 +115,8 @@ const lineDecos = {
   "code-fence": Decoration.line({ class: "ox-code-fence" }),
   hr: Decoration.line({ class: "ox-hr" }),
 } as const;
+/** hr line whose dashes are revealed: same class family, rule suppressed. */
+const hrRevealedLineDeco = Decoration.line({ class: "ox-hr ox-hr-revealed" });
 
 /** Blockquote line decorations are depth-dependent; cache one per depth (capped at 3 for styling). */
 const blockquoteLineDecos = new Map<number, Decoration>();
@@ -177,6 +179,29 @@ class TaskCheckboxWidget extends WidgetType {
 
   ignoreEvent(): boolean {
     return true;
+  }
+}
+
+/**
+ * Unordered-list bullet: replaces the raw `- ` marker span with a `•`. Not
+ * interactive — `ignoreEvent` returns false so clicks fall through to the
+ * editor and place the cursor normally.
+ */
+class BulletWidget extends WidgetType {
+  eq(): boolean {
+    return true; // all bullets are identical
+  }
+
+  toDOM(): HTMLElement {
+    // The dot itself is drawn by CSS (`.ox-bullet::before`, a circle sized
+    // and vertically centered independent of any glyph's font metrics).
+    const span = document.createElement("span");
+    span.className = "ox-bullet";
+    return span;
+  }
+
+  ignoreEvent(): boolean {
+    return false;
   }
 }
 
@@ -356,6 +381,14 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
           }
         }
         try {
+          // Pre-pass: positions where the core revealed raw source as delim
+          // marks. An hr line whose dashes are revealed (delim at the line's
+          // own position instead of a conceal) drops its drawn rule so the
+          // raw `---` isn't overstruck while being edited.
+          const delimStarts = new Set<number>();
+          for (const d of decos) {
+            if (d.kind === "mark" && d.style === "delim") delimStarts.add(d.from);
+          }
           const ranges: Range<Decoration>[] = [];
           for (const d of decos) {
             // Forward compatibility: views MUST ignore decoration styles and
@@ -364,6 +397,11 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
               if (d.style === "blockquote") {
                 const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
                 ranges.push(blockquoteLineDeco(d.depth ?? 1).range(line.from));
+                continue;
+              }
+              if (d.style === "hr" && delimStarts.has(d.at)) {
+                const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
+                ranges.push(hrRevealedLineDeco.range(line.from));
                 continue;
               }
               const deco = lineDecos[d.style as keyof typeof lineDecos];
@@ -381,8 +419,12 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
               if (d.widget === "task" && d.to > d.from) {
                 ranges.push(
                   Decoration.replace({
-                    widget: new TaskCheckboxWidget(d.checked, d.from, core),
+                    widget: new TaskCheckboxWidget(d.checked ?? false, d.from, core),
                   }).range(d.from, d.to),
+                );
+              } else if (d.widget === "bullet" && d.to > d.from) {
+                ranges.push(
+                  Decoration.replace({ widget: new BulletWidget() }).range(d.from, d.to),
                 );
               }
               // unrecognized widget kinds: ignore

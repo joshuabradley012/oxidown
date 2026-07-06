@@ -121,6 +121,12 @@ interface ParsedNode {
    * widget:task decoration when concealed, or a delim mark when revealed.
    */
   widget?: { from: number; to: number; checked: boolean };
+  /**
+   * Present for unordered-list marker nodes: the whole "- " span, replaced
+   * by a widget:bullet when concealed (STRICT interior reveal — the cursor
+   * at the item text's first character does not reveal).
+   */
+  bullet?: { from: number; to: number };
 }
 
 function runLength(src: string, i: number, ch: string): number {
@@ -339,24 +345,38 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
   const listM = matchListMarker(content);
   if (listM) {
     const { markerFrom, contentFrom } = listM;
-    const marks: InlineMark[] = [
-      { from: base + markerFrom, to: base + contentFrom, style: "list-marker" },
-    ];
+    const isBullet = /[-*+]/.test(content[markerFrom]);
     const afterMarker = content.slice(contentFrom);
     const taskM = TASK_RE.exec(afterMarker);
     if (taskM) {
+      // Task items: the `- ` marker conceals entirely (no bullet widget) —
+      // the checkbox alone represents the item; revealing shows raw source.
       const checkboxFrom = base + contentFrom;
       const checkboxTo = checkboxFrom + 3; // "[ ]" / "[x]"
       const itemContentFrom = contentFrom + taskM[0].length;
       nodes.push({
         start: base + markerFrom,
         end: checkboxTo,
-        conceals: [],
-        marks,
+        conceals: [[base + markerFrom, base + contentFrom]],
+        marks: [],
         widget: { from: checkboxFrom, to: checkboxTo, checked: taskM[1] !== " " },
       });
       parseInline(content.slice(itemContentFrom), base + itemContentFrom, nodes);
       return;
+    }
+    const marks: InlineMark[] = [];
+    if (isBullet) {
+      // Bullets are their own node: widget:bullet when concealed,
+      // mark:list-marker when strictly revealed.
+      nodes.push({
+        start: base + markerFrom,
+        end: base + contentFrom,
+        conceals: [],
+        marks: [],
+        bullet: { from: base + markerFrom, to: base + contentFrom },
+      });
+    } else {
+      marks.push({ from: base + markerFrom, to: base + contentFrom, style: "list-marker" });
     }
     nodes.push({ start: base + markerFrom, end: base + contentFrom, conceals: [], marks });
     parseInline(content.slice(contentFrom), base + contentFrom, nodes);
@@ -384,7 +404,7 @@ export function parseDoc(doc: string): ParsedNode[] {
       nodes.push({
         start: lineStart,
         end: lineEnd,
-        conceals: [],
+        conceals: lineEnd > lineStart ? [[lineStart, lineEnd]] : [],
         marks: [],
         line: { kind: "line", at: lineStart, style: "code-fence" },
       });
@@ -399,7 +419,7 @@ export function parseDoc(doc: string): ParsedNode[] {
           nodes.push({
             start: bLineStart,
             end: bLineEnd,
-            conceals: [],
+            conceals: bLineEnd > bLineStart ? [[bLineStart, bLineEnd]] : [],
             marks: [],
             line: { kind: "line", at: bLineStart, style: "code-fence" },
           });
@@ -420,12 +440,13 @@ export function parseDoc(doc: string): ParsedNode[] {
       continue;
     }
 
-    // Thematic break: styled only, never concealed, no inline parsing.
+    // Thematic break: hr line style + the raw dashes concealed (revealed as
+    // delim when the cursor is on the line); the view draws the rule.
     if (HR_RE.test(line)) {
       nodes.push({
         start: lineStart,
         end: lineEnd,
-        conceals: [],
+        conceals: lineEnd > lineStart ? [[lineStart, lineEnd]] : [],
         marks: [],
         line: { kind: "line", at: lineStart, style: "hr" },
       });
@@ -678,7 +699,43 @@ export class MockCore implements OxidownCore {
         continue;
       }
 
+      if (node.bullet) {
+        // STRICT interior overlap (a < end && b > start): the cursor at the
+        // item text's first character (== extent end) or at line start does
+        // not reveal; entering the marker or selecting across it does.
+        const strictly =
+          selections.some((sel) => {
+            const lo = Math.min(sel.anchor, sel.head);
+            const hi = Math.max(sel.anchor, sel.head);
+            return lo < node.end && hi > node.start;
+          }) ||
+          (this.composing && this.compFrom <= node.end && this.compTo >= node.start);
+        if (strictly) {
+          out.push({ kind: "mark", from: node.bullet.from, to: node.bullet.to, style: "list-marker" });
+        } else {
+          out.push({ kind: "widget", from: node.bullet.from, to: node.bullet.to, widget: "bullet" });
+        }
+        continue;
+      }
+
       if (node.widget) {
+        // Task-item marker (`- `): concealed unless the cursor is STRICTLY
+        // inside the marker span (core parity), in which case it shows as a
+        // list-marker mark.
+        for (const [cf, ct] of node.conceals) {
+          const strictMarker =
+            selections.some((sel) => {
+              const lo = Math.min(sel.anchor, sel.head);
+              const hi = Math.max(sel.anchor, sel.head);
+              return lo < ct && hi > cf;
+            }) ||
+            (this.composing && this.compFrom <= ct && this.compTo >= cf);
+          if (strictMarker) {
+            out.push({ kind: "mark", from: cf, to: ct, style: "list-marker" });
+          } else {
+            out.push({ kind: "conceal", from: cf, to: ct });
+          }
+        }
         if (revealed) {
           out.push({ kind: "mark", from: node.widget.from, to: node.widget.to, style: "delim" });
         } else {

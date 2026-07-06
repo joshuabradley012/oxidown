@@ -46,7 +46,10 @@ pub enum NodeKind {
     ThematicBreak,
     /// A list item's marker span (`- `, `1. `, `1) `, or the bullet portion
     /// of a task item before its checkbox). Always visible, never concealed.
-    ListMarker,
+    /// A list-item marker run (`"- "`, `"1. "`). `task` marks the marker of
+    /// a task item, whose glyph conceals entirely when not revealed (the
+    /// checkbox widget alone represents the item).
+    ListMarker { task: bool },
     /// A task item's checkbox span (`[ ]`/`[x]`), rendered as a widget
     /// unless revealed.
     TaskWidget { checked: bool },
@@ -231,14 +234,14 @@ pub fn parse_document(src: &str) -> ParseResult {
             let item_start = item.start;
             if let Event::TaskListMarker(checked) = &event {
                 if range.start > item_start {
-                    nodes.push(leaf(NodeKind::ListMarker, item_start..range.start, range.end..range.end, vec![]));
+                    nodes.push(leaf(NodeKind::ListMarker { task: true }, item_start..range.start, range.end..range.end, vec![]));
                 }
                 let mut task = leaf(NodeKind::TaskWidget { checked: *checked }, range.clone(), range.end..range.end, vec![]);
                 task.reveal_extent = Some(item_start..range.end);
                 task.item_extent = Some(item);
                 nodes.push(task);
             } else if range.start > item_start {
-                nodes.push(leaf(NodeKind::ListMarker, item_start..range.start, range.end..range.end, vec![]));
+                nodes.push(leaf(NodeKind::ListMarker { task: false }, item_start..range.start, range.end..range.end, vec![]));
             }
         }
 
@@ -793,7 +796,7 @@ mod tests {
     #[test]
     fn unordered_list_marker() {
         let nodes = parse("- one\n- two\n");
-        let markers: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::ListMarker).collect();
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
         assert_eq!(markers.len(), 2);
         assert_eq!(markers[0].extent, 0..2);
         assert_eq!(markers[1].extent, 6..8);
@@ -802,7 +805,7 @@ mod tests {
     #[test]
     fn ordered_list_marker() {
         let nodes = parse("1. one\n2. two\n");
-        let markers: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::ListMarker).collect();
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
         assert_eq!(markers[0].extent, 0..3);
         assert_eq!(markers[1].extent, 7..10);
     }
@@ -810,7 +813,7 @@ mod tests {
     #[test]
     fn task_list_marker_and_widget() {
         let nodes = parse("- [ ] todo\n- [x] done\n");
-        let markers: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::ListMarker).collect();
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
         assert_eq!(markers.len(), 2);
         assert_eq!(markers[0].extent, 0..2);
         let widgets: Vec<_> = nodes
@@ -896,7 +899,7 @@ mod tests {
     #[test]
     fn list_inside_blockquote_gets_both_marker_and_line() {
         let nodes = parse("> - item one\n> - item two\n");
-        let markers: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::ListMarker).collect();
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
         let lines: Vec<_> = nodes
             .iter()
             .filter(|n| matches!(n.kind, NodeKind::BlockQuoteLine(_)))
