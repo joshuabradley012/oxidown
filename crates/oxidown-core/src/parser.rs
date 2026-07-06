@@ -258,8 +258,28 @@ pub fn parse_document(src: &str) -> ParseResult {
                 ));
             }
             // Obsidian-style reveal: only when the caret is directly next to
-            // the marker region — the `- ` itself, or for tasks the combined
-            // `- [ ]` run (marker and checkbox reveal in lockstep).
+            // the marker GLYPHS — `-`/`1.` (trailing whitespace trimmed from
+            // the reveal extent, so "next to the space" does not reveal), or
+            // for tasks the combined `- [ ]` run through the closing `]`.
+            // The nested indent's reveal extent is widened to the same end,
+            // so a revealed marker always shows its raw leading spaces too —
+            // true source geometry, no invisible indentation.
+            let mut glyph_end = range.start;
+            while glyph_end > item_start && matches!(bytes[glyph_end - 1], b' ' | b'\t') {
+                glyph_end -= 1;
+            }
+            let reveal_end = if let Event::TaskListMarker(_) = &event {
+                range.end
+            } else {
+                glyph_end
+            };
+            if item_depth >= 2 && ws_start < item_start {
+                if let Some(last) = nodes.last_mut() {
+                    if matches!(last.kind, NodeKind::ListItemIndent { .. }) {
+                        last.reveal_extent = Some(ws_start..reveal_end);
+                    }
+                }
+            }
             if let Event::TaskListMarker(checked) = &event {
                 if range.start > item_start {
                     let mut marker = leaf(NodeKind::ListMarker { task: true, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
@@ -271,8 +291,9 @@ pub fn parse_document(src: &str) -> ParseResult {
                 task.item_extent = Some(item);
                 nodes.push(task);
             } else if range.start > item_start {
-                // reveal_extent defaults to the marker extent itself.
-                nodes.push(leaf(NodeKind::ListMarker { task: false, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]));
+                let mut marker = leaf(NodeKind::ListMarker { task: false, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
+                marker.reveal_extent = Some(item_start..glyph_end);
+                nodes.push(marker);
             }
         }
 
@@ -340,9 +361,14 @@ pub fn parse_document(src: &str) -> ParseResult {
             let _ = depth; // depth of the enclosing top-level interval; line_depth is authoritative
             let mut node = leaf(NodeKind::BlockQuoteLine(line_depth), line.clone(), line.end..line.end, delims);
             // Obsidian-style reveal: only when the caret is directly next to
-            // (touching) the `> ` marker run — not anywhere on the line.
+            // (touching) the `>` marker glyphs — trailing whitespace trimmed,
+            // so "next to the space" does not reveal.
             if let (Some(f), Some(l)) = (node.delims.first(), node.delims.last()) {
-                node.reveal_extent = Some(f.start..l.end);
+                let mut e = l.end;
+                while e > f.start && matches!(bytes[e - 1], b' ' | b'\t') {
+                    e -= 1;
+                }
+                node.reveal_extent = Some(f.start..e);
             }
             nodes.push(node);
         }

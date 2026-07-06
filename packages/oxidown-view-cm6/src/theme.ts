@@ -200,6 +200,17 @@ export const oxidownTheme = EditorView.baseTheme({
   // Breathing room before a nested quote block (set on the parent line).
   ".ox-bq-gap": { paddingBottom: "4px" },
 
+  // Source-mode line (marker region being edited): neutralize the marker
+  // box so raw `- `/`1. ` render at their NATURAL width — any visible gap
+  // is a real whitespace character, never phantom box padding.
+  ".ox-src .ox-list-marker": {
+    display: "inline",
+    minWidth: "0",
+    textAlign: "left",
+    opacity: "1",
+    fontVariantNumeric: "normal",
+  },
+
   // Thematic break: the raw `---` is concealed (per the amended contract) and
   // the line draws an actual centered 1px rule; revealing the line shows the
   // dashes (as dimmed delim marks) on top of the rule. (Light/dark

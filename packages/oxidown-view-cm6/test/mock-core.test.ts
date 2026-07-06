@@ -485,13 +485,16 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     expect(lines(ds)).toEqual([{ kind: "line", at: 0, style: "blockquote", depth: 1 }]);
     expect(conceals(ds)).toEqual([{ kind: "conceal", from: 0, to: 2 }]);
 
-    // Cursor in the quote TEXT (past the marker run): still concealed.
-    const inText = core.decorations(core.revision(), 0, doc.length, cursor(4));
-    expect(conceals(inText)).toEqual([{ kind: "conceal", from: 0, to: 2 }]);
+    // Cursor in the quote TEXT — and even at the position right after the
+    // marker's trailing space — still concealed (glyph adjacency only).
+    for (const pos of [2, 4]) {
+      const inText = core.decorations(core.revision(), 0, doc.length, cursor(pos));
+      expect(conceals(inText)).toEqual([{ kind: "conceal", from: 0, to: 2 }]);
+    }
 
-    // Caret adjacent to the `> ` run: raw markers + revealed-flagged line
+    // Caret adjacent to the `>` glyph: raw markers + revealed-flagged line
     // (the view drops the bar/padding to show source geometry).
-    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(2));
+    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(1));
     expect(conceals(revealed)).toEqual([]);
     expect(marks(revealed, "delim")).toEqual([{ kind: "mark", from: 0, to: 2, style: "delim" }]);
     expect(lines(revealed)).toEqual([
@@ -552,9 +555,13 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
       { kind: "line", at: 0, style: "list-item", depth: 1 },
       { kind: "line", at: 7, style: "list-item", depth: 1 },
     ]);
-    // Caret directly next to the marker (touching [0, 2]) reveals it and
-    // flags the line (view drops the hanging-indent padding).
-    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(2));
+    // Caret directly next to the `-` GLYPH (touching [0, 1]) reveals it and
+    // flags the line; the position after the trailing space does NOT.
+    const afterSpace = core.decorations(core.revision(), 0, doc.length, cursor(2));
+    expect(afterSpace.filter((d) => d.kind === "widget")).toEqual([
+      { kind: "widget", from: 0, to: 2, widget: "bullet" },
+    ]);
+    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(1));
     expect(revealed.filter((d) => d.kind === "widget")).toEqual([]);
     expect(marks(revealed, "list-marker")).toEqual([
       { kind: "mark", from: 0, to: 2, style: "list-marker" },

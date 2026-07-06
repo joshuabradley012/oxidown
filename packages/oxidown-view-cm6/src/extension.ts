@@ -119,6 +119,13 @@ const lineDecos = {
 } as const;
 /** hr line whose dashes are revealed: same class family, rule suppressed. */
 const hrRevealedLineDeco = Decoration.line({ class: "ox-hr ox-hr-revealed" });
+/**
+ * A line whose marker region is being edited: rendered as SOURCE — no
+ * decorative padding/bars (no li/bq line classes), and the `ox-src` class
+ * neutralizes marker box styling so raw `- `/`1. ` render at natural width
+ * (no phantom space that could be mistaken for real characters).
+ */
+const srcLineDeco = Decoration.line({ class: "ox-src" });
 
 /** List-item lines (ALL depths): per-depth hanging-indent classes (cap 4). */
 const listItemLineDecos = new Map<number, Decoration>();
@@ -420,6 +427,7 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
             )
             .sort((a, b) => a.at - b.at);
           const bqGapAts = new Set<number>();
+          const srcLines = new Set<number>();
           for (let i = 0; i + 1 < bqLines.length; i++) {
             if ((bqLines[i + 1].depth ?? 1) > (bqLines[i].depth ?? 1)) {
               bqGapAts.add(bqLines[i].at);
@@ -430,21 +438,20 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
             // Forward compatibility: views MUST ignore decoration styles and
             // widget kinds they don't recognize (docs/boundary-v0.md v0.2).
             if (d.kind === "line") {
-              if (d.style === "blockquote") {
-                // Revealed (marker being edited): NO line decoration at all —
-                // default rendering IS source geometry (no bars, no padding),
-                // so raw `> > ` markers sit at their true source positions.
-                if (d.revealed) continue;
+              if (d.style === "blockquote" || d.style === "list-item") {
                 const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
-                ranges.push(blockquoteLineDeco(d.depth ?? 1, bqGapAts.has(d.at)).range(line.from));
-                continue;
-              }
-              if (d.style === "list-item") {
-                // Same: a revealed item line renders as plain source (no
-                // hanging-indent padding), making nesting spaces visible.
-                if (d.revealed) continue;
-                const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
-                ranges.push(listItemLineDeco(d.depth ?? 1).range(line.from));
+                if (d.revealed) {
+                  // Marker being edited: source geometry (no bars/padding)
+                  // plus box-styling neutralization via .ox-src.
+                  if (!srcLines.has(line.from)) {
+                    srcLines.add(line.from);
+                    ranges.push(srcLineDeco.range(line.from));
+                  }
+                } else if (d.style === "blockquote") {
+                  ranges.push(blockquoteLineDeco(d.depth ?? 1, bqGapAts.has(d.at)).range(line.from));
+                } else {
+                  ranges.push(listItemLineDeco(d.depth ?? 1).range(line.from));
+                }
                 continue;
               }
               if (d.style === "hr" && delimStarts.has(d.at)) {

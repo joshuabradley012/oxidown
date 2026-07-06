@@ -309,6 +309,8 @@ const TASK_RE = /^\[([ xX])\] /;
 
 interface ListMarkerMatch {
   markerFrom: number;
+  /** End of the marker GLYPHS (`-`, `1.`) — reveal adjacency stops here. */
+  glyphTo: number;
   /** End of the WHOLE matched marker run, e.g. "- " or "1. " (glyph + required space) — matches the spec's literal examples. */
   contentFrom: number;
 }
@@ -319,7 +321,8 @@ function matchListMarker(line: string): ListMarkerMatch | null {
   if (!m) return null;
   const markerFrom = m[1].length;
   const contentFrom = m[0].length;
-  return { markerFrom, contentFrom };
+  const glyphTo = markerFrom + m[2].length; // end of `-`/`1.` (no trailing ws)
+  return { markerFrom, contentFrom, glyphTo };
 }
 
 /**
@@ -344,17 +347,18 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
 
   const listM = matchListMarker(content);
   if (listM) {
-    const { markerFrom, contentFrom } = listM;
+    const { markerFrom, contentFrom, glyphTo } = listM;
     const isBullet = /[-*+]/.test(content[markerFrom]);
     // Depth approximated as floor(indent/2) + 1 (2-space bullet / 3-space
     // ordered nesting, close enough for the mock). EVERY item line emits
     // line:list-item (the view's hanging indent); nested indents conceal.
     const depth = Math.floor(markerFrom / 2) + 1;
     nodes.push({
-      // Indent + marker region: caret adjacency here flags the line as
-      // revealed (view drops hanging-indent padding -> source geometry).
+      // Indent + marker GLYPH region (trailing space excluded): caret
+      // adjacency here flags the line revealed AND reveals the indent, so a
+      // revealed marker always shows its raw leading spaces.
       start: base,
-      end: base + contentFrom,
+      end: base + glyphTo,
       conceals: depth >= 2 && markerFrom > 0 ? [[base, base + markerFrom]] : [],
       marks: [],
       line: { kind: "line", at: base, style: "list-item", depth },
@@ -362,6 +366,9 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
     const afterMarker = content.slice(contentFrom);
     const taskM = TASK_RE.exec(afterMarker);
     if (taskM) {
+      // Widen the li-line node (just pushed) to the checkbox end so the
+      // revealed flag + indent reveal share the task's `- [ ]` extent.
+      nodes[nodes.length - 1].end = base + contentFrom + 3;
       // Task items: the `- ` marker conceals (no bullet widget) and reveals
       // in lockstep with the checkbox — LINE-level (node spans the line).
       const checkboxFrom = base + contentFrom;
@@ -380,11 +387,12 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
     }
     const marks: InlineMark[] = [];
     if (isBullet) {
-      // Bullet node spans the MARKER: only a caret directly next to it
-      // reveals the raw `- ` (Obsidian-style).
+      // Bullet node spans the marker GLYPH: only a caret directly next to
+      // the `-` itself reveals the raw source (Obsidian-style; the position
+      // after the trailing space does not).
       nodes.push({
         start: base + markerFrom,
-        end: base + contentFrom,
+        end: base + glyphTo,
         conceals: [],
         marks: [],
         bullet: { from: base + markerFrom, to: base + contentFrom },
@@ -487,9 +495,10 @@ export function parseDoc(doc: string): ParsedNode[] {
         rest = rest.slice(m[0].length);
         offset += m[0].length;
       }
+      const glyphRunEnd = lineStart + line.slice(0, offset - lineStart).trimEnd().length;
       nodes.push({
         start: lineStart,
-        end: offset, // marker run only: adjacency reveal
+        end: glyphRunEnd, // marker glyphs only: "next to the space" != reveal
         conceals: [[lineStart, offset]],
         marks: [],
         line: { kind: "line", at: lineStart, style: "blockquote", depth },

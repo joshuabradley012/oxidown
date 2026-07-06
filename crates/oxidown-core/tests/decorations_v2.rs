@@ -280,13 +280,16 @@ fn unordered_list_marker_bullet_widget_and_adjacency_reveal() {
     let d = decos("- one\n- two\n", &[]);
     assert_eq!(d, vec![li(0, 1), bullet(0, 2), li(6, 1), bullet(6, 8)]);
     // Obsidian-style reveal: a cursor in the item's TEXT does NOT reveal the
-    // marker...
-    let d = decos("- one\n- two\n", &[(4, 4)]);
-    assert_eq!(d, vec![li(0, 1), bullet(0, 2), li(6, 1), bullet(6, 8)]);
-    // ...but a caret directly next to it (touching the marker span, here at
-    // the item text's first char == marker end) reveals it as raw source and
-    // flags the line as revealed (the view drops its decorative padding).
-    let d = decos("- one\n- two\n", &[(2, 2)]);
+    // marker — and neither does the position after the marker's trailing
+    // space (glyph adjacency only).
+    for pos in [2, 4] {
+        let d = decos("- one\n- two\n", &[(pos, pos)]);
+        assert_eq!(d, vec![li(0, 1), bullet(0, 2), li(6, 1), bullet(6, 8)], "pos {pos}");
+    }
+    // ...but a caret directly next to the `-` GLYPH (before or after it)
+    // reveals it as raw source and flags the line as revealed (the view
+    // drops its decorative padding).
+    let d = decos("- one\n- two\n", &[(1, 1)]);
     assert_eq!(
         d,
         vec![
@@ -481,9 +484,12 @@ fn blockquote_reveals_only_next_to_markers_and_flags_line() {
     let d = decos(doc, &[(9, 9)]);
     assert!(d.contains(&block(0, BlockStyle::BlockQuote(1))));
     assert!(d.contains(&conceal(0, 2)));
-    // Caret directly next to the `> ` run (touching [0, 2]): raw markers +
+    // Position after the marker's trailing space: still concealed.
+    let d = decos(doc, &[(2, 2)]);
+    assert!(d.contains(&conceal(0, 2)));
+    // Caret directly next to the `>` glyph (touching [0, 1]): raw markers +
     // revealed line (view drops bars/padding -> source geometry).
-    for pos in 0..=2 {
+    for pos in 0..=1 {
         let d = decos(doc, &[(pos, pos)]);
         assert!(
             d.contains(&Decoration::Block {
@@ -498,17 +504,38 @@ fn blockquote_reveals_only_next_to_markers_and_flags_line() {
 }
 
 #[test]
-fn nested_quote_bullet_reveals_chain_at_the_seam() {
-    // "> > - item": caret between the quote markers and the bullet touches
-    // BOTH regions — the full raw prefix becomes editable at once.
+fn nested_quote_bullet_adjacency_regions() {
+    // "> > - item": each marker region reveals next to its own glyphs.
     let doc = "> > - item\n";
-    let d = decos(doc, &[(4, 4)]);
+    // Caret right after the last `>` (pos 3): quote markers reveal.
+    let d = decos(doc, &[(3, 3)]);
     assert!(d.contains(&mark(0, 2, MarkStyle::Delim)), "{d:?}");
     assert!(d.contains(&mark(2, 4, MarkStyle::Delim)));
-    assert!(d.contains(&mark(4, 6, MarkStyle::ListMarker)));
-    // Caret in the item text: everything conceals again.
-    let d = decos(doc, &[(8, 8)]);
-    assert!(d.contains(&conceal(0, 2)));
-    assert!(d.contains(&conceal(2, 4)));
-    assert!(d.iter().any(|x| matches!(x, Decoration::Widget { .. })));
+    // Caret at / right after the `-` glyph (pos 4, 5): bullet reveals.
+    for pos in [4, 5] {
+        let d = decos(doc, &[(pos, pos)]);
+        assert!(d.contains(&mark(4, 6, MarkStyle::ListMarker)), "pos {pos}: {d:?}");
+    }
+    // Position after the bullet's trailing space (pos 6) and in the text:
+    // everything conceals.
+    for pos in [6, 8] {
+        let d = decos(doc, &[(pos, pos)]);
+        assert!(d.contains(&conceal(0, 2)), "pos {pos}");
+        assert!(d.contains(&conceal(2, 4)), "pos {pos}");
+        assert!(d.iter().any(|x| matches!(x, Decoration::Widget { .. })), "pos {pos}");
+    }
+}
+
+#[test]
+fn nested_indent_reveals_in_lockstep_with_its_marker() {
+    // "  - b" (depth 2): caret next to the `-` glyph reveals the marker AND
+    // the leading indent spaces — true source geometry, no invisible indent.
+    let doc = "- a\n  - b\n";
+    let d = decos(doc, &[(7, 7)]); // right after the nested `-` (bytes 6..7)
+    assert!(d.contains(&mark(4, 6, MarkStyle::Delim)), "indent revealed: {d:?}");
+    assert!(d.contains(&mark(6, 8, MarkStyle::ListMarker)), "marker revealed");
+    assert!(d.contains(&li_rev(6, 2)), "line flagged");
+    // Caret in the nested item's text: indent + marker concealed again.
+    let d = decos(doc, &[(9, 9)]);
+    assert!(d.contains(&conceal(4, 6)));
 }
