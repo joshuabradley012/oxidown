@@ -9,6 +9,7 @@ import {
 import {
   Decoration,
   type DecorationSet,
+  drawSelection,
   EditorView,
   keymap,
   ViewPlugin,
@@ -632,5 +633,17 @@ export function oxidownCommands(core: OxidownCore): Extension {
  * the core is the only historian, and two undo systems will fight.
  */
 export function oxidown(core: OxidownCore, options: OxidownOptions = {}): Extension {
-  return [oxidownPlugin(core, options), historyKeymap(core), oxidownCommands(core), oxidownTheme];
+  return [
+    oxidownPlugin(core, options),
+    historyKeymap(core),
+    oxidownCommands(core),
+    oxidownTheme,
+    // The native browser caret is painted at full line-box height whenever it
+    // sits next to a widget/replace decoration (CM inserts cm-widgetBuffer
+    // <img>s there, and Chrome sizes the caret to the line box beside replaced
+    // elements) — every concealed marker boundary showed an enlarged caret.
+    // drawSelection hides the native caret and draws one from coordsAtPos,
+    // which reflects the real text metrics at every position.
+    drawSelection(),
+  ];
 }

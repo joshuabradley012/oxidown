@@ -31,6 +31,14 @@ export const oxidownTheme = EditorView.baseTheme({
     minHeight: "1.5em",
   },
 
+  // drawSelection (see extension.ts) replaces the native selection highlight
+  // with .cm-selectionBackground layers; give them a native-looking blue when
+  // focused, gray otherwise, so swapping renderers isn't a visible change.
+  "&light .cm-selectionBackground": { backgroundColor: "#d9d9d9" },
+  "&light.cm-focused .cm-selectionBackground": { backgroundColor: "#b3d4fc" },
+  "&dark .cm-selectionBackground": { backgroundColor: "#404040" },
+  "&dark.cm-focused .cm-selectionBackground": { backgroundColor: "#2a4a75" },
+
   // Inline marks
   ".ox-strong": { fontWeight: "700" },
   ".ox-em": { fontStyle: "italic" },
