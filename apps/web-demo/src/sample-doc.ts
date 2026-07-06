@@ -29,12 +29,14 @@ drag-select across formatted spans, and toggle source mode above.
 `;
 
 /**
- * Hardcoded "LLM answer" for the streaming demo (no network). Deliberately a
- * mix of M1 markdown constructs — headings, bold/italic, a fenced code
- * block, a task list, a blockquote — so the demo exercises the append
- * fast-path across all of them. main.ts delivers this via streamOpen/
- * streamAppend/streamClose in randomly-sized chunks that do NOT align to
- * token or markdown boundaries, on purpose.
+ * Hardcoded "LLM answer" for the streaming demo (no network). Exercises the
+ * ENTIRE currently-supported decoration vocabulary (contract v0.2): headings
+ * h2-h4, bold/italic (both delimiter flavors), inline code, strikethrough,
+ * links + autolinks, nested blockquotes, a fenced code block, bullet lists
+ * (nested), an ordered list, task checkboxes, and a thematic break — so the
+ * append fast-path is exercised across every construct. main.ts delivers
+ * this via streamOpen/streamAppend/streamClose in randomly-sized chunks that
+ * do NOT align to token or markdown boundaries, on purpose.
  */
 export const STREAM_TEXT = `## Streaming into a live document
 
@@ -45,6 +47,20 @@ Here's what's happening while this text appears.
 The core now understands more markdown, and the view renders it without
 ever losing the source text underneath: **bold**, *italic*, and even
 ~~struck-through~~ runs stay concealed until your cursor visits them.
+Links work too — the design borrows from
+[Peritext](https://www.inkandswitch.com/peritext/) and
+[lezer-markdown](https://github.com/lezer-parser/markdown), and bare
+autolinks like <https://oxidown.dev> render as links as well. Put your
+cursor inside one to reveal its destination.
+
+#### The full vocabulary, in one list
+
+- **Bold** (\`**\` or \`__\`) and *italic* (\`*\` or \`_\`)
+- ~~Strikethrough~~ and \`inline code\`
+- [Links](https://example.com) and <https://autolinks.example>
+  - nested bullets indent like this
+  - and keep their markers visible, styled — never concealed
+- Blockquotes, fences, tasks, and ordered lists — all shown below
 
 > Concealment never removes characters from the DOM — it only collapses
 > them visually. That discipline is exactly what keeps this stream from
@@ -87,6 +103,10 @@ anything, because the document is never anything other than plain text.
 > "The file is the document." Everything else — decorations, widgets,
 > reveal state — is disposable and re-derivable. If it's wrong, it just
 > repaints; it can never corrupt what you actually wrote.
+>
+> > Blockquotes nest, too — depth gets its own styling.
+
+---
 
 That's the whole pitch — thanks for reading. Now go try editing while
 this finishes streaming in.
