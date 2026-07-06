@@ -202,11 +202,21 @@ M1 emission scope (parser may understand more than it decorates):
   with the first line's text). Nested items (depth ≥ 2) additionally emit a `conceal` over the
   raw leading indent whitespace (revealed as `mark:delim`); the view supplies exact per-depth
   padding (1.5em per level) so each nested marker starts at its parent's text column.
-- **`revealed: true` on `blockquote`/`list-item` lines** means the line's marker region is
-  being edited (caret adjacent): the view drops ALL decorative padding/bars/indent for that
-  line and renders default source geometry — the raw markers and real leading spaces sit at
-  their true positions, so deeply nested prefixes (e.g. `> > - `) are edited as plain source.
-  Blockquote line reveal extents are likewise the marker run only, per line.
+- **`revealed: true` on `blockquote`/`list-item` lines** means THAT CONSTRUCT's marker region
+  is being edited (caret adjacent). The flag is PER CONSTRUCT, not per line: on a mixed line
+  (`> > - item`) the `blockquote` and `list-item` line decorations carry independent flags,
+  and the view drops only the revealed construct's geometry — a revealed list item loses its
+  hanging indent/marker box but an unrevealed blockquote on the same line KEEPS its bars and
+  quote padding (and vice versa). Any revealed construct puts the line in source styling
+  (`ox-src`: marker boxes neutralized) so revealed markers render at natural width.
+  Reveal extents are per MARKER RUN: the blockquote run (all `> ` glyphs on the line, trailing
+  whitespace trimmed) and the list marker (leading indent whitespace + glyphs) are separate,
+  independently-revealed extents. They may share a boundary character (the space between `>`
+  and `-` is the quote run's separator AND the bullet's leading whitespace), so a caret there
+  reveals both; but a caret touching only the bullet edits `- ` as source while the `> > `
+  prefix stays concealed, and a caret at line start (left edge of `>`) reveals only the quote
+  run while the bullet stays a widget. Deeply nested prefixes are therefore edited PIECEWISE,
+  construct by construct — never all-or-nothing.
 - Thematic break — `line:hr` on the line, plus `conceal` over the raw dashes (revealed as
   `mark:delim` when the cursor is on the line). The view draws the actual rule on the hr line;
   nested blockquote bars are likewise the view's job (one bar per depth level).

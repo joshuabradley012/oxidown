@@ -114,6 +114,12 @@ export const oxidownTheme = EditorView.baseTheme({
     backgroundColor: "currentColor",
     verticalAlign: "middle",
     marginRight: "0.5em",
+    // The box is capped below the line height (see .ox-bullet), so the strut
+    // inside it overflows downward and `middle` resolves against a baseline
+    // that sits low: the dot landed 4px below the text's optical center.
+    // Empirically measured nudge; leaves the dot within 0.1px of center.
+    position: "relative",
+    top: "-0.25em",
   },
 
   // Blockquotes: one vertical bar PER nesting level, drawn as layered
@@ -133,20 +139,28 @@ export const oxidownTheme = EditorView.baseTheme({
     backgroundRepeat: "no-repeat",
     backgroundSize: "3px 100%",
   },
+  // `--ox-bq-pad` doubles as the quote's text origin for list items nested
+  // INSIDE the quote: the `.ox-li-*` rules below stack their indent on top of
+  // it, so a bullet in a quote indents relative to the quote's text, not the
+  // content edge (a bare paddingLeft here would lose to the li rule and the
+  // quote indent would vanish on mixed lines).
   ".ox-bq-1": {
     backgroundImage: "var(--ox-bq-bar)",
     backgroundPosition: "0 0",
-    paddingLeft: "0.9em",
+    "--ox-bq-pad": "0.9em",
+    paddingLeft: "var(--ox-bq-pad)",
   },
   ".ox-bq-2": {
     backgroundImage: "var(--ox-bq-bar), var(--ox-bq-bar)",
     backgroundPosition: "0 0, 0.8em 0",
-    paddingLeft: "1.7em",
+    "--ox-bq-pad": "1.7em",
+    paddingLeft: "var(--ox-bq-pad)",
   },
   ".ox-bq-3": {
     backgroundImage: "var(--ox-bq-bar), var(--ox-bq-bar), var(--ox-bq-bar)",
     backgroundPosition: "0 0, 0.8em 0, 1.6em 0",
-    paddingLeft: "2.5em",
+    "--ox-bq-pad": "2.5em",
+    paddingLeft: "var(--ox-bq-pad)",
   },
 
   // Fenced code blocks: fence + body share one font-family/background so the
@@ -178,12 +192,14 @@ export const oxidownTheme = EditorView.baseTheme({
   // FIRST line (the marker) back into it, so wrapped text aligns with the
   // first line's text. Nested raw indent whitespace conceals (depth >= 2)
   // and each nested marker starts at its parent's text column.
-  // calc: our padding REPLACES the line's default (CM6 base: 6px left).
+  // The indent stacks on `--ox-bq-pad` when the item lives inside a quote
+  // (set by `.ox-bq-*` above); outside a quote the fallback is the line's
+  // default padding our rule replaces (CM6 base: 6px left).
   ".ox-list-item": { textIndent: "-1.5em" },
-  ".ox-li-1": { paddingLeft: "calc(6px + 1.5em)" },
-  ".ox-li-2": { paddingLeft: "calc(6px + 3em)" },
-  ".ox-li-3": { paddingLeft: "calc(6px + 4.5em)" },
-  ".ox-li-4": { paddingLeft: "calc(6px + 6em)" },
+  ".ox-li-1": { paddingLeft: "calc(var(--ox-bq-pad, 6px) + 1.5em)" },
+  ".ox-li-2": { paddingLeft: "calc(var(--ox-bq-pad, 6px) + 3em)" },
+  ".ox-li-3": { paddingLeft: "calc(var(--ox-bq-pad, 6px) + 4.5em)" },
+  ".ox-li-4": { paddingLeft: "calc(var(--ox-bq-pad, 6px) + 6em)" },
 
   // Breathing room before a nested quote block (set on the parent line).
   ".ox-bq-gap": { paddingBottom: "4px" },

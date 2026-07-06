@@ -65,10 +65,12 @@ function greet(name: string): string {
 > A quote with **bold**, *italic*, \`inline code\`, ~~strike~~, a [link](https://example.com/a(b)?q=1&x=2#frag), and <https://auto.example/?a=1&b=2>.
 > ## A heading inside a quote with \`code\` and **bold !@#$%^&()**
 > - a bullet inside a quote with *italic*
+>   - a NESTED bullet inside a quote
 > - [ ] a task inside a quote with ~~strike~~
 > 1. an ordered item inside a quote
 > > nested quote containing \`- not a bullet\` in code and a real list:
 > > - **bold bullet** with [a *italic* link](https://x.dev)
+> >   - a NESTED bullet inside a NESTED quote
 
 ### Headings with everything
 
