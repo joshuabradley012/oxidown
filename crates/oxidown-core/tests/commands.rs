@@ -426,3 +426,405 @@ fn undo_redo_supply_selection() {
     // Redo restored "XYZ": cursor at the end of the restored text.
     assert_eq!(r.selection.map(|s| (s.anchor, s.head)), Some((6, 6)));
 }
+
+// ------------------------------------------------- indentList/outdentList --
+//
+// Marker-width-aware Tab nesting (boundary v0.2): indenting nests a child
+// under the nearest previous item at or above its own marker column, to
+// that item's CONTENT column (marker + required trailing space), not a
+// fixed 2-space shift.
+
+/// Post-condition for EVERY indent/outdent test (the invariant the
+/// paragraph-interruption bug violated): reparse the result and assert the
+/// line containing `needle` still carries its own ListMarker — i.e. the
+/// command never produced markdown where the moved line silently degrades
+/// to lazy-continuation paragraph text.
+fn assert_list_item_line(ed: &Editor, needle: &str) {
+    let text = ed.get_text();
+    let pos = text
+        .find(needle)
+        .unwrap_or_else(|| panic!("line {needle:?} not found in {text:?}"));
+    let line_start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[pos..].find('\n').map_or(text.len(), |i| pos + i);
+    let nodes = oxidown_core::parser::parse(&text);
+    assert!(
+        nodes.iter().any(|n| {
+            matches!(n.kind, oxidown_core::parser::NodeKind::ListMarker { .. })
+                && n.extent.start >= line_start
+                && n.extent.start < line_end
+        }),
+        "the line containing {needle:?} must still parse as a list item in {text:?}"
+    );
+}
+
+#[test]
+fn indent_bullet_under_bullet_is_plus_two() {
+    let mut ed = Editor::new(1);
+    ed.load("- a\n- b\n");
+    // Cursor inside "b"'s text — indenting the ITEM, not the cursor position.
+    let change = run(&mut ed, Command::IndentList { from: 6, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n  - b\n");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (8, 8), "cursor follows its character");
+    assert_list_item_line(&ed, "- b");
+}
+
+#[test]
+fn indent_ordered_under_ordered_is_plus_three() {
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n2. b\n");
+    run(&mut ed, Command::IndentList { from: 8, to: 8 }).unwrap();
+    // "2." is rewritten to "1.": a non-1 ordered marker cannot interrupt the
+    // parent item's paragraph, so "   2. b" would de-list into continuation
+    // text (the paragraph-interruption guard; see the structural-rewrite
+    // tests below).
+    assert_eq!(ed.get_text(), "1. a\n   1. b\n");
+    assert_list_item_line(&ed, "1. b");
+}
+
+#[test]
+fn indent_under_double_digit_marker_is_plus_four() {
+    let mut ed = Editor::new(1);
+    ed.load("10. a\n11. b\n");
+    run(&mut ed, Command::IndentList { from: 10, to: 10 }).unwrap();
+    // +4 (the "10. " content column), digits guard-rewritten to "1".
+    assert_eq!(ed.get_text(), "10. a\n    1. b\n");
+    assert_list_item_line(&ed, "1. b");
+}
+
+#[test]
+fn indent_bullet_under_ordered_is_plus_three() {
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n- b\n");
+    run(&mut ed, Command::IndentList { from: 7, to: 7 }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n   - b\n");
+    assert_list_item_line(&ed, "- b");
+}
+
+#[test]
+fn indent_task_under_task_is_plus_two() {
+    let mut ed = Editor::new(1);
+    ed.load("- [ ] a\n- [ ] b\n");
+    // Cursor on the "b" character itself.
+    run(&mut ed, Command::IndentList { from: 14, to: 14 }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] a\n  - [ ] b\n");
+    assert_list_item_line(&ed, "- [ ] b");
+}
+
+#[test]
+fn indent_inside_a_quote_stays_relative_to_the_quote_prefix() {
+    let mut ed = Editor::new(1);
+    ed.load("> 1. a\n> 2. b\n");
+    // Cursor inside "b", after the quote prefix.
+    run(&mut ed, Command::IndentList { from: 12, to: 12 }).unwrap();
+    // 3 spaces after "> " (the parent's content column), digits
+    // guard-rewritten to "1" (landing on the shallower "1. a").
+    assert_eq!(ed.get_text(), "> 1. a\n>    1. b\n");
+    assert_list_item_line(&ed, "1. b");
+}
+
+#[test]
+fn indent_does_not_nest_across_a_quote_boundary() {
+    // A list outside a quote never nests relative to items inside it: the
+    // line above is quoted (depth 1), "- b" is depth 0 — the scan stops
+    // immediately and there is no candidate.
+    let mut ed = Editor::new(1);
+    ed.load("> - a\n- b\n");
+    let rev = ed.revision();
+    let change = run(&mut ed, Command::IndentList { from: 8, to: 8 }).unwrap();
+    assert_eq!(ed.get_text(), "> - a\n- b\n", "no-op: quote depth differs");
+    assert!(change.splices.is_empty());
+    assert_eq!(ed.revision(), rev, "no-op must not burn a revision");
+}
+
+#[test]
+fn indent_multiline_selection_moves_together_by_first_lines_delta() {
+    let mut ed = Editor::new(1);
+    ed.load("- a\n- b\n- c\n");
+    // Select across "b" and "c": both siblings shift by "b"'s delta (2),
+    // they do NOT nest under one another.
+    let change = run(&mut ed, Command::IndentList { from: 4, to: 11 }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n  - b\n  - c\n");
+    assert_eq!(change.splices.len(), 2, "one splice per intersecting item line");
+    assert_list_item_line(&ed, "- b");
+    assert_list_item_line(&ed, "- c");
+}
+
+#[test]
+fn indent_first_item_of_a_list_is_a_noop() {
+    let mut ed = Editor::new(1);
+    ed.load("- a\n- b\n");
+    let rev = ed.revision();
+    let (undo_depth, _) = ed.history_depths();
+    let change = run(&mut ed, Command::IndentList { from: 2, to: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n- b\n", "no movement possible");
+    assert!(change.splices.is_empty());
+    assert!(change.selection.is_none());
+    assert_eq!(ed.revision(), rev, "no-op must not burn a revision");
+    assert_eq!(ed.history_depths().0, undo_depth, "no-op must not create an undo unit");
+}
+
+#[test]
+fn indent_non_list_range_does_not_apply() {
+    let mut ed = Editor::new(1);
+    ed.load("plain paragraph\n");
+    assert!(ed.command(Command::IndentList { from: 3, to: 3 }).unwrap().is_none());
+}
+
+#[test]
+fn indent_already_at_parents_content_column_is_a_noop() {
+    // "  - b" is already exactly at "- a"'s content column (2): indenting
+    // further has no target that would move it forward.
+    let mut ed = Editor::new(1);
+    ed.load("- a\n  - b\n");
+    let change = run(&mut ed, Command::IndentList { from: 8, to: 8 }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n  - b\n");
+    assert!(change.splices.is_empty());
+}
+
+#[test]
+fn outdent_reverses_each_indent_case() {
+    // Nested ordered children are written as "1." here — exactly what the
+    // paragraph-interruption guard produces when indenting (a non-1 ordered
+    // marker nested directly under an open paragraph would not parse as a
+    // list item, so indent rewrites it; these fixtures ARE the guard's
+    // output shape, and the chained Tab→Shift-Tab test below covers the
+    // full round trip through one editor).
+    for (indented, from, to, flat) in [
+        ("- a\n  - b\n", 8, 8, "- a\n- b\n"),
+        ("1. a\n   1. b\n", 11, 11, "1. a\n1. b\n"),
+        ("10. a\n    1. b\n", 13, 13, "10. a\n1. b\n"),
+        ("1. a\n   - b\n", 10, 10, "1. a\n- b\n"),
+        ("- [ ] a\n  - [ ] b\n", 16, 16, "- [ ] a\n- [ ] b\n"),
+        ("> 1. a\n>    1. b\n", 15, 15, "> 1. a\n> 1. b\n"),
+    ] {
+        let mut ed = Editor::new(1);
+        ed.load(indented);
+        run(&mut ed, Command::OutdentList { from, to }).unwrap();
+        assert_eq!(ed.get_text(), flat, "outdent reverses {indented:?}");
+        assert_list_item_line(&ed, flat.lines().nth(1).unwrap().trim_start_matches("> "));
+    }
+}
+
+#[test]
+fn outdent_at_top_level_is_a_noop() {
+    let mut ed = Editor::new(1);
+    ed.load("- a\n- b\n");
+    let rev = ed.revision();
+    let change = run(&mut ed, Command::OutdentList { from: 6, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n- b\n");
+    assert!(change.splices.is_empty());
+    assert_eq!(ed.revision(), rev, "no-op must not burn a revision");
+}
+
+#[test]
+fn outdent_clamps_to_a_lines_own_leading_space_count() {
+    // "- a" under leading space each: the "a" child has 2 leading spaces,
+    // the "c" child has only 1 (a malformed/partial indent). Outdenting
+    // both together wants delta=2, but "c" only has 1 to give up.
+    let mut ed = Editor::new(1);
+    ed.load("- p\n  - a\n - c\n");
+    // Select across "a" and "c"; "a" (col 2) is the first intersecting item.
+    let change = run(&mut ed, Command::OutdentList { from: 8, to: 13 }).unwrap();
+    assert_eq!(ed.get_text(), "- p\n- a\n- c\n");
+    assert_eq!(change.splices.len(), 2);
+    let deletes: Vec<usize> = change.splices.iter().map(|s| s.delete).collect();
+    assert_eq!(deletes, vec![2, 1], "the second line clamps to its own 1 leading space");
+    assert_list_item_line(&ed, "- a");
+    assert_list_item_line(&ed, "- c");
+}
+
+#[test]
+fn undo_restores_a_multiline_indent_in_one_step() {
+    let mut ed = Editor::new(1);
+    ed.load("- a\n- b\n- c\n");
+    let (undo_depth, _) = ed.history_depths();
+    run(&mut ed, Command::IndentList { from: 4, to: 11 }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n  - b\n  - c\n");
+    assert_eq!(ed.history_depths().0, undo_depth + 1, "one undo unit for the whole batch");
+
+    let mut mirror = ed.get_text();
+    let u = ed.undo().unwrap();
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "- a\n- b\n- c\n", "undo restores both lines in one step");
+    assert_eq!(mirror, ed.get_text());
+
+    let r = ed.redo().unwrap();
+    apply_to_mirror(&mut mirror, &r.splices);
+    assert_eq!(ed.get_text(), "- a\n  - b\n  - c\n");
+    assert_eq!(mirror, ed.get_text());
+}
+
+#[test]
+fn indent_with_multibyte_text_before_the_list_still_works() {
+    let mut ed = Editor::new(1);
+    let doc = "prefix 你好😀\n\n- a\n- b\n";
+    ed.load(doc);
+    let b_byte = doc.rfind("- b").unwrap() + 2; // byte index of 'b' in "- b"
+    let cu = doc[..b_byte].encode_utf16().count();
+    let change = run(&mut ed, Command::IndentList { from: cu, to: cu }).unwrap();
+    assert_eq!(ed.get_text(), "prefix 你好😀\n\n- a\n  - b\n");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (cu + 2, cu + 2));
+    assert_list_item_line(&ed, "- b");
+}
+
+// ---------------------------------------------- subtree-aware affected set --
+//
+// Not just the intersecting lines: for every intersecting item line, its
+// whole subtree (consecutive following lines, same quote depth, marker
+// column strictly greater than THAT line's own) moves with it by the same
+// single delta.
+
+#[test]
+fn indent_a_parent_moves_its_whole_subtree_with_it() {
+    let mut ed = Editor::new(1);
+    // Cursor on "p" only — no selection spans "c1"/"c2" — but both are "p"'s
+    // children and must move with it.
+    ed.load("- x\n- p\n  - c1\n  - c2\n");
+    let change = run(&mut ed, Command::IndentList { from: 6, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "- x\n  - p\n    - c1\n    - c2\n");
+    assert_eq!(change.splices.len(), 3, "p + both children move");
+    assert_list_item_line(&ed, "- p");
+}
+
+#[test]
+fn outdent_reverses_a_subtree_move() {
+    let mut ed = Editor::new(1);
+    ed.load("- x\n  - p\n    - c1\n    - c2\n");
+    let change = run(&mut ed, Command::OutdentList { from: 8, to: 8 }).unwrap();
+    assert_eq!(ed.get_text(), "- x\n- p\n  - c1\n  - c2\n");
+    assert_eq!(change.splices.len(), 3);
+    assert_list_item_line(&ed, "- p");
+}
+
+#[test]
+fn indent_subtree_does_not_include_a_following_sibling() {
+    // "sibling" has the SAME marker column as "p" (0): it's a sibling, not a
+    // descendant, and must not move.
+    let mut ed = Editor::new(1);
+    ed.load("- x\n- p\n  - c1\n- sibling\n");
+    let change = run(&mut ed, Command::IndentList { from: 6, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "- x\n  - p\n    - c1\n- sibling\n");
+    assert_eq!(change.splices.len(), 2, "p + c1 only");
+    assert_list_item_line(&ed, "- p");
+}
+
+#[test]
+fn indent_subtree_walk_stops_at_a_blank_line() {
+    // "c2" is indented like a child of "p", but a blank line sits between it
+    // and "c1" — v1 does not look past a non-list-context line to see
+    // whether list content resumes, so "c2" is left behind.
+    let mut ed = Editor::new(1);
+    ed.load("- x\n- p\n  - c1\n\n  - c2\n");
+    let change = run(&mut ed, Command::IndentList { from: 6, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "- x\n  - p\n    - c1\n\n  - c2\n", "c2 untouched");
+    assert_eq!(change.splices.len(), 2, "p + c1 only");
+    assert_list_item_line(&ed, "- p");
+}
+
+#[test]
+fn indent_subtree_inside_a_quote_respects_quote_depth() {
+    // "c1" is inside the same quote as "p" (depth 1) and moves with it;
+    // "outside" is depth 0 and must not.
+    let mut ed = Editor::new(1);
+    ed.load("> - x\n> - p\n>   - c1\n- outside\n");
+    let change = run(&mut ed, Command::IndentList { from: 10, to: 10 }).unwrap();
+    assert_eq!(ed.get_text(), "> - x\n>   - p\n>     - c1\n- outside\n");
+    assert_eq!(change.splices.len(), 2, "p + c1 only, not outside");
+    assert_list_item_line(&ed, "- p");
+}
+
+// --------------------------------------- paragraph-interruption guard --
+//
+// A non-1 ordered marker cannot START a list in paragraph-interruption
+// position (CommonMark): without the guard, indenting "2. b" under "1. a"
+// produces "   2. b", which reparses as LAZY CONTINUATION of item 1's
+// paragraph — the item (and its whole subtree) silently de-lists, and the
+// next Shift-Tab finds no item line and returns None. The guard rewrites
+// the moved line's digits to "1" (same batch, same undo unit) unless it
+// lands where a same-delimiter ordered list is already open.
+
+#[test]
+fn chained_indent_then_outdent_on_the_flagship_repro() {
+    // The demo-doc repro, chained through ONE editor instance (no reload
+    // between commands) — the regression the original tests missed.
+    let doc = "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n3. ordered three\n";
+    let mut ed = Editor::new(1);
+    ed.load(doc);
+
+    // Tab on "2. ordered two" (cursor mid-text).
+    let change = run(&mut ed, Command::IndentList { from: 21, to: 21 }).unwrap();
+    assert_eq!(
+        ed.get_text(),
+        "1. ordered one\n   1. ordered two\n      1. nested ordered item\n      - a bullet nested under an ordered item\n3. ordered three\n",
+        "digits rewritten to 1, subtree carried"
+    );
+    assert_eq!(change.splices.len(), 4, "3 indents + 1 digit rewrite");
+    // The moved line IS a list item after reparse (the invariant the bug broke).
+    assert_list_item_line(&ed, "1. ordered two");
+    assert_list_item_line(&ed, "1. nested ordered item");
+    assert_list_item_line(&ed, "- a bullet nested under an ordered item");
+
+    // Shift-Tab at the returned selection restores the nesting structure
+    // (numbers may legitimately differ from the original bytes — assert
+    // structure, not byte-identity).
+    let sel = change.selection.expect("indent returns a selection");
+    let out = run(&mut ed, Command::OutdentList { from: sel.anchor, to: sel.head })
+        .expect("chained outdent must apply — the indented line must still be an item");
+    assert!(!out.splices.is_empty(), "outdent actually moves the lines back");
+    assert_eq!(
+        ed.get_text(),
+        "1. ordered one\n1. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n3. ordered three\n",
+        "structure restored: top-level item with its two children re-attached"
+    );
+    assert_list_item_line(&ed, "1. ordered two");
+    assert_list_item_line(&ed, "1. nested ordered item");
+    assert_list_item_line(&ed, "- a bullet nested under an ordered item");
+}
+
+#[test]
+fn indent_joining_an_open_ordered_sublist_keeps_its_number() {
+    // "2. b" lands at the same column as the open "   1. a1" sublist, same
+    // "." family: it JOINS that list — any number is valid there, no rewrite.
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n   1. a1\n2. b\n");
+    run(&mut ed, Command::IndentList { from: 17, to: 17 }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n   1. a1\n   2. b\n");
+    assert_list_item_line(&ed, "2. b");
+}
+
+#[test]
+fn indent_onto_a_bullet_family_at_the_same_column_rewrites_to_one() {
+    // Same landing column but a BULLET list is open there: an ordered marker
+    // starts a NEW list (lists are homogeneous per marker family), which a
+    // non-1 number cannot do in paragraph-interruption position → rewrite.
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n   - a1\n2. b\n");
+    run(&mut ed, Command::IndentList { from: 16, to: 16 }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n   - a1\n   1. b\n");
+    assert_list_item_line(&ed, "1. b");
+}
+
+#[test]
+fn outdent_rejoining_an_open_ordered_list_keeps_its_number() {
+    // Shift-Tab on "   3. c": after skipping the deeper "1. b"/"1. b1"
+    // lines, the landing line at the target column is "1. a" — ordered,
+    // same family → "3. c" REJOINS the outer open list, no rewrite.
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n   1. b\n      1. b1\n   3. c\n");
+    run(&mut ed, Command::OutdentList { from: 31, to: 31 }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n   1. b\n      1. b1\n3. c\n");
+    assert_list_item_line(&ed, "3. c");
+}
+
+#[test]
+fn outdent_onto_a_bullet_parent_rewrites_to_one() {
+    // "2. c" outdents to the bullet parent's column: different family →
+    // starting a new ordered list there needs number 1 → rewrite.
+    let mut ed = Editor::new(1);
+    ed.load("- a\n  1. b\n  2. c\n");
+    run(&mut ed, Command::OutdentList { from: 16, to: 16 }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n  1. b\n1. c\n");
+    assert_list_item_line(&ed, "1. c");
+}

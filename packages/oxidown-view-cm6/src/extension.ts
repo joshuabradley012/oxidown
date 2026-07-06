@@ -597,14 +597,52 @@ function commandKeymap(core: OxidownCore): Extension {
       if (change) applyCoreChange(view, change, "oxidown.command");
       return true;
     };
+  // Tab/Shift-Tab: marker-width-aware Tab nesting (docs/boundary-v0.md
+  // "indentList / outdentList") when the selection touches a list item —
+  // nests to the PARENT MARKER'S CONTENT COLUMN (2/3/4 spaces depending on
+  // the marker), never a fixed 2-space shift. The core resolves this purely
+  // from the line(s) the selection touches, so a cursor anywhere in the
+  // item's text (not just at its start) indents the whole item, never
+  // inserts spaces at the cursor. Falls back to CM6's own indentMore/
+  // indentLess when the command doesn't apply (`null`) — e.g. a plain
+  // paragraph. When it DOES apply but there's no movement to make (already
+  // top-level, first item of its list, …), the core still returns a
+  // CoreChange (empty splices, no selection); `applyCoreChange` is then a
+  // no-op, and — unlike the `null` case — that does NOT fall back to
+  // indentMore/indentLess (the command applied; it just moved nothing).
+  const runIndent =
+    (name: "indentList" | "outdentList", fallback: (view: EditorView) => boolean) =>
+    (view: EditorView): boolean => {
+      const { from, to } = view.state.selection.main;
+      let change: CoreChange | null;
+      try {
+        change = core.command(name, from, to);
+      } catch (err) {
+        console.error(
+          `[oxidown] core error during command(${name}) — re-loading core from view buffer:`,
+          err,
+        );
+        core.load(view.state.doc.toString());
+        return true;
+      }
+      if (change === null) return fallback(view);
+      applyCoreChange(view, change, "oxidown.command");
+      return true;
+    };
   return keymap.of([
     { key: "Mod-b", run: runToggle("toggleStrong"), preventDefault: true },
     { key: "Mod-i", run: runToggle("toggleEm"), preventDefault: true },
     { key: "Mod-Shift-x", run: runToggle("toggleStrike"), preventDefault: true },
     { key: "Mod-e", run: runToggle("toggleCode"), preventDefault: true },
-    // Tab indents (2-space indentUnit) instead of moving focus — the
-    // standard editor tradeoff; Escape then Tab leaves the editor.
-    { key: "Tab", run: indentMore, shift: indentLess, preventDefault: true },
+    // Tab indents (falling back to CM6's fixed 2-space indentUnit outside
+    // list context) instead of moving focus — the standard editor tradeoff;
+    // Escape then Tab leaves the editor.
+    {
+      key: "Tab",
+      run: runIndent("indentList", indentMore),
+      shift: runIndent("outdentList", indentLess),
+      preventDefault: true,
+    },
   ]);
 }
 

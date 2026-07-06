@@ -285,6 +285,8 @@ impl OxidownCore {
     /// - `command("toggleStrong"|"toggleEm"|"toggleStrike"|"toggleCode", from, to)`
     /// - `command("setHeading", pos, level)` (level 0–6; 0 = paragraph)
     /// - `command("toggleTask", pos)`
+    /// - `command("indentList"|"outdentList", from, to)` (marker-width-aware
+    ///   Tab nesting, boundary v0.2)
     ///
     /// Returns `CoreChange | null` (`null` when the command doesn't apply at
     /// the target). Throws on unknown names, missing arguments, or invalid
@@ -302,6 +304,15 @@ impl OxidownCore {
                     "toggleEm" => Command::ToggleEm { from, to },
                     "toggleStrike" => Command::ToggleStrike { from, to },
                     _ => Command::ToggleCode { from, to },
+                }
+            }
+            "indentList" | "outdentList" => {
+                let from = a as usize;
+                let to = need_b("a `to` position")? as usize;
+                if name == "indentList" {
+                    Command::IndentList { from, to }
+                } else {
+                    Command::OutdentList { from, to }
                 }
             }
             "setHeading" => {

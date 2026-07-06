@@ -144,6 +144,87 @@ describe("oxidown extension wiring (jsdom)", () => {
   });
 });
 
+describe("Tab/Shift-Tab keymap (indentList/outdentList with indentMore/indentLess fallback)", () => {
+  const tabKey = (shift = false) =>
+    new KeyboardEvent("keydown", { key: "Tab", code: "Tab", shiftKey: shift, bubbles: true, cancelable: true });
+
+  it("falls back to indentMore in a plain paragraph (not a list)", async () => {
+    const core = new MockCore();
+    const view = makeView("plain paragraph", core);
+    view.dispatch({ selection: { anchor: 3 } });
+
+    view.contentDOM.dispatchEvent(tabKey());
+    await flush();
+
+    // CM6's default indentMore behavior: 2 spaces at the line start.
+    expect(view.state.doc.toString()).toBe("  plain paragraph");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    view.destroy();
+  });
+
+  it("indents the whole item when the cursor is in the middle of the item's text", async () => {
+    const core = new MockCore();
+    const doc = "- a\n- b\n";
+    const view = makeView(doc, core);
+    // Cursor on the "b" character itself, not at the line/item start.
+    view.dispatch({ selection: { anchor: doc.indexOf("b") } });
+
+    view.contentDOM.dispatchEvent(tabKey());
+    await flush();
+
+    expect(view.state.doc.toString()).toBe("- a\n  - b\n");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    view.destroy();
+  });
+
+  it("Shift-Tab outdents via outdentList and reverses an indent", async () => {
+    const core = new MockCore();
+    const doc = "- a\n  - b\n";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: doc.indexOf("b") } });
+
+    view.contentDOM.dispatchEvent(tabKey(true));
+    await flush();
+
+    expect(view.state.doc.toString()).toBe("- a\n- b\n");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    view.destroy();
+  });
+
+  it("a no-movement no-op (first item of a list) does not fall back to indentMore", async () => {
+    const core = new MockCore();
+    const doc = "- a\n- b\n";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: doc.indexOf("a") } });
+
+    view.contentDOM.dispatchEvent(tabKey());
+    await flush();
+
+    // Applies (list context) but there's no target to nest under — must NOT
+    // insert indentMore's fixed 2 spaces instead.
+    expect(view.state.doc.toString()).toBe(doc);
+    view.destroy();
+  });
+
+  it("indenting a non-1 ordered item applies the digit-rewrite batch cleanly through CM6", async () => {
+    // The paragraph-interruption guard adds a digit-rewrite splice that
+    // TOUCHES the indent splice (both anchored at the line start when the
+    // item is at column 0) — this exercises that batch through a real CM6
+    // dispatch, not just the mock's own string splicing.
+    const core = new MockCore();
+    const doc = "1. a\n2. b\n";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: doc.indexOf("b") } });
+
+    view.contentDOM.dispatchEvent(tabKey());
+    await flush();
+
+    expect(view.state.doc.toString()).toBe("1. a\n   1. b\n");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    view.destroy();
+  });
+});
+
 describe("source mode (decorations: false)", () => {
   function makeSourceView(doc: string, core: MockCore) {
     const parent = document.createElement("div");

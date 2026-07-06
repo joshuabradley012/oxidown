@@ -341,8 +341,32 @@ impl Editor {
                 let pos_b = self.text.utf16_to_byte_floor(pos)?;
                 commands::toggle_task(&self.overlay, self.text.len_bytes(), pos_b)
             }
+            Command::IndentList { from, to } | Command::OutdentList { from, to } => {
+                let (lo, hi) = (from.min(to), from.max(to));
+                let from_b = self.text.utf16_to_byte(lo)?;
+                let to_b = self.text.utf16_to_byte(hi)?;
+                if matches!(cmd, Command::IndentList { .. }) {
+                    commands::indent_list(&self.overlay, &src, from_b, to_b)
+                } else {
+                    commands::outdent_list(&self.overlay, &src, from_b, to_b)
+                }
+            }
         };
-        Ok(plan.map(|plan| self.apply_plan(plan)))
+        // A plan with an empty batch means the command APPLIES but no
+        // movement is possible (boundary v0.2: indentList/outdentList at the
+        // top/bottom of their nesting range) — it must not create an undo
+        // unit or bump the revision, unlike every other (non-empty) plan.
+        Ok(plan.map(|plan| {
+            if plan.batch.is_empty() {
+                CoreChange {
+                    revision: self.revision,
+                    splices: Vec::new(),
+                    selection: None,
+                }
+            } else {
+                self.apply_plan(plan)
+            }
+        }))
     }
 
     // ---- streaming (boundary v0.2, plan §5.9) ----------------------------

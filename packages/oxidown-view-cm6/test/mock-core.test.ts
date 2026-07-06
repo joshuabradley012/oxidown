@@ -743,6 +743,217 @@ describe("MockCore command (v0.2)", () => {
   });
 });
 
+describe("MockCore indentList/outdentList (v0.2, marker-width-aware Tab nesting)", () => {
+  it("bullet under bullet indents by 2", () => {
+    const { core } = makeCore("- a\n- b\n");
+    core.command("indentList", 6, 6);
+    expect(core.getText()).toBe("- a\n  - b\n");
+  });
+
+  it("ordered under ordered indents by 3, double-digit marker by 4", () => {
+    // Digits rewrite to "1": a non-1 ordered marker cannot interrupt the
+    // parent item's paragraph (the paragraph-interruption guard — see the
+    // dedicated describe block below), so "   2. b" would de-list.
+    const a = makeCore("1. a\n2. b\n").core;
+    a.command("indentList", 8, 8);
+    expect(a.getText()).toBe("1. a\n   1. b\n");
+
+    const b = makeCore("10. a\n11. b\n").core;
+    b.command("indentList", 10, 10);
+    expect(b.getText()).toBe("10. a\n    1. b\n");
+  });
+
+  it("bullet under ordered indents by 3", () => {
+    const { core } = makeCore("1. a\n- b\n");
+    core.command("indentList", 7, 7);
+    expect(core.getText()).toBe("1. a\n   - b\n");
+  });
+
+  it("task under task indents by 2 (checkbox is content, not marker)", () => {
+    const { core } = makeCore("- [ ] a\n- [ ] b\n");
+    core.command("indentList", 14, 14);
+    expect(core.getText()).toBe("- [ ] a\n  - [ ] b\n");
+  });
+
+  it("nesting inside a quote stays relative to the quote prefix", () => {
+    const { core } = makeCore("> 1. a\n> 2. b\n");
+    core.command("indentList", 12, 12);
+    // 3 spaces after "> ", digits guard-rewritten to "1".
+    expect(core.getText()).toBe("> 1. a\n>    1. b\n");
+  });
+
+  it("does not nest across a quote boundary", () => {
+    const { core } = makeCore("> - a\n- b\n");
+    const rev = core.revision();
+    const change = core.command("indentList", 8, 8);
+    expect(change).not.toBeNull();
+    expect(change!.splices).toEqual([]);
+    expect(core.getText()).toBe("> - a\n- b\n");
+    expect(core.revision()).toBe(rev);
+  });
+
+  it("multi-line selection moves together by the first line's delta", () => {
+    const { core } = makeCore("- a\n- b\n- c\n");
+    const change = core.command("indentList", 4, 11);
+    expect(change!.splices.length).toBe(2);
+    expect(core.getText()).toBe("- a\n  - b\n  - c\n");
+  });
+
+  it("first item of a list is a no-op that applies (not null) and burns no revision", () => {
+    const { core } = makeCore("- a\n- b\n");
+    const rev = core.revision();
+    const change = core.command("indentList", 2, 2);
+    expect(change).not.toBeNull();
+    expect(change!.splices).toEqual([]);
+    expect(change!.selection).toBeNull();
+    expect(core.revision()).toBe(rev);
+    expect(core.getText()).toBe("- a\n- b\n");
+  });
+
+  it("a non-list range does not apply", () => {
+    const { core } = makeCore("plain paragraph\n");
+    expect(core.command("indentList", 3, 3)).toBeNull();
+  });
+
+  it("outdent reverses each indent case", () => {
+    for (const [indented, from, to, flat] of [
+      ["- a\n  - b\n", 8, 8, "- a\n- b\n"],
+      ["1. a\n   1. b\n", 11, 11, "1. a\n1. b\n"],
+      ["10. a\n    1. b\n", 13, 13, "10. a\n1. b\n"],
+      ["1. a\n   - b\n", 10, 10, "1. a\n- b\n"],
+      ["- [ ] a\n  - [ ] b\n", 16, 16, "- [ ] a\n- [ ] b\n"],
+      ["> 1. a\n>    1. b\n", 15, 15, "> 1. a\n> 1. b\n"],
+    ] as Array<[string, number, number, string]>) {
+      const { core } = makeCore(indented);
+      core.command("outdentList", from, to);
+      expect(core.getText()).toBe(flat);
+    }
+  });
+
+  it("outdent at top level is a no-op", () => {
+    const { core } = makeCore("- a\n- b\n");
+    const rev = core.revision();
+    const change = core.command("outdentList", 6, 6);
+    expect(change).not.toBeNull();
+    expect(change!.splices).toEqual([]);
+    expect(core.revision()).toBe(rev);
+  });
+
+  it("outdent clamps to a line's own leading space count", () => {
+    const { core } = makeCore("- p\n  - a\n - c\n");
+    const change = core.command("outdentList", 8, 13);
+    expect(change!.splices.map((s) => s.delete)).toEqual([2, 1]);
+    expect(core.getText()).toBe("- p\n- a\n- c\n");
+  });
+
+  it("undo restores a multi-line indent in one step", () => {
+    const { core } = makeCore("- a\n- b\n- c\n");
+    core.command("indentList", 4, 11);
+    expect(core.getText()).toBe("- a\n  - b\n  - c\n");
+    core.undo();
+    expect(core.getText()).toBe("- a\n- b\n- c\n");
+    core.redo();
+    expect(core.getText()).toBe("- a\n  - b\n  - c\n");
+  });
+
+  // --- subtree-aware affected set -----------------------------------------
+
+  it("indenting a parent moves its whole subtree with it", () => {
+    const { core } = makeCore("- x\n- p\n  - c1\n  - c2\n");
+    const change = core.command("indentList", 6, 6);
+    expect(change!.splices.length).toBe(3);
+    expect(core.getText()).toBe("- x\n  - p\n    - c1\n    - c2\n");
+  });
+
+  it("outdent reverses a subtree move", () => {
+    const { core } = makeCore("- x\n  - p\n    - c1\n    - c2\n");
+    const change = core.command("outdentList", 8, 8);
+    expect(change!.splices.length).toBe(3);
+    expect(core.getText()).toBe("- x\n- p\n  - c1\n  - c2\n");
+  });
+
+  it("subtree does not include a following sibling (equal marker column)", () => {
+    const { core } = makeCore("- x\n- p\n  - c1\n- sibling\n");
+    const change = core.command("indentList", 6, 6);
+    expect(change!.splices.length).toBe(2);
+    expect(core.getText()).toBe("- x\n  - p\n    - c1\n- sibling\n");
+  });
+
+  it("subtree walk stops at a blank line", () => {
+    const { core } = makeCore("- x\n- p\n  - c1\n\n  - c2\n");
+    const change = core.command("indentList", 6, 6);
+    expect(change!.splices.length).toBe(2);
+    expect(core.getText()).toBe("- x\n  - p\n    - c1\n\n  - c2\n");
+  });
+
+  it("subtree inside a quote respects quote depth", () => {
+    const { core } = makeCore("> - x\n> - p\n>   - c1\n- outside\n");
+    const change = core.command("indentList", 10, 10);
+    expect(change!.splices.length).toBe(2);
+    expect(core.getText()).toBe("> - x\n>   - p\n>     - c1\n- outside\n");
+  });
+
+  // --- paragraph-interruption guard (parity with the Rust core) -----------
+  //
+  // A non-1 ordered marker cannot START a list in paragraph-interruption
+  // position (CommonMark): the moved line's digits rewrite to "1" unless it
+  // lands where a same-delimiter ordered list is already open.
+
+  it("chained Tab then Shift-Tab on the flagship repro (one core, no reload)", () => {
+    const doc =
+      "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n3. ordered three\n";
+    const { core } = makeCore(doc);
+
+    const change = core.command("indentList", 21, 21)!;
+    expect(core.getText()).toBe(
+      "1. ordered one\n   1. ordered two\n      1. nested ordered item\n      - a bullet nested under an ordered item\n3. ordered three\n",
+    );
+    expect(change.splices.length).toBe(4); // 3 indents + 1 digit rewrite
+
+    // Shift-Tab at the returned selection restores the nesting structure
+    // (numbers may differ from the original bytes — structure, not bytes).
+    const sel = change.selection!;
+    const out = core.command("outdentList", sel.anchor, sel.head);
+    expect(out).not.toBeNull();
+    expect(out!.splices.length).toBeGreaterThan(0);
+    expect(core.getText()).toBe(
+      "1. ordered one\n1. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n3. ordered three\n",
+    );
+  });
+
+  it("joining an open ordered sublist keeps the number", () => {
+    const { core } = makeCore("1. a\n   1. a1\n2. b\n");
+    core.command("indentList", 17, 17);
+    expect(core.getText()).toBe("1. a\n   1. a1\n   2. b\n");
+  });
+
+  it("landing on a bullet family at the same column rewrites to 1", () => {
+    const { core } = makeCore("1. a\n   - a1\n2. b\n");
+    core.command("indentList", 16, 16);
+    expect(core.getText()).toBe("1. a\n   - a1\n   1. b\n");
+  });
+
+  it("outdent rejoining an open ordered list keeps the number", () => {
+    const { core } = makeCore("1. a\n   1. b\n      1. b1\n   3. c\n");
+    core.command("outdentList", 31, 31);
+    expect(core.getText()).toBe("1. a\n   1. b\n      1. b1\n3. c\n");
+  });
+
+  it("outdent onto a bullet parent rewrites to 1", () => {
+    const { core } = makeCore("- a\n  1. b\n  2. c\n");
+    core.command("outdentList", 16, 16);
+    expect(core.getText()).toBe("- a\n  1. b\n1. c\n");
+  });
+
+  it("the rewrite shares the command's single undo unit", () => {
+    const { core } = makeCore("1. a\n2. b\n");
+    core.command("indentList", 8, 8);
+    expect(core.getText()).toBe("1. a\n   1. b\n");
+    core.undo();
+    expect(core.getText()).toBe("1. a\n2. b\n"); // digits AND indent restored together
+  });
+});
+
 describe("MockCore streaming (v0.2)", () => {
   it("streamOpen/Append/Close: appends land at the (mapped) insertion anchor", () => {
     const { core } = makeCore("head\n");

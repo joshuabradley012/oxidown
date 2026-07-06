@@ -99,8 +99,20 @@ export interface CoreChange {
   selection?: { anchor: number; head: number } | null;
 }
 
-/** v0.2 command names accepting a (from, to) range. */
-export type RangeCommandName = "toggleStrong" | "toggleEm" | "toggleStrike" | "toggleCode";
+/**
+ * v0.2 command names accepting a (from, to) range. `indentList`/
+ * `outdentList` are marker-width-aware Tab nesting (docs/boundary-v0.md
+ * "indentList / outdentList"): they apply only when the range touches a
+ * list-item line, and return a NO-OP CoreChange (empty splices) rather than
+ * `null` when they apply but no movement is possible.
+ */
+export type RangeCommandName =
+  | "toggleStrong"
+  | "toggleEm"
+  | "toggleStrike"
+  | "toggleCode"
+  | "indentList"
+  | "outdentList";
 
 export interface OxidownCore {
   /** Create/replace the document. Returns revision 0's successor. */
@@ -164,7 +176,10 @@ export interface OxidownCore {
    * Commands are text transforms computed against the overlay (plan §5.8):
    * minimal splices (toggle = add/remove delimiters), origin "command",
    * always a single non-coalescing undo unit. Returns null when the command
-   * doesn't apply at the target.
+   * doesn't apply at the target — EXCEPT `indentList`/`outdentList`, which
+   * return null only when no line in the range carries a list marker; when
+   * they apply but no movement is possible they return a CoreChange with
+   * empty splices (a no-op the view still shouldn't fall back from).
    */
   command(name: RangeCommandName, from: number, to: number): CoreChange | null;
   command(name: "setHeading", pos: number, level: 0 | 1 | 2 | 3 | 4 | 5 | 6): CoreChange | null;

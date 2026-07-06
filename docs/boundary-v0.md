@@ -256,11 +256,110 @@ text collapses the anchor to the deletion site; it does not become null in M1.
 command(name: "toggleStrong"|"toggleEm"|"toggleStrike"|"toggleCode", from: number, to: number): CoreChange | null;
 command(name: "setHeading", pos: number, level: 0|1|2|3|4|5|6): CoreChange | null;   // 0 = paragraph
 command(name: "toggleTask", pos: number): CoreChange | null;  // pos anywhere in the list item
+command(name: "indentList"|"outdentList", from: number, to: number): CoreChange | null;
 ```
 
 Commands are text transforms computed against the overlay (plan §5.8): they emit minimal
 splices (toggle = add or remove delimiters), enter the op log with origin `"command"`, and are
-single undo units (never coalesce). Returns null when the command doesn't apply at the target.
+single undo units (never coalesce). Returns null when the command doesn't apply at the target —
+`indentList`/`outdentList` are the one exception to "null when nothing happens"; see below.
+
+### `indentList` / `outdentList`
+
+Obsidian-style Tab nesting: indent a list item to its PARENT MARKER'S CONTENT COLUMN — 2 spaces
+under `- `, 3 under `1. `, 4 under `10. ` — rather than a fixed 2-space shift (CM6's stock
+`indentMore`/`indentLess`, which the view falls back to outside list context). All quantities
+below are per PHYSICAL SOURCE LINE.
+
+Definitions:
+- **Quote prefix**: a line's blockquote marker run (`> `, `> > `, …), from the parser's per-line
+  `BlockQuoteLine` nodes (`> `'s own required trailing space is part of the prefix; further
+  spaces before a list marker are not).
+- **Marker column**: the column of a list marker's first glyph (`-`, `+`, `*`, or an ordered
+  marker's digits), measured AFTER the quote prefix.
+- **Marker token width**: marker glyphs plus exactly ONE following space — `- ` = 2, `1. ` = 3,
+  `10. ` = 4. For a task item (`- [ ] x`) the token is just `- ` (width 2): the `[ ]` is GFM
+  content, not part of the marker, so nesting under a task item needs only 2 spaces. This is a
+  FIXED formula — it does not grow with however much whitespace the source actually has after
+  the marker (CommonMark tolerates a few extra spaces there without moving the content column).
+- **Content column** = marker column + marker token width.
+
+Applies-vs-no-op:
+- The command applies iff at least one line intersecting `[from, to]` is a list-item line
+  (carries a list marker). If none → does not apply → `null` (the view falls back to
+  `indentMore`/`indentLess`).
+- When it applies but no movement is possible (see below) it returns a CoreChange that is a
+  NO-OP: empty `splices`, no `selection` — and it must NOT create an undo unit or bump the
+  revision (unlike every other non-empty command result). The view must still treat this as
+  "handled" (do NOT fall back to `indentMore`/`indentLess` just because nothing moved).
+
+First-line delta (batching): the whole edit moves by ONE delta, computed from the FIRST
+intersecting item line only. Scan upward from it over consecutive list-item lines at the SAME
+quote depth (stop at the first line that either isn't a list-item line, or is one at a different
+quote depth — sibling/parent scans never cross a quote boundary; a list inside a quote never
+nests relative to items outside it, and vice versa) to find:
+- **indentList**'s target: the nearest such line with marker column `<=` the first line's.
+  `delta = target's content column − first line's marker column`; `delta <= 0` → no-op. No target
+  above (first item of its list) → no-op.
+- **outdentList**'s parent: the nearest such line with marker column STRICTLY `<` the first
+  line's. `delta = first line's marker column − parent's` (always `> 0`). No parent (already
+  top-level) → no-op.
+
+Subtree-aware affected set: it is not just the lines intersecting `[from, to]`. For EVERY
+intersecting item line, its whole subtree moves with it by the same single delta above — walk
+forward from that line collecting consecutive following lines that are (a) list-item lines,
+(b) at the same quote depth as it, (c) with marker column STRICTLY GREATER than **its own**
+column (not the previous line's — so a multi-level subtree, several children included, is
+captured in one walk; a following line at an EQUAL column is a sibling and stops the walk, not a
+descendant). The walk also stops at a quote-depth change or the first non-item line — including a
+blank line: v1 does not look past one to see whether list content resumes, so a blank-line-
+separated ("loose") continuation is left at its prior depth. The union of every intersecting item
+line plus its subtree (deduplicated, applied in document order) is the final affected set:
+- indentList inserts `delta` spaces immediately after the quote prefix on every line in it.
+- outdentList removes `min(delta, that line's own marker column)` spaces from just after the
+  quote prefix on every line in it (clamped independently per line, so a shallower-than-expected
+  descendant never goes negative).
+
+Renumbering: there is no COSMETIC renumbering of siblings — presenting `1./1./1.` sources as
+`1./2./3.` is the view's computed-number territory (research/07), and the command never touches
+lines the user didn't move. But the command DOES perform one minimal STRUCTURAL rewrite on the
+moved item itself, because CommonMark would otherwise refuse to parse the command's own output
+as a list item:
+
+**Paragraph-interruption guard.** Per CommonMark, an ordered marker whose number != 1 cannot
+START a new list in paragraph-interruption position — indenting `2. b` directly under `1. a`'s
+open paragraph would make `   2. b` reparse as LAZY CONTINUATION text of item 1, silently
+de-listing the moved item (and stranding its carried subtree), after which Shift-Tab finds no
+item line and falls back. To prevent this, after computing the batch (indent AND outdent both),
+the FIRST affected line is checked with a deterministic structural rule (identical in the Rust
+core and the mock — a shared rule, not post-hoc parser validation, so both cores agree even
+where their parsers differ in leniency):
+
+- If the first affected line's marker is ordered with number != 1 (numeric — `01.` counts
+  as 1): scan upward from its post-edit position past consecutive same-quote-depth list-item
+  lines whose (post-edit) marker column is STRICTLY GREATER than its new column; land on the
+  nearest line with column <= the new column. (Lines above the first affected line are untouched
+  by the batch, so their pre-edit columns are already post-edit.)
+- If the landing line is a list-item line at column EQUAL to the new column whose marker is
+  also ordered with the SAME delimiter flavor (`.` vs `)`), the moved item JOINS that
+  already-open ordered list — any number is valid there — and nothing is rewritten
+  (e.g. Tab on `2. b` in `1. a` / `   1. a1` / `2. b` keeps `   2. b`).
+- Otherwise (landing on a shallower item, a different marker family — e.g. a bullet list open
+  at that column — or the scan broke on a non-item or different-quote-depth line), the moved
+  item would START a new list in interruption position: its digits are rewritten to `1`
+  (`2.` → `1.`, `10.` → `1.`) as additional splice(s) in the SAME batch and undo unit.
+
+The moved line is text the user explicitly commanded to transform, so this does not violate the
+never-rewrite-unedited-bytes invariant; only the moved item's own digits are ever touched.
+Accepted v1 imprecision: `10.` → `1.` shrinks the marker token width by one, so the moved
+item's descendants (shifted by the pre-rewrite delta) may sit one column past the ideal content
+column — still valid nesting, just not byte-ideal.
+
+Selection: the cursor/selection maps through the inserted/removed spaces (existing
+mapping/anchor machinery), so it stays logically attached to the same character.
+
+Undo: one undo unit for the whole affected set (however many lines it touches); undo restores
+every line at once.
 
 ## Streaming (plan §5.9)
 

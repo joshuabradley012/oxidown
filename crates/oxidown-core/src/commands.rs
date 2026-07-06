@@ -47,7 +47,76 @@
 //! `pos` anywhere in the list item (the parser records each task item's
 //! full extent). Flips exactly one byte: the `[ ]`/`[x]` checkbox interior.
 //! `[X]` (capital) also toggles off to `[ ]`.
+//!
+//! ## indentList / outdentList
+//!
+//! Obsidian-style Tab nesting: indent a list item to its PARENT MARKER'S
+//! CONTENT COLUMN (`- ` → 2, `1. ` → 3, `10. ` → 4; a task item's `- ` is
+//! the same 2 — the checkbox is GFM content, not part of the marker),
+//! rather than a fixed 2-space shift. All positions/quantities below are
+//! per PHYSICAL SOURCE LINE.
+//!
+//! * The "quote prefix" of a line is its blockquote marker run (`> `,
+//!   `> > `, …), from the parser's `BlockQuoteLine` nodes. The "marker
+//!   column" is the column of a list marker's first glyph measured AFTER
+//!   the quote prefix. "Content column" = marker column + marker token
+//!   width.
+//! * Applies iff at least one line intersecting `[from, to]` carries a list
+//!   marker (a "list-item line") — otherwise `None` (the view falls back to
+//!   its own default Tab handling).
+//! * The edit moves by ONE delta, computed from the FIRST intersecting item
+//!   line only: scanning upward over consecutive same-quote-depth list-item
+//!   lines (stopping at the first line that isn't one, or whose quote depth
+//!   differs) to find the nearest candidate — indent's target is the
+//!   nearest with marker column <= the first line's; outdent's parent is
+//!   the nearest with marker column STRICTLY less. No candidate (already
+//!   first-in-list / already top-level) → applies, but is a NO-OP
+//!   `CommandPlan` (empty batch); `Editor::command` special-cases an empty
+//!   batch so it skips the undo unit/revision bump entirely (see its doc
+//!   comment).
+//! * indent: delta = target's content column − first line's marker column
+//!   (`<= 0` → no-op). outdent: delta = first line's marker column − parent's
+//!   (always `> 0`, since the parent's column is strictly smaller).
+//! * **Subtree-aware affected-line set** (not just the intersecting lines):
+//!   for EVERY intersecting item line, its whole subtree moves with it —
+//!   walk forward from that line collecting consecutive following lines
+//!   that are (a) list-item lines (b) at the SAME quote depth as it
+//!   (c) with marker column STRICTLY GREATER than ITS OWN column (not the
+//!   previous line's — a grandchild and a second child both still compare
+//!   against the root, so a whole multi-level subtree, several children
+//!   included, is captured in one walk). The walk stops at the first line
+//!   that fails any of those three (a sibling/shallower item, a quote-depth
+//!   change, or a non-item line — including a blank line: v1 does not look
+//!   past one to see whether list content resumes). The union of every
+//!   intersecting item line plus its subtree is the final affected set
+//!   (deduplicated by line, applied in document order); every line in it
+//!   gets the SAME single delta from above. indent inserts `delta` spaces
+//!   right after each affected line's quote prefix; outdent removes
+//!   `min(delta, that line's own marker column)` (clamped independently per
+//!   line, so a shallower descendant than expected never goes negative).
+//! * **Paragraph-interruption guard** (structural, not cosmetic): after
+//!   computing the batch, if the FIRST affected line's marker is ordered
+//!   with number != 1, check whether it lands where an ordered list of the
+//!   same delimiter flavor is already open — scan upward from its post-edit
+//!   position past consecutive same-quote-depth item lines whose (post-edit)
+//!   marker column is STRICTLY GREATER than its new column, landing on the
+//!   nearest line with column <= the new column. If the landing line is an
+//!   item at column == the new column whose marker is also ordered with the
+//!   SAME delimiter (`.` vs `)`), the moved item joins that open list and
+//!   any number is valid → no rewrite. Otherwise (shallower landing,
+//!   different marker family, or the scan broke on a non-item/other-depth
+//!   line) the moved item would START a new list in paragraph-interruption
+//!   position, which CommonMark refuses for ordered markers != 1 — the line
+//!   would silently degrade to lazy-continuation text. Rewrite its digits
+//!   to `1` (`2.` → `1.`, `10.` → `1.`) as an extra splice in the SAME
+//!   batch/undo unit. Only the moved line is ever rewritten — no COSMETIC
+//!   renumbering of siblings (that is view territory, per research/07).
+//!   Accepted v1 imprecision: `10.` → `1.` shrinks the marker token width
+//!   by one, so the line's descendants (shifted by the pre-rewrite delta)
+//!   may sit one column past the ideal content column — still valid
+//!   nesting.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use crate::block_index::BlockKind;
@@ -66,6 +135,10 @@ pub enum Command {
     /// `level` 0 = back to paragraph.
     SetHeading { pos: usize, level: u8 },
     ToggleTask { pos: usize },
+    /// Marker-width-aware Tab nesting (boundary v0.2). UTF-16 range like the
+    /// toggles; the editor resolves to bytes and normalizes `from <= to`.
+    IndentList { from: usize, to: usize },
+    OutdentList { from: usize, to: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,4 +386,437 @@ pub fn toggle_task(nodes: &[Node], doc_len: usize, pos_b: usize) -> Option<Comma
         }],
         selection: None, // 1-for-1 byte swap: the view's cursor is unaffected
     })
+}
+
+// ---------------------------------------------------------------------
+// indentList / outdentList (boundary v0.2: marker-width-aware Tab nesting).
+// See the module doc comment's "## indentList / outdentList" section for
+// the full spec — this is a direct transcription of it.
+// ---------------------------------------------------------------------
+
+/// One physical source line's list/quote context. Built fresh per line from
+/// the parser overlay + raw source bytes — cheap, since these commands only
+/// ever look at a handful of lines around the selection.
+#[derive(Clone, Copy)]
+struct ListLineCtx {
+    start: usize,
+    /// This line's own extent end (terminator excluded) — where to resume
+    /// scanning from `next_line` for the subtree walk.
+    end: usize,
+    /// Byte offset just past this line's blockquote marker run (`> `,
+    /// `> > `, …) — equals `start` when the line isn't quoted.
+    quote_end: usize,
+    quote_depth: u8,
+    /// `(marker glyph's first byte, marker token width)` when this line's
+    /// OWN list item begins here — `None` for continuation/blank/non-list
+    /// lines (those never carry their own `ListMarker` node).
+    marker: Option<(usize, usize)>,
+}
+
+impl ListLineCtx {
+    /// Marker column: the marker's first glyph, measured from just past the
+    /// quote prefix. `None` when this line has no marker of its own.
+    fn marker_column(&self) -> Option<usize> {
+        self.marker.map(|(item_start, _)| item_start - self.quote_end)
+    }
+}
+
+/// Byte range of the physical source line containing `pos` (the trailing
+/// `\n`/`\r\n` terminator excluded). Commands work directly off `src`
+/// (unlike `Editor`, which has `TextBuffer::line_range_at` over the rope).
+fn line_containing(bytes: &[u8], pos: usize) -> Range<usize> {
+    let mut start = pos.min(bytes.len());
+    while start > 0 && bytes[start - 1] != b'\n' {
+        start -= 1;
+    }
+    let mut end = start;
+    while end < bytes.len() && bytes[end] != b'\n' && bytes[end] != b'\r' {
+        end += 1;
+    }
+    start..end
+}
+
+/// The physical line immediately preceding `line_start`, or `None` at the
+/// start of the document.
+fn prev_line(bytes: &[u8], line_start: usize) -> Option<Range<usize>> {
+    if line_start == 0 {
+        return None;
+    }
+    let mut end = line_start;
+    if end > 0 && bytes[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && bytes[end - 1] == b'\r' {
+        end -= 1;
+    }
+    Some(line_containing(bytes, end))
+}
+
+/// The physical line immediately following the line ending at `line_end`
+/// (that line's own extent, terminator excluded), or `None` when `line_end`
+/// has no terminator (the document's last line).
+fn next_line(bytes: &[u8], line_end: usize) -> Option<Range<usize>> {
+    let mut next = line_end;
+    if bytes.get(next) == Some(&b'\r') {
+        next += 1;
+    }
+    if bytes.get(next) == Some(&b'\n') {
+        next += 1;
+    }
+    if next == line_end {
+        return None; // no terminator: `line_end` is the document's end
+    }
+    Some(line_containing(bytes, next))
+}
+
+/// Physical lines intersecting `[from_b, to_b]` (`from_b <= to_b`), mirroring
+/// CodeMirror's own multi-line command iteration: an empty range (cursor)
+/// always yields its containing line; a non-empty range excludes a trailing
+/// line touched only at its very start (`to_b` landing exactly on a line
+/// boundary selects none of that line).
+fn intersecting_lines(bytes: &[u8], from_b: usize, to_b: usize) -> Vec<Range<usize>> {
+    let mut lines = Vec::new();
+    let empty = from_b == to_b;
+    let mut pos = from_b;
+    loop {
+        let line = line_containing(bytes, pos);
+        if empty || to_b > line.start {
+            lines.push(line.clone());
+        }
+        if pos >= to_b {
+            break;
+        }
+        let mut next = line.end;
+        if bytes.get(next) == Some(&b'\r') {
+            next += 1;
+        }
+        if bytes.get(next) == Some(&b'\n') {
+            next += 1;
+        }
+        if next <= pos {
+            break; // defensive: no terminator left (doc end)
+        }
+        pos = next;
+    }
+    lines
+}
+
+/// This line's blockquote depth (0 outside any blockquote) and the byte
+/// offset just past its `> `/`> > `/… marker run, from the parser's per-line
+/// `BlockQuoteLine` node.
+fn quote_context(nodes: &[Node], line_start: usize) -> (u8, usize) {
+    nodes
+        .iter()
+        .find_map(|n| match n.kind {
+            NodeKind::BlockQuoteLine(depth) if n.extent.start == line_start => {
+                Some((depth, n.delims.last().map_or(line_start, |d| d.end)))
+            }
+            _ => None,
+        })
+        .unwrap_or((0, line_start))
+}
+
+/// This line's list marker, if its own item begins here: `(glyph_start,
+/// token_width)`. `token_width` uses the spec's FIXED-width definition —
+/// marker glyphs plus exactly one following space (`- ` = 2, `1. ` = 3,
+/// `10. ` = 4; a task item's `- ` is the same 2, the checkbox is content) —
+/// not however much whitespace the source actually has after the marker
+/// (CommonMark lets a marker's real content start several spaces later;
+/// that extra whitespace is deliberately not part of this arithmetic).
+fn line_marker(nodes: &[Node], bytes: &[u8], line: &Range<usize>) -> Option<(usize, usize)> {
+    let raw_start = nodes.iter().find_map(|n| match n.kind {
+        NodeKind::ListMarker { .. } if n.extent.start >= line.start && n.extent.start < line.end => {
+            Some(n.extent.start)
+        }
+        _ => None,
+    })?;
+    // The parser's `ListMarker` extent starts exactly at the glyph for a
+    // properly-nested (depth >= 2) item — its leading indent is split into a
+    // separate `ListItemIndent` node. But pulldown-cmark can fold a FEW
+    // (0-3) bytes of incidental leading whitespace directly into a marker's
+    // own span when that whitespace isn't establishing a new nested
+    // container (e.g. a lightly/unevenly indented sibling within a
+    // depth-1 list). Skip forward past any such whitespace so the marker
+    // column always measures from the actual `-`/`+`/`*`/digit glyph, per
+    // the spec's literal definition — never from stray leading spaces.
+    let mut item_start = raw_start;
+    while matches!(bytes.get(item_start), Some(b' ' | b'\t')) {
+        item_start += 1;
+    }
+    Some((item_start, marker_token_width(bytes, item_start)))
+}
+
+/// Marker glyph run length + 1 (the required following space) — see
+/// [`line_marker`].
+fn marker_token_width(bytes: &[u8], item_start: usize) -> usize {
+    let mut i = item_start;
+    match bytes.get(i) {
+        Some(b'-' | b'+' | b'*') => i += 1,
+        Some(b) if b.is_ascii_digit() => {
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+            if matches!(bytes.get(i), Some(b'.' | b')')) {
+                i += 1;
+            }
+        }
+        _ => {}
+    }
+    (i - item_start) + 1
+}
+
+fn list_line_ctx(nodes: &[Node], bytes: &[u8], line: Range<usize>) -> ListLineCtx {
+    let (quote_depth, quote_end) = quote_context(nodes, line.start);
+    let marker = line_marker(nodes, bytes, &line);
+    ListLineCtx {
+        start: line.start,
+        end: line.end,
+        quote_end,
+        quote_depth,
+        marker,
+    }
+}
+
+/// Shared planner for `indentList`/`outdentList`. `from_b <= to_b` (the
+/// editor normalizes before calling, same convention as `toggle_inline`).
+fn plan_list_nesting(
+    nodes: &[Node],
+    src: &str,
+    from_b: usize,
+    to_b: usize,
+    indent: bool,
+) -> Option<CommandPlan> {
+    let bytes = src.as_bytes();
+    let lines: Vec<ListLineCtx> = intersecting_lines(bytes, from_b, to_b)
+        .into_iter()
+        .map(|l| list_line_ctx(nodes, bytes, l))
+        .collect();
+
+    // Applies iff at least one intersecting line carries a marker.
+    let first_idx = lines.iter().position(|l| l.marker.is_some())?;
+    let first = &lines[first_idx];
+    let first_col = first.marker_column().expect("first_idx line has a marker");
+    let first_depth = first.quote_depth;
+
+    let no_op = || CommandPlan {
+        batch: Vec::new(),
+        selection: None,
+    };
+
+    // Scan upward over consecutive same-quote-depth list-item lines for the
+    // nearest qualifying candidate: indent's target allows `<=`, outdent's
+    // parent requires strictly `<`. Stops (no candidate) at the first line
+    // that isn't itself a list-item line, or whose quote depth differs.
+    let mut target: Option<(usize, usize)> = None; // (marker_column, token_width)
+    let mut cursor = first.start;
+    while let Some(range) = prev_line(bytes, cursor) {
+        let ctx = list_line_ctx(nodes, bytes, range.clone());
+        if ctx.quote_depth != first_depth {
+            break;
+        }
+        let Some((item_start, width)) = ctx.marker else {
+            break;
+        };
+        let col = item_start - ctx.quote_end;
+        let qualifies = if indent { col <= first_col } else { col < first_col };
+        if qualifies {
+            target = Some((col, width));
+            break;
+        }
+        cursor = range.start;
+    }
+    let Some((target_col, target_width)) = target else {
+        return Some(no_op()); // no candidate above: nothing to nest under/from
+    };
+
+    let delta: usize = if indent {
+        let content_col = target_col + target_width;
+        if content_col <= first_col {
+            return Some(no_op());
+        }
+        content_col - first_col
+    } else {
+        // target_col < first_col by construction (the strict `<` qualifier
+        // above), so this never underflows.
+        first_col - target_col
+    };
+
+    // Subtree-aware affected set: every intersecting item line, PLUS, for
+    // each one, its whole subtree (consecutive following lines at the same
+    // quote depth whose marker column is strictly greater than that line's
+    // own — see the module doc comment). Keyed/ordered by line start so the
+    // final batch is built in ascending document order with no duplicates.
+    let mut affected: BTreeMap<usize, ListLineCtx> = BTreeMap::new();
+    for line in &lines {
+        let Some(root_col) = line.marker_column() else {
+            continue;
+        };
+        affected.entry(line.start).or_insert(*line);
+        let mut cursor_end = line.end;
+        while let Some(range) = next_line(bytes, cursor_end) {
+            let ctx = list_line_ctx(nodes, bytes, range.clone());
+            if ctx.quote_depth != line.quote_depth {
+                break;
+            }
+            let Some(col) = ctx.marker_column() else {
+                break;
+            };
+            if col <= root_col {
+                break;
+            }
+            cursor_end = range.end;
+            affected.entry(ctx.start).or_insert(ctx);
+        }
+    }
+
+    let mut batch = Vec::with_capacity(affected.len());
+    for line in affected.values() {
+        let Some(col) = line.marker_column() else {
+            continue;
+        };
+        if indent {
+            batch.push(ByteSplice {
+                at: line.quote_end,
+                delete: 0,
+                insert: " ".repeat(delta),
+            });
+        } else {
+            let remove = delta.min(col);
+            if remove == 0 {
+                continue;
+            }
+            batch.push(ByteSplice {
+                at: line.quote_end,
+                delete: remove,
+                insert: String::new(),
+            });
+        }
+    }
+    if batch.is_empty() {
+        return Some(no_op());
+    }
+
+    // Paragraph-interruption guard (see the module doc comment): a moved
+    // non-1 ordered item that would START a new list — rather than join an
+    // already-open same-delimiter ordered list at its landing column — is
+    // refused by CommonMark in paragraph-interruption position and would
+    // silently degrade to lazy-continuation text. Rewrite its digits to "1"
+    // in the same batch. The first affected line's own splice is batch[0]
+    // (it is the minimum start of the affected set and always contributes),
+    // and the rewrite lands after it but before the next line's splice, so
+    // index 1 keeps the batch ascending and non-overlapping.
+    let new_col = if indent { first_col + delta } else { first_col - delta };
+    if let Some(rewrite) = interruption_rewrite(nodes, bytes, first, new_col) {
+        batch.insert(1, rewrite);
+    }
+
+    // Selection maps through the batch like any other command (Bias::After:
+    // an insertion sitting exactly at a mapped endpoint moves past it, so a
+    // cursor/selection anchored right at a line's content start shifts with
+    // the line rather than staying pinned before the new indentation).
+    let anchor = mapping::map_pos(from_b, &batch, Bias::After);
+    let head = mapping::map_pos(to_b, &batch, Bias::After);
+    Some(CommandPlan {
+        batch,
+        selection: Some((anchor, head)),
+    })
+}
+
+/// The ordered-marker shape at `item_start`: `(digit_run_len, value_is_one,
+/// delimiter_byte)`. `None` for bullet markers. `value_is_one` is numeric
+/// (`01.` counts as 1, per CommonMark's "start number" semantics).
+fn ordered_marker(bytes: &[u8], item_start: usize) -> Option<(usize, bool, u8)> {
+    let mut i = item_start;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+    }
+    if i == item_start {
+        return None;
+    }
+    let delim = *bytes.get(i)?;
+    if delim != b'.' && delim != b')' {
+        return None;
+    }
+    let digits = &bytes[item_start..i];
+    let significant = digits
+        .iter()
+        .position(|&b| b != b'0')
+        .map_or(&b""[..], |p| &digits[p..]);
+    Some((i - item_start, significant == b"1", delim))
+}
+
+/// Paragraph-interruption guard for the FIRST affected line (module doc
+/// comment, "Paragraph-interruption guard"): returns the digit-rewrite
+/// splice (pre-edit coordinates — the whitespace edits never touch the
+/// digits, so pre- and post-edit digit spans are the same bytes) when the
+/// moved line's non-1 ordered marker would start a new list rather than
+/// join an open one, `None` when no rewrite is needed. The landing scan
+/// reads pre-edit lines: everything ABOVE the first affected line is
+/// untouched by the batch (the affected set only extends downward), so
+/// pre-edit columns above are already the post-edit ones.
+fn interruption_rewrite(
+    nodes: &[Node],
+    bytes: &[u8],
+    first: &ListLineCtx,
+    new_col: usize,
+) -> Option<ByteSplice> {
+    let (item_start, _) = first.marker?;
+    let (digit_len, is_one, delim) = ordered_marker(bytes, item_start)?;
+    if is_one {
+        return None; // "1." can interrupt anything; never rewritten
+    }
+    // Landing scan: skip consecutive same-quote-depth item lines strictly
+    // deeper than the new column; the first line that isn't is the landing.
+    let mut joins = false;
+    let mut cursor = first.start;
+    while let Some(range) = prev_line(bytes, cursor) {
+        let ctx = list_line_ctx(nodes, bytes, range.clone());
+        if ctx.quote_depth != first.quote_depth {
+            break; // landing outside the quote context: not an open list
+        }
+        let Some((land_start, _)) = ctx.marker else {
+            break; // landing on a non-item line: not an open list
+        };
+        let col = land_start - ctx.quote_end;
+        if col > new_col {
+            cursor = range.start;
+            continue;
+        }
+        // Landing line: the moved item joins an open list only at an EQUAL
+        // column with the SAME ordered delimiter flavor ('.' vs ')') — a
+        // shallower item or a different family means the moved item starts
+        // a NEW list where a non-1 ordered marker cannot interrupt.
+        joins = col == new_col
+            && ordered_marker(bytes, land_start).is_some_and(|(_, _, d)| d == delim);
+        break;
+        // Scan exhaustion (document start) would leave `joins` false and
+        // rewrite; unreachable in practice, since the indent target /
+        // outdent parent found earlier always sits above the first line.
+    }
+    if joins {
+        return None;
+    }
+    Some(ByteSplice {
+        at: item_start,
+        delete: digit_len,
+        insert: "1".into(),
+    })
+}
+
+/// Indent every list-item line intersecting `[from_b, to_b]` — plus, for
+/// each one, its whole subtree (see the module doc comment) — to its
+/// nesting parent's content column. `None` when no intersecting line is a
+/// list item; `Some` with an empty batch when it applies but no movement is
+/// possible (first item of its list, or already as deep as its parent
+/// allows).
+pub fn indent_list(nodes: &[Node], src: &str, from_b: usize, to_b: usize) -> Option<CommandPlan> {
+    plan_list_nesting(nodes, src, from_b, to_b, true)
+}
+
+/// Outdent every list-item line intersecting `[from_b, to_b]` — plus each
+/// one's subtree — by the first line's distance to its nesting parent.
+/// `None`/no-op cases mirror [`indent_list`] (already top-level → no-op
+/// instead of `None`, since the command still applies).
+pub fn outdent_list(nodes: &[Node], src: &str, from_b: usize, to_b: usize) -> Option<CommandPlan> {
+    plan_list_nesting(nodes, src, from_b, to_b, false)
 }

@@ -325,6 +325,134 @@ function matchListMarker(line: string): ListMarkerMatch | null {
   return { markerFrom, contentFrom, glyphTo };
 }
 
+// ---------------------------------------------------------------------------
+// indentList / outdentList (boundary v0.2: marker-width-aware Tab nesting).
+// A direct transcription of the Rust core's algorithm (crates/oxidown-core/
+// src/commands.rs `plan_list_nesting`) over plain-string line scanning
+// instead of the parser overlay — see that module's doc comment for the
+// full spec.
+// ---------------------------------------------------------------------------
+
+/**
+ * Unbounded-leading-space marker match, for indentList/outdentList only —
+ * deliberately NOT capped at 3 leading spaces like `LIST_MARKER_RE` (that
+ * cap models "does this line still belong to the enclosing container" for
+ * the DECORATION parser; the nesting command must recognize markers at any
+ * depth).
+ */
+const LIST_MARKER_ANY_INDENT_RE = /^( *)([-*+]|\d{1,9}[.)]) /;
+
+interface ListLineInfo {
+  start: number;
+  end: number;
+  quoteEnd: number;
+  quoteDepth: number;
+  /**
+   * This line's OWN list marker, when its item begins here: column (after
+   * the quote prefix), the spec's fixed token width, and the raw marker
+   * glyphs (`-`, `2.`, `10)`, …) for the paragraph-interruption guard's
+   * family/number checks.
+   */
+  marker: { col: number; width: number; glyphs: string } | null;
+}
+
+/** Code-unit range of the physical line containing `pos` (terminator excluded). */
+function lineRangeContaining(doc: string, pos: number): { start: number; end: number } {
+  const start = doc.lastIndexOf("\n", Math.max(0, pos - 1)) + 1;
+  let end = doc.indexOf("\n", pos);
+  if (end === -1) end = doc.length;
+  return { start, end };
+}
+
+/** The physical line immediately before `lineStart`, or null at the document start. */
+function prevLineRange(doc: string, lineStart: number): { start: number; end: number } | null {
+  if (lineStart === 0) return null;
+  return lineRangeContaining(doc, lineStart - 1); // lineStart-1 is the preceding "\n"
+}
+
+/**
+ * The physical line immediately following the line ending at `lineEnd` (that
+ * line's own extent, terminator excluded), or null when `lineEnd` has no
+ * terminator (the document's last line).
+ */
+function nextLineRange(doc: string, lineEnd: number): { start: number; end: number } | null {
+  if (doc[lineEnd] !== "\n") return null; // mock: LF only, no terminator = doc end
+  return lineRangeContaining(doc, lineEnd + 1);
+}
+
+/**
+ * Physical lines intersecting `[from, to]`, mirroring CodeMirror's own
+ * multi-line command iteration: an empty range (cursor) always yields its
+ * containing line; a non-empty range excludes a trailing line touched only
+ * at its very start (`to` landing exactly on a line boundary selects none
+ * of that line).
+ */
+function intersectingLines(
+  doc: string,
+  from: number,
+  to: number,
+): Array<{ start: number; end: number }> {
+  const lines: Array<{ start: number; end: number }> = [];
+  const empty = from === to;
+  let pos = from;
+  for (;;) {
+    const line = lineRangeContaining(doc, pos);
+    if (empty || to > line.start) lines.push(line);
+    if (pos >= to) break;
+    const next = line.end + 1; // skip the single "\n" (mock: LF only)
+    if (next <= pos || next > doc.length) break;
+    pos = next;
+  }
+  return lines;
+}
+
+/** This line's blockquote depth (0 outside any) and length of its `> `/`> > `/… run. */
+function quotePrefixInfo(line: string): { depth: number; length: number } {
+  let depth = 0;
+  let rest = line;
+  let consumed = 0;
+  for (;;) {
+    const m = BQ_MARKER_RE.exec(rest);
+    if (!m) break;
+    depth++;
+    consumed += m[0].length;
+    rest = rest.slice(m[0].length);
+  }
+  return { depth, length: consumed };
+}
+
+/**
+ * This line's list marker relative to `afterQuote` (the text past the quote
+ * prefix). `width` is the spec's FIXED-width definition — marker glyphs plus
+ * exactly one following space (`- ` = 2, `1. ` = 3, `10. ` = 4; a task
+ * item's `- ` is the same 2) — not however much whitespace actually follows
+ * the marker in the source.
+ */
+function listMarkerInfo(afterQuote: string): ListLineInfo["marker"] {
+  const m = LIST_MARKER_ANY_INDENT_RE.exec(afterQuote);
+  if (!m) return null;
+  return { col: m[1].length, width: m[2].length + 1, glyphs: m[2] };
+}
+
+function listLineInfo(doc: string, range: { start: number; end: number }): ListLineInfo {
+  const lineText = doc.slice(range.start, range.end);
+  const q = quotePrefixInfo(lineText);
+  const quoteEnd = range.start + q.length;
+  const marker = listMarkerInfo(lineText.slice(q.length)); // columns relative to quoteEnd
+  return { start: range.start, end: range.end, quoteEnd, quoteDepth: q.depth, marker };
+}
+
+/**
+ * The ordered-marker parts of a marker glyph run (`2.` → digits "2", delim
+ * "."), or null for bullets. `isOne` is numeric ("01" counts as 1, matching
+ * CommonMark's start-number semantics).
+ */
+function orderedMarkerParts(glyphs: string): { digits: string; delim: string; isOne: boolean } | null {
+  const m = /^(\d+)([.)])$/.exec(glyphs);
+  if (!m) return null;
+  return { digits: m[1], delim: m[2], isOne: parseInt(m[1], 10) === 1 };
+}
+
 /**
  * Parse one "logical line" of content (heading / list item / plain paragraph
  * text) at document offset `base`, pushing nodes into `nodes`. Shared by the
@@ -853,6 +981,10 @@ export class MockCore implements OxidownCore {
         return this.setHeadingCmd(a, b as 0 | 1 | 2 | 3 | 4 | 5 | 6);
       case "toggleTask":
         return this.toggleTaskCmd(a);
+      case "indentList":
+        return this.indentOutdentList(a, b as number, true);
+      case "outdentList":
+        return this.indentOutdentList(a, b as number, false);
       default:
         return null;
     }
@@ -997,6 +1129,156 @@ export class MockCore implements OxidownCore {
     this.pushCommandUndoUnit();
     this.mutateDoc([splice]);
     return { revision: this.rev, splices: [splice], selection: null };
+  }
+
+  /**
+   * indentList/outdentList (boundary v0.2: marker-width-aware Tab nesting).
+   * A direct transcription of the Rust core's algorithm
+   * (crates/oxidown-core/src/commands.rs `plan_list_nesting`) over
+   * plain-string line scanning — see that module's doc comment for the full
+   * spec, including the subtree-aware affected-line set.
+   */
+  private indentOutdentList(from: number, to: number, indent: boolean): CoreChange | null {
+    if (from < 0 || to > this.doc.length || from > to) return null;
+    const doc = this.doc;
+    const lines = intersectingLines(doc, from, to).map((r) => listLineInfo(doc, r));
+
+    // Applies iff at least one intersecting line carries a marker.
+    const firstIdx = lines.findIndex((l) => l.marker !== null);
+    if (firstIdx === -1) return null;
+    const first = lines[firstIdx];
+    const firstCol = first.marker!.col;
+    const firstDepth = first.quoteDepth;
+
+    const noOp = (): CoreChange => ({ revision: this.rev, splices: [], selection: null });
+
+    // Scan upward over consecutive same-quote-depth list-item lines for the
+    // nearest qualifying candidate: indent's target allows `<=`, outdent's
+    // parent requires strictly `<`. Stops (no candidate) at the first line
+    // that isn't itself a list-item line, or whose quote depth differs.
+    let target: { col: number; width: number } | null = null;
+    let cursor = first.start;
+    for (;;) {
+      const range = prevLineRange(doc, cursor);
+      if (!range) break;
+      const info = listLineInfo(doc, range);
+      if (info.quoteDepth !== firstDepth) break;
+      if (!info.marker) break;
+      const { col, width } = info.marker;
+      const qualifies = indent ? col <= firstCol : col < firstCol;
+      if (qualifies) {
+        target = { col, width };
+        break;
+      }
+      cursor = range.start;
+    }
+    if (!target) return noOp(); // no candidate above: nothing to nest under/from
+
+    let delta: number;
+    if (indent) {
+      const contentCol = target.col + target.width;
+      if (contentCol <= firstCol) return noOp();
+      delta = contentCol - firstCol;
+    } else {
+      // target.col < firstCol by construction (the strict `<` qualifier above).
+      delta = firstCol - target.col;
+    }
+
+    // Subtree-aware affected set: every intersecting item line, PLUS, for
+    // each one, its whole subtree (consecutive following lines at the same
+    // quote depth whose marker column is strictly greater than THAT line's
+    // own — not the previous line's, so a whole multi-level subtree is
+    // captured in one walk). Stops at the first line that fails any of
+    // those (a sibling/shallower item, a quote-depth change, or a
+    // non-item line — including a blank line).
+    const affected = new Map<number, ListLineInfo>();
+    for (const line of lines) {
+      if (!line.marker) continue;
+      const rootCol = line.marker.col;
+      if (!affected.has(line.start)) affected.set(line.start, line);
+      let cursorEnd = line.end;
+      for (;;) {
+        const range = nextLineRange(doc, cursorEnd);
+        if (!range) break;
+        const info = listLineInfo(doc, range);
+        if (info.quoteDepth !== line.quoteDepth) break;
+        if (!info.marker) break;
+        if (info.marker.col <= rootCol) break;
+        cursorEnd = range.end;
+        if (!affected.has(info.start)) affected.set(info.start, info);
+      }
+    }
+
+    const splices: Splice[] = [...affected.values()]
+      .sort((a, b) => a.start - b.start)
+      .flatMap((line) => {
+        const col = line.marker!.col;
+        if (indent) {
+          return [{ at: line.quoteEnd, delete: 0, insert: " ".repeat(delta) }];
+        }
+        const remove = Math.min(delta, col);
+        return remove > 0 ? [{ at: line.quoteEnd, delete: remove, insert: "" }] : [];
+      });
+    if (splices.length === 0) return noOp();
+
+    // Paragraph-interruption guard (mirrors the Rust core exactly — see
+    // crates/oxidown-core/src/commands.rs, "Paragraph-interruption guard"):
+    // a moved non-1 ordered item that would START a new list, rather than
+    // join an already-open same-delimiter ordered list at its landing
+    // column, cannot interrupt a paragraph per CommonMark and would
+    // silently degrade to lazy-continuation text. Rewrite its digits to "1"
+    // in the same batch (index 1: after the first line's own splice, before
+    // the next line's).
+    const rewrite = this.interruptionRewrite(doc, first, indent ? firstCol + delta : firstCol - delta);
+    if (rewrite) splices.splice(1, 0, rewrite);
+
+    this.pushCommandUndoUnit();
+    this.mutateDoc(splices);
+    const anchor = mapPos(from, splices, 1);
+    const head = mapPos(to, splices, 1);
+    return { revision: this.rev, splices, selection: { anchor, head } };
+  }
+
+  /**
+   * Paragraph-interruption guard for the FIRST affected line: the
+   * digit-rewrite splice (pre-edit coordinates — the whitespace edits never
+   * touch the digits) when the moved line's non-1 ordered marker would
+   * start a new list rather than join an open one, else null. The landing
+   * scan reads pre-edit lines: everything ABOVE the first affected line is
+   * untouched by the batch (the affected set only extends downward), so
+   * pre-edit columns above are already the post-edit ones.
+   */
+  private interruptionRewrite(doc: string, first: ListLineInfo, newCol: number): Splice | null {
+    const ordered = orderedMarkerParts(first.marker!.glyphs);
+    if (!ordered || ordered.isOne) return null; // bullets / "1." never rewrite
+    // Landing scan: skip consecutive same-quote-depth item lines strictly
+    // deeper than the new column; the first line that isn't is the landing.
+    let joins = false;
+    let cursor = first.start;
+    for (;;) {
+      const range = prevLineRange(doc, cursor);
+      if (!range) break; // document start (unreachable: a target/parent exists above)
+      const info = listLineInfo(doc, range);
+      if (info.quoteDepth !== first.quoteDepth) break; // outside the quote context
+      if (!info.marker) break; // non-item landing: no open list
+      if (info.marker.col > newCol) {
+        cursor = range.start;
+        continue;
+      }
+      // Landing line: joins an open list only at an EQUAL column with the
+      // SAME ordered delimiter flavor ('.' vs ')') — a shallower item or a
+      // different family means the moved item starts a NEW list, which a
+      // non-1 ordered marker cannot do in paragraph-interruption position.
+      const landing = orderedMarkerParts(info.marker.glyphs);
+      joins = info.marker.col === newCol && landing !== null && landing.delim === ordered.delim;
+      break;
+    }
+    if (joins) return null;
+    return {
+      at: first.quoteEnd + first.marker!.col,
+      delete: ordered.digits.length,
+      insert: "1",
+    };
   }
 
   // ---------------------------------------------------------------------------
