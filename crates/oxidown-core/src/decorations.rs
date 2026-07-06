@@ -117,10 +117,14 @@ pub enum Decoration {
         /// Heading level 1..=6 (boundary style string "h1".."h6").
         level: u8,
     },
-    /// M1: blockquote/code-fence/code-block/thematic-break line chrome.
+    /// M1: blockquote/code-fence/code-block/hr/list-item line chrome.
+    /// `revealed` is meaningful for `BlockQuote` and `ListItem`: the line's
+    /// marker region is being edited (caret adjacent), so the view drops the
+    /// line's decorative padding/bars and shows source geometry.
     Block {
         at: usize,
         style: BlockStyle,
+        revealed: bool,
     },
     /// M1: a widget replacing a source span visually. Withheld (in favor of
     /// a mark over the same span) when the node is revealed or under active
@@ -181,6 +185,7 @@ pub fn compute(
                 out.push(Decoration::Block {
                     at: text.byte_to_utf16(node.extent.start),
                     style: BlockStyle::ListItem(depth),
+                    revealed,
                 });
                 let from = text.byte_to_utf16(node.extent.start);
                 let to = text.byte_to_utf16(node.extent.end);
@@ -269,6 +274,7 @@ pub fn compute(
                 out.push(Decoration::Block {
                     at: text.byte_to_utf16(node.extent.start),
                     style: BlockStyle::BlockQuote(depth),
+                    revealed,
                 });
                 None
             }
@@ -276,6 +282,7 @@ pub fn compute(
                 out.push(Decoration::Block {
                     at: text.byte_to_utf16(node.extent.start),
                     style: BlockStyle::CodeFence,
+                    revealed: false,
                 });
                 // Like the thematic break: the raw fence (``` + info string)
                 // conceals unless the cursor is on the fence line — the
@@ -301,6 +308,7 @@ pub fn compute(
                 out.push(Decoration::Block {
                     at: text.byte_to_utf16(node.extent.start),
                     style: BlockStyle::CodeBlock,
+                    revealed: false,
                 });
                 Some(MarkStyle::Code)
             }
@@ -324,6 +332,7 @@ pub fn compute(
                 out.push(Decoration::Block {
                     at: text.byte_to_utf16(node.extent.start),
                     style: BlockStyle::ThematicBreak,
+                    revealed: false,
                 });
                 // The `---` source participates in reveal like any delimiter:
                 // concealed (the view draws the rule via the hr line style)

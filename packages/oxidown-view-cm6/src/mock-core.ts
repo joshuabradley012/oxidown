@@ -350,10 +350,11 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
     // ordered nesting, close enough for the mock). EVERY item line emits
     // line:list-item (the view's hanging indent); nested indents conceal.
     const depth = Math.floor(markerFrom / 2) + 1;
-    const lineEnd = base + content.length;
     nodes.push({
+      // Indent + marker region: caret adjacency here flags the line as
+      // revealed (view drops hanging-indent padding -> source geometry).
       start: base,
-      end: lineEnd,
+      end: base + contentFrom,
       conceals: depth >= 2 && markerFrom > 0 ? [[base, base + markerFrom]] : [],
       marks: [],
       line: { kind: "line", at: base, style: "list-item", depth },
@@ -367,8 +368,9 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
       const checkboxTo = checkboxFrom + 3; // "[ ]" / "[x]"
       const itemContentFrom = contentFrom + taskM[0].length;
       nodes.push({
-        start: base,
-        end: lineEnd,
+        // Combined `- [ ]` run: adjacency reveal, lockstep dash+brackets.
+        start: base + markerFrom,
+        end: checkboxTo,
         conceals: [[base + markerFrom, base + contentFrom]],
         marks: [],
         widget: { from: checkboxFrom, to: checkboxTo, checked: taskM[1] !== " " },
@@ -378,11 +380,11 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
     }
     const marks: InlineMark[] = [];
     if (isBullet) {
-      // Bullet node spans the LINE: cursor anywhere on it reveals the raw
-      // marker (editable while the line is being edited).
+      // Bullet node spans the MARKER: only a caret directly next to it
+      // reveals the raw `- ` (Obsidian-style).
       nodes.push({
-        start: base,
-        end: lineEnd,
+        start: base + markerFrom,
+        end: base + contentFrom,
         conceals: [],
         marks: [],
         bullet: { from: base + markerFrom, to: base + contentFrom },
@@ -473,7 +475,7 @@ export function parseDoc(doc: string): ParsedNode[] {
     }
 
     // Blockquote: depth = count of stripped "> " marker levels; reveal is
-    // per-line (node spans the whole line, like headings).
+    // Obsidian-style — only when the caret touches the marker run.
     if (BQ_MARKER_RE.test(line)) {
       let depth = 0;
       let rest = line;
@@ -487,7 +489,7 @@ export function parseDoc(doc: string): ParsedNode[] {
       }
       nodes.push({
         start: lineStart,
-        end: lineEnd,
+        end: offset, // marker run only: adjacency reveal
         conceals: [[lineStart, offset]],
         marks: [],
         line: { kind: "line", at: lineStart, style: "blockquote", depth },
@@ -695,7 +697,10 @@ export class MockCore implements OxidownCore {
         }) ||
         (this.composing && this.compFrom <= node.end && this.compTo >= node.start);
 
-      if (node.line) out.push(node.line);
+      if (node.line) {
+        const flaggable = node.line.style === "blockquote" || node.line.style === "list-item";
+        out.push(flaggable && revealed ? { ...node.line, revealed: true } : node.line);
+      }
       for (const m of node.marks) {
         out.push({ kind: "mark", from: m.from, to: m.to, style: m.style });
       }

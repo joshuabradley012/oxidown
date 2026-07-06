@@ -28,7 +28,7 @@ fn conceal(from: usize, to: usize) -> Decoration {
 }
 
 fn block(at: usize, style: BlockStyle) -> Decoration {
-    Decoration::Block { at, style }
+    Decoration::Block { at, style, revealed: false }
 }
 
 fn widget(from: usize, to: usize, checked: bool) -> Decoration {
@@ -43,6 +43,15 @@ fn li(at: usize, depth: u8) -> Decoration {
     Decoration::Block {
         at,
         style: BlockStyle::ListItem(depth),
+        revealed: false,
+    }
+}
+
+fn li_rev(at: usize, depth: u8) -> Decoration {
+    Decoration::Block {
+        at,
+        style: BlockStyle::ListItem(depth),
+        revealed: true,
     }
 }
 
@@ -265,19 +274,23 @@ fn fenced_code_multi_line_body() {
 // ------------------------------------------------------------------ lists --
 
 #[test]
-fn unordered_list_marker_bullet_widget_and_line_reveal() {
+fn unordered_list_marker_bullet_widget_and_adjacency_reveal() {
     // Concealed: bullets render as a widget over the whole marker span; every
     // item line carries a list-item line decoration (hanging indent).
     let d = decos("- one\n- two\n", &[]);
     assert_eq!(d, vec![li(0, 1), bullet(0, 2), li(6, 1), bullet(6, 8)]);
-    // Reveal is LINE-level: a cursor ANYWHERE on the item's line (here the
-    // middle of the text) reveals the raw marker for editing; other lines
-    // keep their bullets.
-    let d = decos("- one\n- two\n", &[(3, 3)]);
+    // Obsidian-style reveal: a cursor in the item's TEXT does NOT reveal the
+    // marker...
+    let d = decos("- one\n- two\n", &[(4, 4)]);
+    assert_eq!(d, vec![li(0, 1), bullet(0, 2), li(6, 1), bullet(6, 8)]);
+    // ...but a caret directly next to it (touching the marker span, here at
+    // the item text's first char == marker end) reveals it as raw source and
+    // flags the line as revealed (the view drops its decorative padding).
+    let d = decos("- one\n- two\n", &[(2, 2)]);
     assert_eq!(
         d,
         vec![
-            li(0, 1),
+            li_rev(0, 1),
             mark(0, 2, MarkStyle::ListMarker),
             li(6, 1),
             bullet(6, 8),
@@ -332,10 +345,11 @@ fn task_item_widget_withheld_when_item_marker_extent_revealed() {
     assert_eq!(
         d,
         vec![
-            // Lockstep reveal: the dash and the brackets share the item's
-            // LINE as reveal extent — a cursor anywhere on the line shows
-            // both as raw delim text together, never one without the other.
-            li(0, 1),
+            // Lockstep reveal: the dash and the brackets share the combined
+            // `- [ ]` run as reveal extent — a caret touching it shows both
+            // as raw delim text together, and the line is flagged revealed
+            // (the view drops its decorative padding: source geometry).
+            li_rev(0, 1),
             mark(0, 2, MarkStyle::Delim),
             mark(2, 5, MarkStyle::Delim),
         ]
@@ -346,11 +360,11 @@ fn task_item_widget_withheld_when_item_marker_extent_revealed() {
     assert!(!d
         .iter()
         .any(|d| matches!(d, Decoration::Widget { kind: oxidown_core::WidgetKind::Task { .. }, .. })));
-    // LINE-level reveal: a cursor in the item's body text also reveals the
-    // raw markers (editable whenever the line is being edited).
+    // Obsidian-style: a cursor in the item's body text does NOT reveal —
+    // the widget stays and the dash stays concealed.
     let d = decos("- [ ] todo\n", &[(8, 8)]);
-    assert!(d.contains(&mark(2, 5, MarkStyle::Delim)));
-    assert!(!d.iter().any(|x| matches!(x, Decoration::Widget { .. })));
+    assert!(d.contains(&widget(2, 5, false)));
+    assert!(d.contains(&conceal(0, 2)));
 }
 
 #[test]
@@ -442,17 +456,59 @@ fn nested_list_items_emit_list_item_lines_with_concealed_indent() {
 #[test]
 fn task_marker_reveals_in_lockstep_with_checkbox() {
     let doc = "- [ ] todo\nnext line\n";
-    // Cursor anywhere on the item's LINE reveals BOTH the dash and the
-    // brackets together...
-    for pos in 0..=10 {
+    // Caret anywhere touching the combined `- [ ]` run [0, 5] reveals BOTH
+    // the dash and the brackets together...
+    for pos in 0..=5 {
         let d = decos(doc, &[(pos, pos)]);
         assert!(
             d.contains(&mark(0, 2, MarkStyle::Delim)) && d.contains(&mark(2, 5, MarkStyle::Delim)),
             "pos {pos}: {d:?}"
         );
     }
-    // ...and off the line, both conceal together (widget + concealed dash).
-    let d = decos(doc, &[(14, 14)]);
+    // ...and away from it (item text or another line), both conceal together.
+    for pos in [7, 14] {
+        let d = decos(doc, &[(pos, pos)]);
+        assert!(d.contains(&conceal(0, 2)), "pos {pos}");
+        assert!(d.contains(&widget(2, 5, false)), "pos {pos}");
+    }
+}
+
+
+#[test]
+fn blockquote_reveals_only_next_to_markers_and_flags_line() {
+    let doc = "> quoted text here\n";
+    // Cursor in the quote TEXT: markers stay concealed, line not revealed.
+    let d = decos(doc, &[(9, 9)]);
+    assert!(d.contains(&block(0, BlockStyle::BlockQuote(1))));
     assert!(d.contains(&conceal(0, 2)));
-    assert!(d.contains(&widget(2, 5, false)));
+    // Caret directly next to the `> ` run (touching [0, 2]): raw markers +
+    // revealed line (view drops bars/padding -> source geometry).
+    for pos in 0..=2 {
+        let d = decos(doc, &[(pos, pos)]);
+        assert!(
+            d.contains(&Decoration::Block {
+                at: 0,
+                style: BlockStyle::BlockQuote(1),
+                revealed: true
+            }),
+            "pos {pos}: {d:?}"
+        );
+        assert!(d.contains(&mark(0, 2, MarkStyle::Delim)), "pos {pos}");
+    }
+}
+
+#[test]
+fn nested_quote_bullet_reveals_chain_at_the_seam() {
+    // "> > - item": caret between the quote markers and the bullet touches
+    // BOTH regions — the full raw prefix becomes editable at once.
+    let doc = "> > - item\n";
+    let d = decos(doc, &[(4, 4)]);
+    assert!(d.contains(&mark(0, 2, MarkStyle::Delim)), "{d:?}");
+    assert!(d.contains(&mark(2, 4, MarkStyle::Delim)));
+    assert!(d.contains(&mark(4, 6, MarkStyle::ListMarker)));
+    // Caret in the item text: everything conceals again.
+    let d = decos(doc, &[(8, 8)]);
+    assert!(d.contains(&conceal(0, 2)));
+    assert!(d.contains(&conceal(2, 4)));
+    assert!(d.iter().any(|x| matches!(x, Decoration::Widget { .. })));
 }

@@ -47,10 +47,10 @@ pub enum NodeKind {
     /// A list item's marker span (`- `, `1. `, `1) `, or the bullet portion
     /// of a task item before its checkbox). Always visible, never concealed.
     /// A list-item marker run (`"- "`, `"1. "`). `task` marks the marker of
-    /// a task item, which conceals/reveals in lockstep with its checkbox.
-    /// Marker reveal is LINE-level (cursor anywhere on the item's line) so
-    /// the raw marker is editable whenever the line is being edited.
-    /// `depth` is the 1-based list nesting depth (drives the view's
+    /// a task item, which conceals/reveals in lockstep with its checkbox
+    /// (shared reveal extent: the combined `- [ ]` run). Reveal is
+    /// Obsidian-style — only when the caret directly touches the marker
+    /// region. `depth` is the 1-based list nesting depth (drives the view's
     /// hanging-indent line decoration).
     ListMarker { task: bool, depth: u8 },
     /// The leading indentation whitespace of a NESTED list item (depth >= 2).
@@ -249,12 +249,6 @@ pub fn parse_document(src: &str) -> ParseResult {
             while ws_start > 0 && matches!(bytes[ws_start - 1], b' ' | b'\t') {
                 ws_start -= 1;
             }
-            // Marker/checkbox reveal is LINE-level: cursor anywhere on the
-            // item's first line makes the raw markers editable.
-            let line_end = bytes[item_start..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(bytes.len(), |i| item_start + i);
             if item_depth >= 2 && ws_start < item_start {
                 nodes.push(leaf(
                     NodeKind::ListItemIndent { depth: item_depth },
@@ -263,20 +257,22 @@ pub fn parse_document(src: &str) -> ParseResult {
                     vec![],
                 ));
             }
+            // Obsidian-style reveal: only when the caret is directly next to
+            // the marker region — the `- ` itself, or for tasks the combined
+            // `- [ ]` run (marker and checkbox reveal in lockstep).
             if let Event::TaskListMarker(checked) = &event {
                 if range.start > item_start {
                     let mut marker = leaf(NodeKind::ListMarker { task: true, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
-                    marker.reveal_extent = Some(ws_start..line_end);
+                    marker.reveal_extent = Some(item_start..range.end);
                     nodes.push(marker);
                 }
                 let mut task = leaf(NodeKind::TaskWidget { checked: *checked }, range.clone(), range.end..range.end, vec![]);
-                task.reveal_extent = Some(ws_start..line_end);
+                task.reveal_extent = Some(item_start..range.end);
                 task.item_extent = Some(item);
                 nodes.push(task);
             } else if range.start > item_start {
-                let mut marker = leaf(NodeKind::ListMarker { task: false, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
-                marker.reveal_extent = Some(ws_start..line_end);
-                nodes.push(marker);
+                // reveal_extent defaults to the marker extent itself.
+                nodes.push(leaf(NodeKind::ListMarker { task: false, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]));
             }
         }
 
@@ -342,7 +338,13 @@ pub fn parse_document(src: &str) -> ParseResult {
             }
             let delims = blockquote_markers(bytes, line.clone());
             let _ = depth; // depth of the enclosing top-level interval; line_depth is authoritative
-            nodes.push(leaf(NodeKind::BlockQuoteLine(line_depth), line.clone(), line.end..line.end, delims));
+            let mut node = leaf(NodeKind::BlockQuoteLine(line_depth), line.clone(), line.end..line.end, delims);
+            // Obsidian-style reveal: only when the caret is directly next to
+            // (touching) the `> ` marker run — not anywhere on the line.
+            if let (Some(f), Some(l)) = (node.delims.first(), node.delims.last()) {
+                node.reveal_extent = Some(f.start..l.end);
+            }
+            nodes.push(node);
         }
     }
 
@@ -872,8 +874,8 @@ mod tests {
         assert_eq!(widgets.len(), 2);
         assert_eq!(widgets[0].extent, 2..5);
         assert_eq!(widgets[0].kind, NodeKind::TaskWidget { checked: false });
-        // LINE-level reveal: the whole first line of the item.
-        assert_eq!(widgets[0].reveal_extent, Some(0..10));
+        // Obsidian-style reveal: the combined `- [ ]` marker run.
+        assert_eq!(widgets[0].reveal_extent, Some(0..5));
         assert_eq!(widgets[1].kind, NodeKind::TaskWidget { checked: true });
     }
 

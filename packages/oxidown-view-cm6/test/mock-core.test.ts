@@ -478,16 +478,25 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     ]);
   });
 
-  it("blockquote (depth 1): line decoration + conceal over the marker; reveal is per-line", () => {
+  it("blockquote (depth 1): reveal only when the caret touches the marker run", () => {
     const doc = "> hello\nworld";
     const { core } = makeCore(doc);
     const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
     expect(lines(ds)).toEqual([{ kind: "line", at: 0, style: "blockquote", depth: 1 }]);
     expect(conceals(ds)).toEqual([{ kind: "conceal", from: 0, to: 2 }]);
 
-    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(3));
+    // Cursor in the quote TEXT (past the marker run): still concealed.
+    const inText = core.decorations(core.revision(), 0, doc.length, cursor(4));
+    expect(conceals(inText)).toEqual([{ kind: "conceal", from: 0, to: 2 }]);
+
+    // Caret adjacent to the `> ` run: raw markers + revealed-flagged line
+    // (the view drops the bar/padding to show source geometry).
+    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(2));
     expect(conceals(revealed)).toEqual([]);
     expect(marks(revealed, "delim")).toEqual([{ kind: "mark", from: 0, to: 2, style: "delim" }]);
+    expect(lines(revealed)).toEqual([
+      { kind: "line", at: 0, style: "blockquote", depth: 1, revealed: true },
+    ]);
   });
 
   it("fenced code block: fence lines styled + raw fences concealed, revealed per line", () => {
@@ -527,11 +536,11 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     expect(conceals(revealed)).toEqual([]);
   });
 
-  it("bullets are widgets with LINE-level reveal; ordered markers stay marks", () => {
+  it("bullets are widgets with ADJACENCY reveal; ordered markers stay marks", () => {
     const doc = "- item\n1. other";
     const { core } = makeCore(doc);
-    // Cursor on the SECOND line: the first line's bullet stays a widget.
-    const ds = core.decorations(core.revision(), 0, doc.length, cursor(9));
+    // Cursor in the first item's TEXT: bullet stays a widget (Obsidian-style).
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(4));
     expect(ds.filter((d) => d.kind === "widget")).toEqual([
       { kind: "widget", from: 0, to: 2, widget: "bullet" },
     ]);
@@ -543,14 +552,21 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
       { kind: "line", at: 0, style: "list-item", depth: 1 },
       { kind: "line", at: 7, style: "list-item", depth: 1 },
     ]);
-    // Cursor ANYWHERE on the bullet's line (here mid-text) reveals its raw
-    // marker for editing.
-    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(4));
+    // Caret directly next to the marker (touching [0, 2]) reveals it and
+    // flags the line (view drops the hanging-indent padding).
+    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(2));
     expect(revealed.filter((d) => d.kind === "widget")).toEqual([]);
     expect(marks(revealed, "list-marker")).toEqual([
       { kind: "mark", from: 0, to: 2, style: "list-marker" },
       { kind: "mark", from: 7, to: 10, style: "list-marker" },
     ]);
+    expect(lines(revealed)[0]).toEqual({
+      kind: "line",
+      at: 0,
+      style: "list-item",
+      depth: 1,
+      revealed: true,
+    });
     expect(conceals(ds)).toEqual([]);
   });
 

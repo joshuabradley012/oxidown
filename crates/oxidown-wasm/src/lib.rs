@@ -119,7 +119,7 @@ fn decoration_json(d: &Decoration) -> serde_json::Value {
             "at": at,
             "style": format!("h{level}"),
         }),
-        Decoration::Block { at, style } => {
+        Decoration::Block { at, style, revealed } => {
             let mut obj = json!({
                 "kind": "line",
                 "at": at,
@@ -127,6 +127,9 @@ fn decoration_json(d: &Decoration) -> serde_json::Value {
             });
             if let Some(depth) = style.depth() {
                 obj["depth"] = json!(depth);
+            }
+            if *revealed {
+                obj["revealed"] = json!(true);
             }
             obj
         }

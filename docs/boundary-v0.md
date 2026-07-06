@@ -193,17 +193,20 @@ M1 emission scope (parser may understand more than it decorates):
   fixed-width right-aligned box + tabular numerals). **Unordered markers emit `widget:bullet`
   replacing the whole marker span (`"- "`)**, revealed as `mark:list-marker` under STRICT
   interior overlap (`a < end && b > start`) — the cursor at the item text's first character or
-  at line start does not flash the raw marker. **Marker reveal is LINE-level** (the reveal
-  extent is the item's whole first line): a cursor anywhere on the line makes the raw marker
-  editable — never one keystroke away from surprise. Task items additionally emit a
-  `widget:task` replacing exactly the `[ ]`/`[x]` span; the task item's `- ` marker conceals
-  and reveals in LOCKSTEP with the checkbox (same line-level extent) — the dash and the
-  brackets always show together, as `mark:delim`.
-- **Every list item line** emits `{kind:"line", style:"list-item", depth}` (1-based depth) at
-  the marker position — the view uses it for hanging indent (wrapped item text aligns with the
-  first line's text). Nested items (depth ≥ 2) additionally emit a `conceal` over the raw
-  leading indent whitespace (revealed as `mark:delim`); the view supplies exact per-depth
+  at line start does not flash the raw marker. **Marker reveal is Obsidian-style adjacency**:
+  the reveal extent is the marker region itself (closed-interval touch) — the `- ` run, or for
+  task items the combined `- [ ]` run (dash and brackets reveal in LOCKSTEP, as `mark:delim`).
+  A caret in the item's text does NOT reveal; a caret directly next to the marker does.
+- **Every list item line** emits `{kind:"line", style:"list-item", depth, revealed?}` (1-based
+  depth) at the marker position — the view uses it for hanging indent (wrapped item text aligns
+  with the first line's text). Nested items (depth ≥ 2) additionally emit a `conceal` over the
+  raw leading indent whitespace (revealed as `mark:delim`); the view supplies exact per-depth
   padding (1.5em per level) so each nested marker starts at its parent's text column.
+- **`revealed: true` on `blockquote`/`list-item` lines** means the line's marker region is
+  being edited (caret adjacent): the view drops ALL decorative padding/bars/indent for that
+  line and renders default source geometry — the raw markers and real leading spaces sit at
+  their true positions, so deeply nested prefixes (e.g. `> > - `) are edited as plain source.
+  Blockquote line reveal extents are likewise the marker run only, per line.
 - Thematic break — `line:hr` on the line, plus `conceal` over the raw dashes (revealed as
   `mark:delim` when the cursor is on the line). The view draws the actual rule on the hr line;
   nested blockquote bars are likewise the view's job (one bar per depth level).

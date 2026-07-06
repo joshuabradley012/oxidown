@@ -56,6 +56,12 @@ export interface DecorationLine {
     | "list-item";
   /** Nesting depth (1-based); present for styles "blockquote" and "list-item". */
   depth?: number;
+  /**
+   * For "blockquote"/"list-item": the line's marker region is being edited
+   * (caret adjacent), so the view drops the line's decorative padding/bars
+   * and renders default source geometry.
+   */
+  revealed?: boolean;
 }
 /**
  * v0.2 addition: a replace-range island. `from`/`to` is the source range the

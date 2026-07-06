@@ -431,11 +431,18 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
             // widget kinds they don't recognize (docs/boundary-v0.md v0.2).
             if (d.kind === "line") {
               if (d.style === "blockquote") {
+                // Revealed (marker being edited): NO line decoration at all —
+                // default rendering IS source geometry (no bars, no padding),
+                // so raw `> > ` markers sit at their true source positions.
+                if (d.revealed) continue;
                 const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
                 ranges.push(blockquoteLineDeco(d.depth ?? 1, bqGapAts.has(d.at)).range(line.from));
                 continue;
               }
               if (d.style === "list-item") {
+                // Same: a revealed item line renders as plain source (no
+                // hanging-indent padding), making nesting spaces visible.
+                if (d.revealed) continue;
                 const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
                 ranges.push(listItemLineDeco(d.depth ?? 1).range(line.from));
                 continue;
