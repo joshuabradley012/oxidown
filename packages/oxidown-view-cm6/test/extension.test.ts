@@ -284,15 +284,15 @@ describe("v0.2 additions (M1)", () => {
 
   it("task widget renders a checkbox; clicking it dispatches toggleTask via the CoreChange path", async () => {
     const core = new MockCore();
-    const doc = "- [ ] buy milk";
+    const doc = "- [ ] buy milk\nelsewhere";
     const parent = document.createElement("div");
     document.body.appendChild(parent);
     const view = new EditorView({
       parent,
       state: EditorState.create({
         doc,
-        // Cursor away from the checkbox's marker extent [0, 5) so it starts
-        // concealed (widget rendered) rather than revealed (delim mark).
+        // Cursor on a DIFFERENT line (reveal is line-level) so the task
+        // starts concealed (widget rendered) rather than revealed.
         selection: { anchor: doc.length },
         extensions: [oxidown(core, { verifyMirror: true })],
       }),
@@ -309,8 +309,8 @@ describe("v0.2 additions (M1)", () => {
     checkbox!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     await flush();
 
-    expect(core.getText()).toBe("- [x] buy milk");
-    expect(view.state.doc.toString()).toBe("- [x] buy milk");
+    expect(core.getText()).toBe("- [x] buy milk\nelsewhere");
+    expect(view.state.doc.toString()).toBe("- [x] buy milk\nelsewhere");
     // The toggle went through core.command → CoreChange → applyCoreChange,
     // never through the ordinary applyEdit change-forwarding path.
     expect(applySpy).not.toHaveBeenCalled();

@@ -47,9 +47,12 @@ pub enum NodeKind {
     /// A list item's marker span (`- `, `1. `, `1) `, or the bullet portion
     /// of a task item before its checkbox). Always visible, never concealed.
     /// A list-item marker run (`"- "`, `"1. "`). `task` marks the marker of
-    /// a task item, which conceals/reveals in lockstep with its checkbox
-    /// (shared reveal extent) rather than by the bullet's strict rule.
-    ListMarker { task: bool },
+    /// a task item, which conceals/reveals in lockstep with its checkbox.
+    /// Marker reveal is LINE-level (cursor anywhere on the item's line) so
+    /// the raw marker is editable whenever the line is being edited.
+    /// `depth` is the 1-based list nesting depth (drives the view's
+    /// hanging-indent line decoration).
+    ListMarker { task: bool, depth: u8 },
     /// The leading indentation whitespace of a NESTED list item (depth >= 2).
     /// Emits a `line:list-item` decoration carrying the depth (the view
     /// provides exact per-depth padding) and conceals the raw spaces.
@@ -242,34 +245,38 @@ pub fn parse_document(src: &str) -> ParseResult {
             // decoration (per-depth padding in the view) + concealed spaces.
             // Scanning back only over blanks keeps blockquote `>` markers
             // (their own nodes) out of the span.
-            if item_depth >= 2 {
-                let mut ws_start = item_start;
-                while ws_start > 0 && matches!(bytes[ws_start - 1], b' ' | b'\t') {
-                    ws_start -= 1;
-                }
-                if ws_start < item_start {
-                    nodes.push(leaf(
-                        NodeKind::ListItemIndent { depth: item_depth },
-                        ws_start..item_start,
-                        item_start..item_start,
-                        vec![],
-                    ));
-                }
+            let mut ws_start = item_start;
+            while ws_start > 0 && matches!(bytes[ws_start - 1], b' ' | b'\t') {
+                ws_start -= 1;
+            }
+            // Marker/checkbox reveal is LINE-level: cursor anywhere on the
+            // item's first line makes the raw markers editable.
+            let line_end = bytes[item_start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |i| item_start + i);
+            if item_depth >= 2 && ws_start < item_start {
+                nodes.push(leaf(
+                    NodeKind::ListItemIndent { depth: item_depth },
+                    ws_start..item_start,
+                    item_start..item_start,
+                    vec![],
+                ));
             }
             if let Event::TaskListMarker(checked) = &event {
                 if range.start > item_start {
-                    // Reveal in lockstep with the checkbox: same extent as
-                    // the task widget's reveal extent (item marker extent).
-                    let mut marker = leaf(NodeKind::ListMarker { task: true }, item_start..range.start, range.end..range.end, vec![]);
-                    marker.reveal_extent = Some(item_start..range.end);
+                    let mut marker = leaf(NodeKind::ListMarker { task: true, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
+                    marker.reveal_extent = Some(ws_start..line_end);
                     nodes.push(marker);
                 }
                 let mut task = leaf(NodeKind::TaskWidget { checked: *checked }, range.clone(), range.end..range.end, vec![]);
-                task.reveal_extent = Some(item_start..range.end);
+                task.reveal_extent = Some(ws_start..line_end);
                 task.item_extent = Some(item);
                 nodes.push(task);
             } else if range.start > item_start {
-                nodes.push(leaf(NodeKind::ListMarker { task: false }, item_start..range.start, range.end..range.end, vec![]));
+                let mut marker = leaf(NodeKind::ListMarker { task: false, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
+                marker.reveal_extent = Some(ws_start..line_end);
+                nodes.push(marker);
             }
         }
 
@@ -669,18 +676,24 @@ fn is_closing_fence(bytes: &[u8], line: Range<usize>, fence_ch: u8, fence_len: u
 
 /// Fenced code block: opening fence line (`line:code-fence`), body lines
 /// (`line:code-block` + `mark:code`), and — if present — the closing fence
-/// line (`line:code-fence`). Fences are never concealed in M1. Derived by
-/// scanning the raw source within the block's extent (already the full
-/// fence-to-fence span at `Start` time), not from `Text` event payloads —
-/// robust to however pulldown chunks the body into `Text` events.
+/// line (`line:code-fence`). Fence lines carry a BLOCK-level reveal extent
+/// (the whole fence-to-fence range): a cursor anywhere inside the block
+/// reveals both raw fences, so they are visible while the code is being
+/// edited. Derived by scanning the raw source within the block's extent
+/// (already the full fence-to-fence span at `Start` time), not from `Text`
+/// event payloads — robust to however pulldown chunks the body into `Text`
+/// events.
 fn fenced_code_lines(bytes: &[u8], range: Range<usize>) -> Vec<Node> {
     let mut out = Vec::new();
+    let block = range.clone();
     let lines = split_lines(bytes, range);
     if lines.is_empty() {
         return out;
     }
     let open = lines[0].clone();
-    out.push(leaf(NodeKind::CodeFenceLine, open.clone(), open.end..open.end, vec![]));
+    let mut open_node = leaf(NodeKind::CodeFenceLine, open.clone(), open.end..open.end, vec![]);
+    open_node.reveal_extent = Some(block.clone());
+    out.push(open_node);
     let Some((fence_ch, fence_len)) = detect_fence(bytes, open) else {
         // Malformed/unexpected: still emit the rest as body lines rather
         // than dropping them.
@@ -701,7 +714,9 @@ fn fenced_code_lines(bytes: &[u8], range: Range<usize>) -> Vec<Node> {
     }
     if body_end_idx < lines.len() {
         let close = lines[body_end_idx].clone();
-        out.push(leaf(NodeKind::CodeFenceLine, close.clone(), close.end..close.end, vec![]));
+        let mut close_node = leaf(NodeKind::CodeFenceLine, close.clone(), close.end..close.end, vec![]);
+        close_node.reveal_extent = Some(block);
+        out.push(close_node);
     }
     out
 }
@@ -857,7 +872,8 @@ mod tests {
         assert_eq!(widgets.len(), 2);
         assert_eq!(widgets[0].extent, 2..5);
         assert_eq!(widgets[0].kind, NodeKind::TaskWidget { checked: false });
-        assert_eq!(widgets[0].reveal_extent, Some(0..5));
+        // LINE-level reveal: the whole first line of the item.
+        assert_eq!(widgets[0].reveal_extent, Some(0..10));
         assert_eq!(widgets[1].kind, NodeKind::TaskWidget { checked: true });
     }
 

@@ -39,6 +39,13 @@ fn widget(from: usize, to: usize, checked: bool) -> Decoration {
     }
 }
 
+fn li(at: usize, depth: u8) -> Decoration {
+    Decoration::Block {
+        at,
+        style: BlockStyle::ListItem(depth),
+    }
+}
+
 fn bullet(from: usize, to: usize) -> Decoration {
     Decoration::Widget {
         from,
@@ -225,9 +232,14 @@ fn fenced_code_block_fences_conceal_and_reveal_per_line() {
             conceal(21, 24),
         ]
     );
-    // Cursor on the opening fence reveals ONLY that fence's raw source.
-    let d = decos(doc, &[(2, 2)]);
+    // BLOCK-level reveal: a cursor anywhere inside the fenced block (here
+    // in the body) reveals BOTH raw fences for editing.
+    let d = decos(doc, &[(10, 10)]);
     assert!(d.contains(&mark(0, 7, MarkStyle::Delim)));
+    assert!(d.contains(&mark(21, 24, MarkStyle::Delim)));
+    // Outside the block: both concealed.
+    let d = decos(doc, &[]);
+    assert!(d.contains(&conceal(0, 7)));
     assert!(d.contains(&conceal(21, 24)));
 }
 
@@ -253,26 +265,30 @@ fn fenced_code_multi_line_body() {
 // ------------------------------------------------------------------ lists --
 
 #[test]
-fn unordered_list_marker_bullet_widget_and_strict_reveal() {
-    // Concealed: bullets render as a widget over the whole marker span.
+fn unordered_list_marker_bullet_widget_and_line_reveal() {
+    // Concealed: bullets render as a widget over the whole marker span; every
+    // item line carries a list-item line decoration (hanging indent).
     let d = decos("- one\n- two\n", &[]);
-    assert_eq!(d, vec![bullet(0, 2), bullet(6, 8)]);
-    // Cursor at the item text's first character (== extent end, the common
-    // typing position) does NOT reveal — strict interior overlap only.
-    let d = decos("- one\n- two\n", &[(2, 2)]);
-    assert_eq!(d[0], bullet(0, 2));
-    // Cursor strictly inside the marker reveals the raw source as a mark.
-    let d = decos("- one\n- two\n", &[(1, 1)]);
-    assert_eq!(d[0], mark(0, 2, MarkStyle::ListMarker));
-    // A selection crossing the marker reveals it too.
-    let d = decos("- one\n- two\n", &[(1, 4)]);
-    assert_eq!(d[0], mark(0, 2, MarkStyle::ListMarker));
+    assert_eq!(d, vec![li(0, 1), bullet(0, 2), li(6, 1), bullet(6, 8)]);
+    // Reveal is LINE-level: a cursor ANYWHERE on the item's line (here the
+    // middle of the text) reveals the raw marker for editing; other lines
+    // keep their bullets.
+    let d = decos("- one\n- two\n", &[(3, 3)]);
+    assert_eq!(
+        d,
+        vec![
+            li(0, 1),
+            mark(0, 2, MarkStyle::ListMarker),
+            li(6, 1),
+            bullet(6, 8),
+        ]
+    );
     // Composition touching the marker reveals it (stability rule).
     let mut ed = Editor::new(1);
     let rev = ed.load("- one\n");
     ed.composition_begin(1, 1).unwrap();
     let d = ed.decorations(rev, 0, ed.doc_len_utf16(), &[]).unwrap();
-    assert_eq!(d[0], mark(0, 2, MarkStyle::ListMarker));
+    assert_eq!(d[1], mark(0, 2, MarkStyle::ListMarker));
 }
 
 #[test]
@@ -281,7 +297,9 @@ fn ordered_list_marker() {
     assert_eq!(
         d,
         vec![
+            li(0, 1),
             mark(0, 3, MarkStyle::ListMarker),
+            li(7, 1),
             mark(7, 10, MarkStyle::ListMarker),
         ]
     );
@@ -295,8 +313,10 @@ fn task_item_widget_when_not_revealed() {
         vec![
             // Task-item markers conceal entirely (no bullet): the checkbox
             // widget alone represents the item.
+            li(0, 1),
             conceal(0, 2),
             widget(2, 5, false),
+            li(11, 1),
             conceal(11, 13),
             widget(13, 16, true),
         ]
@@ -312,9 +332,10 @@ fn task_item_widget_withheld_when_item_marker_extent_revealed() {
     assert_eq!(
         d,
         vec![
-            // Lockstep reveal: the dash and the brackets share the item
-            // marker extent, so a cursor anywhere in [0, 5] shows BOTH as
-            // raw delim text together — never one without the other.
+            // Lockstep reveal: the dash and the brackets share the item's
+            // LINE as reveal extent — a cursor anywhere on the line shows
+            // both as raw delim text together, never one without the other.
+            li(0, 1),
             mark(0, 2, MarkStyle::Delim),
             mark(2, 5, MarkStyle::Delim),
         ]
@@ -325,10 +346,11 @@ fn task_item_widget_withheld_when_item_marker_extent_revealed() {
     assert!(!d
         .iter()
         .any(|d| matches!(d, Decoration::Widget { kind: oxidown_core::WidgetKind::Task { .. }, .. })));
-    // Cursor well past the item's marker extent (in the body text) leaves
-    // the widget in place.
+    // LINE-level reveal: a cursor in the item's body text also reveals the
+    // raw markers (editable whenever the line is being edited).
     let d = decos("- [ ] todo\n", &[(8, 8)]);
-    assert!(d.contains(&widget(2, 5, false)));
+    assert!(d.contains(&mark(2, 5, MarkStyle::Delim)));
+    assert!(!d.iter().any(|x| matches!(x, Decoration::Widget { .. })));
 }
 
 #[test]
@@ -402,14 +424,16 @@ fn nested_list_items_emit_list_item_lines_with_concealed_indent() {
     // and a bullet nested under an ordered item (3-space indent).
     let doc = "- a\n  - b\n    - c\n1. x\n   - y\n";
     let d = decos(doc, &[]);
-    assert!(d.contains(&block(4, BlockStyle::ListItem(2))), "depth 2: {d:?}");
+    // Line decorations at the MARKER positions, for every depth (they drive
+    // the view's hanging indent); indent whitespace conceals for depth >= 2.
+    assert!(d.contains(&li(0, 1)), "depth 1: {d:?}");
+    assert!(d.contains(&li(6, 2)), "depth 2");
     assert!(d.contains(&conceal(4, 6)), "depth-2 indent conceals");
-    assert!(d.contains(&block(10, BlockStyle::ListItem(3))), "depth 3");
+    assert!(d.contains(&li(14, 3)), "depth 3");
     assert!(d.contains(&conceal(10, 14)), "depth-3 indent conceals");
-    assert!(d.contains(&block(23, BlockStyle::ListItem(2))), "under ordered: {d:?}");
+    assert!(d.contains(&li(18, 1)), "ordered depth 1");
+    assert!(d.contains(&li(26, 2)), "under ordered");
     assert!(d.contains(&conceal(23, 26)), "3-space indent conceals");
-    // Top-level items emit NO list-item line.
-    assert!(!d.contains(&block(0, BlockStyle::ListItem(1))));
     // Cursor inside the indent reveals it as delim.
     let d = decos(doc, &[(5, 5)]);
     assert!(d.contains(&mark(4, 6, MarkStyle::Delim)));
@@ -417,18 +441,18 @@ fn nested_list_items_emit_list_item_lines_with_concealed_indent() {
 
 #[test]
 fn task_marker_reveals_in_lockstep_with_checkbox() {
-    let doc = "- [ ] todo\n";
-    // Cursor anywhere in the item marker extent [0, 5] reveals BOTH the
-    // dash and the brackets together...
-    for pos in 0..=5 {
+    let doc = "- [ ] todo\nnext line\n";
+    // Cursor anywhere on the item's LINE reveals BOTH the dash and the
+    // brackets together...
+    for pos in 0..=10 {
         let d = decos(doc, &[(pos, pos)]);
         assert!(
             d.contains(&mark(0, 2, MarkStyle::Delim)) && d.contains(&mark(2, 5, MarkStyle::Delim)),
             "pos {pos}: {d:?}"
         );
     }
-    // ...and outside it, both conceal together (widget + concealed dash).
-    let d = decos(doc, &[(8, 8)]);
+    // ...and off the line, both conceal together (widget + concealed dash).
+    let d = decos(doc, &[(14, 14)]);
     assert!(d.contains(&conceal(0, 2)));
     assert!(d.contains(&widget(2, 5, false)));
 }

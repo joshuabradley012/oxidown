@@ -505,10 +505,14 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
       { kind: "conceal", from: 0, to: 5 },
       { kind: "conceal", from: 19, to: 22 },
     ]);
-    // Cursor on the opening fence reveals only that fence.
-    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(1));
-    expect(marks(revealed, "delim")).toEqual([{ kind: "mark", from: 0, to: 5, style: "delim" }]);
-    expect(conceals(revealed)).toEqual([{ kind: "conceal", from: 19, to: 22 }]);
+    // BLOCK-level reveal: a cursor anywhere inside the block (here in the
+    // body) reveals BOTH raw fences for editing.
+    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(10));
+    expect(marks(revealed, "delim")).toEqual([
+      { kind: "mark", from: 0, to: 5, style: "delim" },
+      { kind: "mark", from: 19, to: 22, style: "delim" },
+    ]);
+    expect(conceals(revealed)).toEqual([]);
   });
 
   it("thematic break: hr line + concealed dashes, revealed as delim on the line", () => {
@@ -523,39 +527,39 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     expect(conceals(revealed)).toEqual([]);
   });
 
-  it("bullets are widgets with strict reveal; ordered markers stay marks", () => {
+  it("bullets are widgets with LINE-level reveal; ordered markers stay marks", () => {
     const doc = "- item\n1. other";
     const { core } = makeCore(doc);
-    // Cursor at line start (== bullet extent start): STRICT interior rule
-    // keeps the bullet a widget; the ordered marker is always a mark.
-    const ds = core.decorations(core.revision(), 0, doc.length, cursor(0));
+    // Cursor on the SECOND line: the first line's bullet stays a widget.
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(9));
     expect(ds.filter((d) => d.kind === "widget")).toEqual([
       { kind: "widget", from: 0, to: 2, widget: "bullet" },
     ]);
     expect(marks(ds, "list-marker")).toEqual([
       { kind: "mark", from: 7, to: 10, style: "list-marker" },
     ]);
-    // Cursor strictly inside the bullet marker reveals it as a mark.
-    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(1));
+    // Every item line carries a list-item line decoration (hanging indent).
+    expect(lines(ds)).toEqual([
+      { kind: "line", at: 0, style: "list-item", depth: 1 },
+      { kind: "line", at: 7, style: "list-item", depth: 1 },
+    ]);
+    // Cursor ANYWHERE on the bullet's line (here mid-text) reveals its raw
+    // marker for editing.
+    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(4));
     expect(revealed.filter((d) => d.kind === "widget")).toEqual([]);
     expect(marks(revealed, "list-marker")).toEqual([
       { kind: "mark", from: 0, to: 2, style: "list-marker" },
       { kind: "mark", from: 7, to: 10, style: "list-marker" },
     ]);
-    // Cursor at the item text's first character does NOT reveal.
-    const atText = core.decorations(core.revision(), 0, doc.length, cursor(2));
-    expect(atText.filter((d) => d.kind === "widget")).toEqual([
-      { kind: "widget", from: 0, to: 2, widget: "bullet" },
-    ]);
     expect(conceals(ds)).toEqual([]);
   });
 
-  it("task list item: list-marker mark + widget:task (concealed) or delim (revealed)", () => {
-    const doc = "- [ ] buy milk";
+  it("task list item: widget:task (concealed) or delims (LINE-level reveal)", () => {
+    const doc = "- [ ] buy milk\nsecond line";
     const { core } = makeCore(doc);
+    // Cursor on the SECOND line: the task line is concealed — the leading
+    // "- " conceals entirely (no bullet widget); the checkbox represents it.
     const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
-    // Task items: the leading "- " conceals entirely (no bullet widget);
-    // the checkbox alone represents the item.
     const widgets = ds.filter((d) => d.kind === "widget");
     expect(widgets).toEqual([
       { kind: "widget", from: 2, to: 5, widget: "task", checked: false },
@@ -574,7 +578,7 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
   });
 
   it("checked task items report checked: true", () => {
-    const doc = "- [x] done";
+    const doc = "- [x] done\nelsewhere";
     const { core } = makeCore(doc);
     const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
     const widgets = ds.filter((d) => d.kind === "widget" && d.widget === "task");

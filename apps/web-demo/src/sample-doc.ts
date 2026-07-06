@@ -57,6 +57,39 @@ function greet(name: string): string {
 3. ordered three
 
 ---
+
+## Torture tests — mixed composition & special characters
+
+### Marks inside marks inside blocks
+
+> A quote with **bold**, *italic*, \`inline code\`, ~~strike~~, a [link](https://example.com/a(b)?q=1&x=2#frag), and <https://auto.example/?a=1&b=2>.
+> ## A heading inside a quote with \`code\` and **bold !@#$%^&()**
+> - a bullet inside a quote with *italic*
+> - [ ] a task inside a quote with ~~strike~~
+> 1. an ordered item inside a quote
+> > nested quote containing \`- not a bullet\` in code and a real list:
+> > - **bold bullet** with [a *italic* link](https://x.dev)
+
+### Headings with everything
+
+#### \`code\` in a heading with **bold !@#$%^&()** and [a link](https://example.com) and ~~strike~~ and 日本語 and 🎉
+
+### Special characters in every mark
+
+**!@#$%^&()** and *!@#$%^&()* and \`!@#$%^&*()_+-=[]{}|;':",./<>?\` and ~~!@#$%^&()~~ and [!@#$%^&()](https://example.com/!@$^()).
+
+Escapes and traps: \\*not italic\\*, \\\`not code\\\`, a_snake_case_word, 2*3*4 math, un**closed bold at line end, \`code with ** and __ inside\`, ****four asterisks****, ** ** (empty-ish), <div>raw html stays literal</div>, &amp; entities, ~single tilde~ (not strike in strict GFM? let's see).
+
+### Lists with everything
+
+- **bold item** with \`code !@#\` and [link](https://a.b/c_(d)) and ~~strike~~
+- [ ] task with **bold**, \`code\`, *italics*, and 🎉 emoji !@#$
+  - [x] nested done task with [link **bold text** inside](https://ex.io)
+  - \`\`\`
+    fenced code attempt inside a list item
+  - back to a bullet after the weird fence attempt
+1. ordered with ***bold italic*** and \`\${template}\` chars
+2. > a quote nested under an ordered item?
 `;
 
 export const SAMPLE_DOC = `# Oxidown demo

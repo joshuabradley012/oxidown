@@ -58,7 +58,14 @@ export const oxidownTheme = EditorView.baseTheme({
     width: "0",
     maxWidth: "0",
     overflow: "hidden",
-    verticalAlign: "baseline",
+    // Box height EXACTLY the line's height (line-height is 1.5 everywhere,
+    // so 1.5em == 1lh), pinned to the line top. This is load-bearing:
+    // shorter boxes (1em glyph-height cap) broke CM6's vertical-motion
+    // geometry at heading boundaries (multi-line ArrowUp skips), and
+    // baseline-aligned full-strut boxes inflated lines to 30px and
+    // elongated the caret. Full-height + top-aligned does neither.
+    height: "1.5em",
+    verticalAlign: "top",
     // Critical: at width 0 the hidden text would otherwise WRAP one glyph
     // per row, inflating the line box to N rows (giant bands around code
     // fences, heading gaps). nowrap keeps the box exactly one line tall.
@@ -160,12 +167,6 @@ export const oxidownTheme = EditorView.baseTheme({
   ".ox-code-fence": {
     fontFamily: MONO_FONT,
   },
-  // Concealed fences: transparent — the strip reads as plain blank space,
-  // so the visible code band is exactly the body lines. Compound selector
-  // (two classes) outweighs the `&light .ox-code-fence` background rule.
-  "&light .ox-code-fence.ox-code-fence-concealed, &dark .ox-code-fence.ox-code-fence-concealed": {
-    backgroundColor: "transparent",
-  },
   ".ox-code-block": {
     fontFamily: MONO_FONT,
   },
@@ -184,15 +185,20 @@ export const oxidownTheme = EditorView.baseTheme({
     backgroundColor: "transparent",
   },
 
-  // Nested list items (depth >= 2): the raw indent whitespace conceals and
-  // the line gets EXACT per-depth padding instead — 1.5em per level, i.e.
-  // each nested marker's left edge aligns with its parent's text column
-  // (which starts after the parent's own 1.5em marker box).
-  // calc: our padding REPLACES the line's default (CM6 base: 6px left), so
-  // add it back — otherwise every depth sits 6px left of its target column.
-  ".ox-li-2": { paddingLeft: "calc(6px + 1.5em)" },
-  ".ox-li-3": { paddingLeft: "calc(6px + 3em)" },
-  ".ox-li-4": { paddingLeft: "calc(6px + 4.5em)" },
+  // List items (every depth): hanging indent — padding reserves the full
+  // marker column for the depth and the negative text-indent pulls only the
+  // FIRST line (the marker) back into it, so wrapped text aligns with the
+  // first line's text. Nested raw indent whitespace conceals (depth >= 2)
+  // and each nested marker starts at its parent's text column.
+  // calc: our padding REPLACES the line's default (CM6 base: 6px left).
+  ".ox-list-item": { textIndent: "-1.5em" },
+  ".ox-li-1": { paddingLeft: "calc(6px + 1.5em)" },
+  ".ox-li-2": { paddingLeft: "calc(6px + 3em)" },
+  ".ox-li-3": { paddingLeft: "calc(6px + 4.5em)" },
+  ".ox-li-4": { paddingLeft: "calc(6px + 6em)" },
+
+  // Breathing room before a nested quote block (set on the parent line).
+  ".ox-bq-gap": { paddingBottom: "4px" },
 
   // Thematic break: the raw `---` is concealed (per the amended contract) and
   // the line draws an actual centered 1px rule; revealing the line shows the

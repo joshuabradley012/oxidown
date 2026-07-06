@@ -119,15 +119,11 @@ const lineDecos = {
 } as const;
 /** hr line whose dashes are revealed: same class family, rule suppressed. */
 const hrRevealedLineDeco = Decoration.line({ class: "ox-hr ox-hr-revealed" });
-/** Fence line whose raw ``` is concealed: code-band background suppressed. */
-const fenceConcealedLineDeco = Decoration.line({
-  class: "ox-code-fence ox-code-fence-concealed",
-});
 
-/** Nested list-item lines: per-depth padding classes (capped at 4). */
+/** List-item lines (ALL depths): per-depth hanging-indent classes (cap 4). */
 const listItemLineDecos = new Map<number, Decoration>();
 function listItemLineDeco(depth: number): Decoration {
-  const capped = Math.max(2, Math.min(depth, 4));
+  const capped = Math.max(1, Math.min(depth, 4));
   let deco = listItemLineDecos.get(capped);
   if (!deco) {
     deco = Decoration.line({ class: `ox-list-item ox-li-${capped}` });
@@ -136,14 +132,19 @@ function listItemLineDeco(depth: number): Decoration {
   return deco;
 }
 
-/** Blockquote line decorations are depth-dependent; cache one per depth (capped at 3 for styling). */
-const blockquoteLineDecos = new Map<number, Decoration>();
-function blockquoteLineDeco(depth: number): Decoration {
+/** Blockquote line decorations: per depth (cap 3), with a `gap` variant for
+ * lines directly followed by a DEEPER quote line (breathing room before the
+ * nested block). */
+const blockquoteLineDecos = new Map<string, Decoration>();
+function blockquoteLineDeco(depth: number, gap: boolean): Decoration {
   const capped = Math.max(1, Math.min(depth, 3));
-  let deco = blockquoteLineDecos.get(capped);
+  const key = `${capped}${gap ? "g" : ""}`;
+  let deco = blockquoteLineDecos.get(key);
   if (!deco) {
-    deco = Decoration.line({ class: `ox-blockquote ox-bq-${capped}` });
-    blockquoteLineDecos.set(capped, deco);
+    deco = Decoration.line({
+      class: `ox-blockquote ox-bq-${capped}${gap ? " ox-bq-gap" : ""}`,
+    });
+    blockquoteLineDecos.set(key, deco);
   }
   return deco;
 }
@@ -410,6 +411,20 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
           for (const d of decos) {
             if (d.kind === "mark" && d.style === "delim") delimStarts.add(d.from);
           }
+          // Blockquote lines directly followed by a DEEPER quote line get a
+          // small bottom gap (see blockquoteLineDeco).
+          const bqLines = decos
+            .filter(
+              (d): d is Extract<CoreDecoration, { kind: "line" }> =>
+                d.kind === "line" && d.style === "blockquote",
+            )
+            .sort((a, b) => a.at - b.at);
+          const bqGapAts = new Set<number>();
+          for (let i = 0; i + 1 < bqLines.length; i++) {
+            if ((bqLines[i + 1].depth ?? 1) > (bqLines[i].depth ?? 1)) {
+              bqGapAts.add(bqLines[i].at);
+            }
+          }
           const ranges: Range<Decoration>[] = [];
           for (const d of decos) {
             // Forward compatibility: views MUST ignore decoration styles and
@@ -417,24 +432,17 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
             if (d.kind === "line") {
               if (d.style === "blockquote") {
                 const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
-                ranges.push(blockquoteLineDeco(d.depth ?? 1).range(line.from));
+                ranges.push(blockquoteLineDeco(d.depth ?? 1, bqGapAts.has(d.at)).range(line.from));
                 continue;
               }
               if (d.style === "list-item") {
                 const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
-                ranges.push(listItemLineDeco(d.depth ?? 2).range(line.from));
+                ranges.push(listItemLineDeco(d.depth ?? 1).range(line.from));
                 continue;
               }
               if (d.style === "hr" && delimStarts.has(d.at)) {
                 const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
                 ranges.push(hrRevealedLineDeco.range(line.from));
-                continue;
-              }
-              if (d.style === "code-fence" && !delimStarts.has(d.at)) {
-                // Concealed fence: no code-band background — the strip reads
-                // as ordinary blank space above/below the block body.
-                const line = state.doc.lineAt(Math.min(d.at, state.doc.length));
-                ranges.push(fenceConcealedLineDeco.range(line.from));
                 continue;
               }
               const deco = lineDecos[d.style as keyof typeof lineDecos];

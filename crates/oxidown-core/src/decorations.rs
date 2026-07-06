@@ -171,24 +171,30 @@ pub fn compute(
             .any(|&(a, b)| touches(a, b, reveal_extent.start, reveal_extent.end));
 
         match node.kind {
-            NodeKind::ListMarker { task } => {
+            NodeKind::ListMarker { task, depth } => {
                 if node.extent.end <= node.extent.start {
                     continue;
                 }
+                // Every list item line carries a list-item line decoration
+                // (all depths): the view uses it for hanging indent, so
+                // wrapped item text aligns with the first line's text.
+                out.push(Decoration::Block {
+                    at: text.byte_to_utf16(node.extent.start),
+                    style: BlockStyle::ListItem(depth),
+                });
                 let from = text.byte_to_utf16(node.extent.start);
                 let to = text.byte_to_utf16(node.extent.end);
                 let is_bullet =
                     matches!(text.byte_at(node.extent.start), Some(b'-' | b'*' | b'+'));
+                let in_composition = composition
+                    .is_some_and(|c| touches(c.start, c.end, node.extent.start, node.extent.end));
+                // Reveal is LINE-level (`revealed` uses the marker node's
+                // reveal_extent = the item's whole first line): the raw
+                // markers are editable whenever the cursor is on the line,
+                // never one keystroke away from surprise.
                 if is_bullet && task {
-                    // Task items: the checkbox alone represents the item, so
-                    // the `- ` conceals — and reveals IN LOCKSTEP with the
-                    // checkbox (`revealed` here uses the marker node's
-                    // reveal_extent = the item marker extent, the same range
-                    // the task widget keys off), so the dash and the
-                    // brackets always show together.
-                    let in_composition = composition.is_some_and(|c| {
-                        touches(c.start, c.end, node.extent.start, node.extent.end)
-                    });
+                    // Task items: the checkbox alone represents the item;
+                    // the `- ` conceals/reveals in lockstep with it.
                     if revealed || in_composition {
                         out.push(Decoration::Mark {
                             from,
@@ -199,19 +205,7 @@ pub fn compute(
                         out.push(Decoration::Conceal { from, to });
                     }
                 } else if is_bullet {
-                    // Bullets render as a `•` widget. Reveal uses STRICT
-                    // interior overlap (`a < end && b > start`), not the
-                    // closed-interval `touches`: a cursor at the item text's
-                    // first character (== extent end, the most common typing
-                    // position) or at the line start must not flash the raw
-                    // `- `; entering the marker or selecting across it does.
-                    let strictly_inside = selections
-                        .iter()
-                        .any(|&(a, b)| a < node.extent.end && b > node.extent.start);
-                    let in_composition = composition.is_some_and(|c| {
-                        touches(c.start, c.end, node.extent.start, node.extent.end)
-                    });
-                    if strictly_inside || in_composition {
+                    if revealed || in_composition {
                         out.push(Decoration::Mark {
                             from,
                             to,
@@ -310,11 +304,7 @@ pub fn compute(
                 });
                 Some(MarkStyle::Code)
             }
-            NodeKind::ListItemIndent { depth } => {
-                out.push(Decoration::Block {
-                    at: text.byte_to_utf16(node.extent.start),
-                    style: BlockStyle::ListItem(depth),
-                });
+            NodeKind::ListItemIndent { .. } => {
                 let in_composition = composition
                     .is_some_and(|c| touches(c.start, c.end, node.extent.start, node.extent.end));
                 let from = text.byte_to_utf16(node.extent.start);

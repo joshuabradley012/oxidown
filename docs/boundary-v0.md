@@ -175,7 +175,7 @@ export interface DecorationWidget {
   kind: "widget";
   from: number;
   to: number;                 // source range the widget REPLACES visually
-  widget: "task" | "bullet";  // task: "[ ]"/"[x]" (carries checked); bullet: the whole "- " marker
+  widget: "task" | "bullet";  // task: "[ ]"/"[x]" (carries checked); bullet: the whole "- " marker (LINE-level reveal)
   checked?: boolean;
 }
 ```
@@ -186,22 +186,24 @@ M1 emission scope (parser may understand more than it decorates):
   Revealed: delimiters as `mark:delim`, destination as `mark:url`. Autolinks: `mark:link` whole.
 - Blockquotes — `line:blockquote` per line with depth; `> ` markers conceal, reveal per-line.
 - Fenced code blocks — `line:code-fence` on fence lines, `line:code-block` on body lines,
-  `mark:code` on body content. The raw fence text (``` + info string) conceals like the
-  thematic break (revealed as `mark:delim` when the cursor is on that fence line); the styled
-  fence line itself reads as the code block's top/bottom edge.
+  `mark:code` on body content. The raw fence text (``` + info string) conceals; reveal is
+  **BLOCK-level**: a cursor/selection anywhere inside the fenced block (either fence or the
+  body) reveals BOTH raw fences as `mark:delim`, so they are editable whenever the block is.
 - Lists — ordered markers emit `mark:list-marker` (always visible; alignment is view styling:
   fixed-width right-aligned box + tabular numerals). **Unordered markers emit `widget:bullet`
   replacing the whole marker span (`"- "`)**, revealed as `mark:list-marker` under STRICT
   interior overlap (`a < end && b > start`) — the cursor at the item text's first character or
-  at line start does not flash the raw marker. Task items additionally emit a `widget:task`
-  replacing exactly the `[ ]`/`[x]` span; **the task item's `- ` marker conceals and reveals in
-  LOCKSTEP with the checkbox** (both key off the item marker extent, closed-interval) — the
-  dash and the brackets always show together, as `mark:delim`.
-- **Nested list items (depth ≥ 2)** emit `{kind:"line", style:"list-item", depth}` on the
-  item's line plus a `conceal` over the raw leading indent whitespace (revealed as
-  `mark:delim`). The view supplies exact per-depth padding (1.5em per level — each nested
-  marker's left edge aligns with its parent's text column) instead of rendering the source
-  spaces at their natural width.
+  at line start does not flash the raw marker. **Marker reveal is LINE-level** (the reveal
+  extent is the item's whole first line): a cursor anywhere on the line makes the raw marker
+  editable — never one keystroke away from surprise. Task items additionally emit a
+  `widget:task` replacing exactly the `[ ]`/`[x]` span; the task item's `- ` marker conceals
+  and reveals in LOCKSTEP with the checkbox (same line-level extent) — the dash and the
+  brackets always show together, as `mark:delim`.
+- **Every list item line** emits `{kind:"line", style:"list-item", depth}` (1-based depth) at
+  the marker position — the view uses it for hanging indent (wrapped item text aligns with the
+  first line's text). Nested items (depth ≥ 2) additionally emit a `conceal` over the raw
+  leading indent whitespace (revealed as `mark:delim`); the view supplies exact per-depth
+  padding (1.5em per level) so each nested marker starts at its parent's text column.
 - Thematic break — `line:hr` on the line, plus `conceal` over the raw dashes (revealed as
   `mark:delim` when the cursor is on the line). The view draws the actual rule on the hr line;
   nested blockquote bars are likewise the view's job (one bar per depth level).

@@ -346,30 +346,29 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
   if (listM) {
     const { markerFrom, contentFrom } = listM;
     const isBullet = /[-*+]/.test(content[markerFrom]);
-    // Nested items (approximated as depth = floor(indent/2) + 1, matching
-    // 2-space bullet / 3-space ordered nesting closely enough for the mock):
-    // a line:list-item decoration + the raw indent concealed.
+    // Depth approximated as floor(indent/2) + 1 (2-space bullet / 3-space
+    // ordered nesting, close enough for the mock). EVERY item line emits
+    // line:list-item (the view's hanging indent); nested indents conceal.
     const depth = Math.floor(markerFrom / 2) + 1;
-    if (depth >= 2 && markerFrom > 0) {
-      nodes.push({
-        start: base,
-        end: base + markerFrom,
-        conceals: [[base, base + markerFrom]],
-        marks: [],
-        line: { kind: "line", at: base, style: "list-item", depth },
-      });
-    }
+    const lineEnd = base + content.length;
+    nodes.push({
+      start: base,
+      end: lineEnd,
+      conceals: depth >= 2 && markerFrom > 0 ? [[base, base + markerFrom]] : [],
+      marks: [],
+      line: { kind: "line", at: base, style: "list-item", depth },
+    });
     const afterMarker = content.slice(contentFrom);
     const taskM = TASK_RE.exec(afterMarker);
     if (taskM) {
-      // Task items: the `- ` marker conceals entirely (no bullet widget) —
-      // the checkbox alone represents the item; revealing shows raw source.
+      // Task items: the `- ` marker conceals (no bullet widget) and reveals
+      // in lockstep with the checkbox — LINE-level (node spans the line).
       const checkboxFrom = base + contentFrom;
       const checkboxTo = checkboxFrom + 3; // "[ ]" / "[x]"
       const itemContentFrom = contentFrom + taskM[0].length;
       nodes.push({
-        start: base + markerFrom,
-        end: checkboxTo,
+        start: base,
+        end: lineEnd,
         conceals: [[base + markerFrom, base + contentFrom]],
         marks: [],
         widget: { from: checkboxFrom, to: checkboxTo, checked: taskM[1] !== " " },
@@ -379,11 +378,11 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
     }
     const marks: InlineMark[] = [];
     if (isBullet) {
-      // Bullets are their own node: widget:bullet when concealed,
-      // mark:list-marker when strictly revealed.
+      // Bullet node spans the LINE: cursor anywhere on it reveals the raw
+      // marker (editable while the line is being edited).
       nodes.push({
-        start: base + markerFrom,
-        end: base + contentFrom,
+        start: base,
+        end: lineEnd,
         conceals: [],
         marks: [],
         bullet: { from: base + markerFrom, to: base + contentFrom },
@@ -414,6 +413,10 @@ export function parseDoc(doc: string): ParsedNode[] {
     if (fenceM) {
       const fenceChar = fenceM[1][0];
       const fenceLen = fenceM[1].length;
+      // BLOCK-level reveal: fence nodes span the whole fenced block, so a
+      // cursor anywhere inside it reveals both raw fences. The open node is
+      // widened once the close fence is found (below).
+      const openIdx = nodes.length;
       nodes.push({
         start: lineStart,
         end: lineEnd,
@@ -430,12 +433,13 @@ export function parseDoc(doc: string): ParsedNode[] {
         const closeM = CLOSE_FENCE_RE.exec(bLine);
         if (closeM && closeM[1][0] === fenceChar && closeM[1].length >= fenceLen) {
           nodes.push({
-            start: bLineStart,
+            start: lineStart, // block start: reveal from anywhere inside
             end: bLineEnd,
             conceals: bLineEnd > bLineStart ? [[bLineStart, bLineEnd]] : [],
             marks: [],
             line: { kind: "line", at: bLineStart, style: "code-fence" },
           });
+          nodes[openIdx].end = bLineEnd;
           cursor = bLineEnd;
           break;
         }
@@ -713,17 +717,10 @@ export class MockCore implements OxidownCore {
       }
 
       if (node.bullet) {
-        // STRICT interior overlap (a < end && b > start): the cursor at the
-        // item text's first character (== extent end) or at line start does
-        // not reveal; entering the marker or selecting across it does.
-        const strictly =
-          selections.some((sel) => {
-            const lo = Math.min(sel.anchor, sel.head);
-            const hi = Math.max(sel.anchor, sel.head);
-            return lo < node.end && hi > node.start;
-          }) ||
-          (this.composing && this.compFrom <= node.end && this.compTo >= node.start);
-        if (strictly) {
+        // LINE-level reveal: the node spans the item's line, so `revealed`
+        // (closed-touch) makes the raw marker editable whenever the cursor
+        // is anywhere on the line.
+        if (revealed) {
           out.push({ kind: "mark", from: node.bullet.from, to: node.bullet.to, style: "list-marker" });
         } else {
           out.push({ kind: "widget", from: node.bullet.from, to: node.bullet.to, widget: "bullet" });
