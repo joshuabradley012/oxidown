@@ -375,8 +375,9 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
       const checkboxTo = checkboxFrom + 3; // "[ ]" / "[x]"
       const itemContentFrom = contentFrom + taskM[0].length;
       nodes.push({
-        // Combined `- [ ]` run: adjacency reveal, lockstep dash+brackets.
-        start: base + markerFrom,
+        // Leading spaces + `- [ ]` run: adjacency reveal (incl. the nesting
+        // spaces), lockstep dash+brackets.
+        start: base,
         end: checkboxTo,
         conceals: [[base + markerFrom, base + contentFrom]],
         marks: [],
@@ -387,11 +388,11 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
     }
     const marks: InlineMark[] = [];
     if (isBullet) {
-      // Bullet node spans the marker GLYPH: only a caret directly next to
-      // the `-` itself reveals the raw source (Obsidian-style; the position
-      // after the trailing space does not).
+      // Bullet node spans leading spaces + marker GLYPH: a caret in the
+      // nesting spaces or next to the `-` reveals the raw source (the
+      // position after the trailing space does not).
       nodes.push({
-        start: base + markerFrom,
+        start: base,
         end: base + glyphTo,
         conceals: [],
         marks: [],

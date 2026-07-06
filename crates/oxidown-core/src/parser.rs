@@ -280,19 +280,22 @@ pub fn parse_document(src: &str) -> ParseResult {
                     }
                 }
             }
+            // Reveal extents extend LEFT over the leading whitespace: a caret
+            // in the nesting spaces also opens the edit view (changing the
+            // nesting level needs the raw indent visible).
             if let Event::TaskListMarker(checked) = &event {
                 if range.start > item_start {
                     let mut marker = leaf(NodeKind::ListMarker { task: true, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
-                    marker.reveal_extent = Some(item_start..range.end);
+                    marker.reveal_extent = Some(ws_start..range.end);
                     nodes.push(marker);
                 }
                 let mut task = leaf(NodeKind::TaskWidget { checked: *checked }, range.clone(), range.end..range.end, vec![]);
-                task.reveal_extent = Some(item_start..range.end);
+                task.reveal_extent = Some(ws_start..range.end);
                 task.item_extent = Some(item);
                 nodes.push(task);
             } else if range.start > item_start {
                 let mut marker = leaf(NodeKind::ListMarker { task: false, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
-                marker.reveal_extent = Some(item_start..glyph_end);
+                marker.reveal_extent = Some(ws_start..glyph_end);
                 nodes.push(marker);
             }
         }

@@ -354,10 +354,10 @@ describe("hr rule suppression while editing", () => {
     const core = new MockCore();
     const view = makeView("before\n---\nafter", core);
     await flush();
+    // Concealment is a replace decoration: the raw `---` is NOT in the DOM
+    // when concealed — find the line by its class instead of its text.
     const hrLine = () =>
-      [...view.contentDOM.querySelectorAll(".cm-line")].find((l) =>
-        l.textContent?.includes("---"),
-      ) as HTMLElement;
+      view.contentDOM.querySelector(".ox-hr") as HTMLElement;
     // Cursor away from the hr: rule class present, revealed class absent.
     view.dispatch({ selection: { anchor: 0 } });
     await flush();

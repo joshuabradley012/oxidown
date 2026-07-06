@@ -105,7 +105,16 @@ const markDecos = {
   url: Decoration.mark({ class: "ox-url" }),
   "list-marker": Decoration.mark({ class: "ox-list-marker" }),
 } as const;
-const concealDeco = Decoration.mark({ class: "ox-conceal" });
+/**
+ * Concealment = CM6 replace decoration (Obsidian's mechanism). The characters
+ * remain in the DOCUMENT (copy/edit/positions all intact) — only their DOM
+ * rendering collapses. This replaced the earlier zero-width-box CSS hack,
+ * whose hidden-but-laid-out inner text gave coordsAtPos phantom x-positions
+ * at conceal boundaries (the caret vanished/floated next to `> ` markers).
+ * IME safety: the core's composition-stability rule diverts any conceal
+ * intersecting a composition to a delim mark BEFORE composition can touch it.
+ */
+const concealDeco = Decoration.replace({});
 const lineDecos = {
   h1: Decoration.line({ class: "ox-h1" }),
   h2: Decoration.line({ class: "ox-h2" }),

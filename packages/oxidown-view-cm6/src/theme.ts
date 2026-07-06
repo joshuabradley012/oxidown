@@ -3,13 +3,11 @@ import { EditorView } from "@codemirror/view";
 /**
  * Oxidown base theme.
  *
- * The conceal trick: delimiters are never removed from the DOM (that would
- * break IME and cursor math) — they are visually collapsed to a ZERO-WIDTH
- * inline-block (normal font metrics, no horizontal space; see .ox-conceal
- * for why not a tiny font-size). Because heading sizes are set on the LINE
- * element (`.ox-h1`…`.ox-h6`), revealed delimiters inherit the line's
- * font-size: line height does not change between concealed and revealed
- * states.
+ * Concealment is a CM6 REPLACE decoration (see extension.ts) — characters
+ * stay in the document; only their rendering collapses. Because heading
+ * sizes are set on the LINE element (`.ox-h1`…`.ox-h6`), revealed delimiters
+ * inherit the line's font-size: line height does not change between
+ * concealed and revealed states.
  *
  * `min-height: <line-height>em` on every line guards against collapse when a
  * line consists solely of concealed characters (em resolves against the
@@ -46,31 +44,7 @@ export const oxidownTheme = EditorView.baseTheme({
   // Revealed delimiters: full size (inherit the line's font-size), dimmed.
   ".ox-delim": { opacity: "0.45" },
 
-  // Concealed delimiters: visually collapsed, characters stay in the DOM.
-  // Zero-width inline-block, NOT a tiny font-size: a 0.01em span's glyph
-  // rects collapse to a sliver at the text baseline, which corrupts the
-  // y-geometry CodeMirror's vertical cursor motion steps through — with
-  // line-start conceals (blockquote `>`, list indents) ArrowUp would
-  // randomly skip multiple lines. width:0 + overflow:hidden keeps normal
-  // font metrics (sane line boxes) while occupying no horizontal space.
-  ".ox-conceal": {
-    display: "inline-block",
-    width: "0",
-    maxWidth: "0",
-    overflow: "hidden",
-    // Box height EXACTLY the line's height (line-height is 1.5 everywhere,
-    // so 1.5em == 1lh), pinned to the line top. This is load-bearing:
-    // shorter boxes (1em glyph-height cap) broke CM6's vertical-motion
-    // geometry at heading boundaries (multi-line ArrowUp skips), and
-    // baseline-aligned full-strut boxes inflated lines to 30px and
-    // elongated the caret. Full-height + top-aligned does neither.
-    height: "1.5em",
-    verticalAlign: "top",
-    // Critical: at width 0 the hidden text would otherwise WRAP one glyph
-    // per row, inflating the line box to N rows (giant bands around code
-    // fences, heading gaps). nowrap keeps the box exactly one line tall.
-    whiteSpace: "nowrap",
-  },
+  // (Concealment is a CM6 replace decoration — see extension.ts. No CSS.)
 
   // Heading line decorations (font-size on the line, so delimiters inherit it)
   ".ox-h1": { fontSize: "1.6em", fontWeight: "700" },
