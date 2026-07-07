@@ -643,6 +643,14 @@ function commandKeymap(core: OxidownCore): Extension {
       shift: runIndent("outdentList", indentLess),
       preventDefault: true,
     },
+    // Mod-]/Mod-[ are defaultKeymap's indentMore/indentLess — claim them so
+    // every indent gesture goes through the SAME marker-width-aware commands
+    // as Tab (a flat 2-space indent on a list line de-nests it: a nested item
+    // needs the parent marker's width, e.g. 3 under "1. "). This keymap must
+    // be registered before defaultKeymap to win (oxidown() before
+    // defaultKeymap in the host's extension array — the documented setup).
+    { key: "Mod-]", run: runIndent("indentList", indentMore), preventDefault: true },
+    { key: "Mod-[", run: runIndent("outdentList", indentLess), preventDefault: true },
   ]);
 }
 
