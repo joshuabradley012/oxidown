@@ -244,6 +244,50 @@ class BulletWidget extends WidgetType {
   }
 }
 
+/**
+ * Field-wise equality over two decoration payloads (same order, same items).
+ * Used to skip rebuilds when a cursor-only invalidation produced an identical
+ * payload. Unknown future kinds compare unequal — that only costs a rebuild,
+ * never a stale render (forward compatibility, boundary-v0.md v0.2).
+ */
+function payloadsEqual(a: CoreDecoration[], b: CoreDecoration[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x.kind !== y.kind) return false;
+    switch (x.kind) {
+      case "mark": {
+        const m = y as typeof x;
+        if (x.from !== m.from || x.to !== m.to || x.style !== m.style) return false;
+        break;
+      }
+      case "conceal": {
+        const c = y as typeof x;
+        if (x.from !== c.from || x.to !== c.to) return false;
+        break;
+      }
+      case "line": {
+        const l = y as typeof x;
+        if (x.at !== l.at || x.style !== l.style || x.depth !== l.depth || x.revealed !== l.revealed) {
+          return false;
+        }
+        break;
+      }
+      case "widget": {
+        const w = y as typeof x;
+        if (x.from !== w.from || x.to !== w.to || x.widget !== w.widget || x.checked !== w.checked) {
+          return false;
+        }
+        break;
+      }
+      default:
+        return false;
+    }
+  }
+  return true;
+}
+
 function originOf(tr: Transaction, view: EditorView): EditOrigin {
   if (tr.isUserEvent("input.paste") || tr.isUserEvent("input.drop")) return "paste";
   if (view.composing || tr.isUserEvent("input.type.compose")) return "ime";
@@ -274,6 +318,21 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
       /** Microtask guard: at most one rebuild flush per microtask batch/frame. */
       private scheduled = false;
       private destroyed = false;
+      /**
+       * The core payload behind the current `decorations` set. Cursor-only
+       * invalidations very often produce an IDENTICAL payload (line-level
+       * reveal: caret moves within a line, or between lines with no marker
+       * constructs, change nothing) — comparing against this skips the
+       * RangeSet rebuild and the re-render dispatch entirely.
+       */
+      private lastPayload: CoreDecoration[] | null = null;
+      /**
+       * Positions in `lastPayload` are absolute: any doc change invalidates
+       * the comparison (a post-edit payload could coincidentally equal a
+       * pre-edit one while meaning different text). Set on docChanged,
+       * cleared when a fresh payload is cached.
+       */
+      private payloadMaybeStale = true;
 
       private readonly onWindowMouseUp = () => {
         if (this.dragging) {
@@ -326,6 +385,7 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         // Keep positions valid immediately; the real rebuild is coalesced.
         if (update.docChanged) {
           this.decorations = this.decorations.map(update.changes);
+          this.payloadMaybeStale = true;
           this.endVerticalMotion(); // typing ends the gesture
         }
         // 2) Recompute decorations on doc change, selection change, or
@@ -388,7 +448,25 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         if (this.destroyed || !this.dirty) return;
         if (this.view.composing || this.dragging || this.verticalMotion) return; // frozen; dirty stays set
         this.dirty = false;
-        const decos = this.buildDecorations();
+        const payload = this.fetchPayload();
+        // Identical payload + unchanged doc → the current decorations are
+        // already exactly right: skip the RangeSet rebuild AND the re-render
+        // dispatch (the bulk of a cursor-move rebuild's cost).
+        if (
+          payload !== null &&
+          !this.payloadMaybeStale &&
+          this.lastPayload !== null &&
+          payloadsEqual(this.lastPayload, payload)
+        ) {
+          return;
+        }
+        if (payload !== null) {
+          this.lastPayload = payload;
+          this.payloadMaybeStale = false;
+        } else {
+          this.lastPayload = null; // resync failed: never skip off a bad cache
+        }
+        const decos = payload === null ? Decoration.none : this.buildDecorationSet(payload);
         if (decos === this.decorations) return;
         this.decorations = decos;
         // Plugin-provided decorations are only re-read during an update cycle;
@@ -396,16 +474,25 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         this.view.dispatch({});
       }
 
+      /** Constructor-time build: fetch + construct + seed the payload cache. */
       private buildDecorations(): DecorationSet {
+        const payload = this.fetchPayload();
+        if (payload === null) return Decoration.none;
+        this.lastPayload = payload;
+        this.payloadMaybeStale = false;
+        return this.buildDecorationSet(payload);
+      }
+
+      /** Core decorations for the current viewport (with desync recovery). */
+      private fetchPayload(): CoreDecoration[] | null {
         const state = this.view.state;
         const { from, to } = this.view.viewport;
         const selections: SelectionRange[] = state.selection.ranges.map((r) => ({
           anchor: r.anchor,
           head: r.head,
         }));
-        let decos: CoreDecoration[];
         try {
-          decos = core.decorations(core.revision(), from, to, selections);
+          return core.decorations(core.revision(), from, to, selections);
         } catch (err) {
           console.error(
             "[oxidown] core error during decorations — re-loading core from view buffer:",
@@ -413,12 +500,16 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
           );
           core.load(state.doc.toString());
           try {
-            decos = core.decorations(core.revision(), from, to, selections);
+            return core.decorations(core.revision(), from, to, selections);
           } catch (err2) {
             console.error("[oxidown] decorations still failing after resync:", err2);
-            return Decoration.none;
+            return null;
           }
         }
+      }
+
+      private buildDecorationSet(decos: CoreDecoration[]): DecorationSet {
+        const state = this.view.state;
         try {
           // Pre-pass: positions where the core revealed raw source as delim
           // marks. An hr line whose dashes are revealed (delim at the line's

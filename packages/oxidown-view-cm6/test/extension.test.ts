@@ -95,6 +95,42 @@ describe("oxidown extension wiring (jsdom)", () => {
     view.destroy();
   });
 
+  it("skips the re-render when a cursor-only move leaves the payload unchanged", async () => {
+    const core = new MockCore();
+    const view = makeView("plain text here\n**bold** span line\n", core);
+    await flush();
+    type P = { decorations: unknown };
+    const plugin = (view as unknown as { plugins: { value: unknown }[] }).plugins
+      .map((p) => p.value)
+      .filter((v): v is P => !!v && typeof v === "object" && "decorations" in v)[0];
+    // settle any initial rebuild so we start from a cached payload
+    view.dispatch({ selection: { anchor: 1 } });
+    await flush();
+    const before = plugin.decorations;
+
+    // Caret moves WITHIN the plain first line: decorations cannot change —
+    // the RangeSet must keep its identity (rebuild + dispatch skipped).
+    view.dispatch({ selection: { anchor: 3 } });
+    await flush();
+    view.dispatch({ selection: { anchor: 9 } });
+    await flush();
+    expect(plugin.decorations).toBe(before);
+
+    // Caret into the **bold** span on line 2: reveal flips, payload differs,
+    // a real rebuild must happen.
+    view.dispatch({ selection: { anchor: "plain text here\n".length + 3 } });
+    await flush();
+    expect(plugin.decorations).not.toBe(before);
+
+    // After a DOC change, identical-looking payloads must not be trusted:
+    // the rebuild runs again (payload cache invalidated).
+    const afterBold = plugin.decorations;
+    view.dispatch({ changes: { from: 6, to: 6, insert: "x" }, userEvent: "input.type" });
+    await flush();
+    expect(plugin.decorations).not.toBe(afterBold);
+    view.destroy();
+  });
+
   it("core-driven undo/redo dispatches are not echoed back into applyEdit", async () => {
     const core = new MockCore();
     const applySpy = vi.spyOn(core, "applyEdit");
