@@ -13,3 +13,6 @@ pulldown-cmark = { workspace = true }
 [dev-dependencies]
 comrak = { version = "0.53.0", default-features = false }
 rand = "0.8"
+# perf_baseline.rs only: replicates oxidown-wasm's exact decoration-JSON
+# serialization step natively (wasm-bindgen/js-sys don't link off wasm32).
+serde_json = "1"
