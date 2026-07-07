@@ -94,27 +94,49 @@
 //!   right after each affected line's quote prefix; outdent removes
 //!   `min(delta, that line's own marker column)` (clamped independently per
 //!   line, so a shallower descendant than expected never goes negative).
-//! * **Paragraph-interruption guard** (structural, not cosmetic): after
-//!   computing the batch, if the FIRST affected line's marker is ordered
-//!   with number != 1, check whether it lands where an ordered list of the
-//!   same delimiter flavor is already open — scan upward from its post-edit
-//!   position past consecutive same-quote-depth item lines whose (post-edit)
-//!   marker column is STRICTLY GREATER than its new column, landing on the
-//!   nearest line with column <= the new column. If the landing line is an
-//!   item at column == the new column whose marker is also ordered with the
-//!   SAME delimiter (`.` vs `)`), the moved item joins that open list and
-//!   any number is valid → no rewrite. Otherwise (shallower landing,
-//!   different marker family, or the scan broke on a non-item/other-depth
-//!   line) the moved item would START a new list in paragraph-interruption
-//!   position, which CommonMark refuses for ordered markers != 1 — the line
-//!   would silently degrade to lazy-continuation text. Rewrite its digits
-//!   to `1` (`2.` → `1.`, `10.` → `1.`) as an extra splice in the SAME
-//!   batch/undo unit. Only the moved line is ever rewritten — no COSMETIC
-//!   renumbering of siblings (that is view territory, per research/07).
-//!   Accepted v1 imprecision: `10.` → `1.` shrinks the marker token width
-//!   by one, so the line's descendants (shifted by the pre-rewrite delta)
-//!   may sit one column past the ideal content column — still valid
-//!   nesting.
+//! * **Paragraph-interruption guard** (structural, not cosmetic): a non-1
+//!   ordered marker cannot START a new list in paragraph-interruption
+//!   position per CommonMark — such a line silently degrades to
+//!   lazy-continuation text. After computing the batch, TWO lines are
+//!   checked with the same landing-scan rule, and rewritten (digits → `1`,
+//!   `2.` → `1.`, `10.` → `1.`, extra splice in the SAME batch/undo unit)
+//!   when they fail it:
+//!
+//!   1. the FIRST affected line (the moved item itself), at its new column;
+//!   2. the first UNAFFECTED item line BELOW the affected set, at its own
+//!      unchanged column — found by walking down from the last affected
+//!      line over consecutive same-quote-depth item lines, skipping ADOPTED
+//!      descendants (post-edit column strictly greater than the moved
+//!      line's new column; they nest under the moved block and stay items
+//!      with it), stopping at a non-item/blank line or quote-depth change.
+//!      The command never touched this line, but the edit restructured the
+//!      parse context above it (e.g. outdenting a nested bullet to top
+//!      level puts a following `3.` sibling against the new bullet list
+//!      instead of the outer ordered list it used to continue); keeping it
+//!      a list item is part of the command's contract, and its displayed
+//!      number is cosmetic (view-computed numbering, research/07).
+//!
+//!   The landing-scan rule, for a line at post-edit column `c`: scan upward
+//!   past consecutive same-quote-depth item lines whose POST-EDIT marker
+//!   column (affected lines shift by the batch's per-line change) is
+//!   STRICTLY GREATER than `c`, landing on the nearest line with column
+//!   <= `c`. If the landing line is an item at column == `c` whose marker
+//!   is also ordered with the SAME delimiter (`.` vs `)`), the checked item
+//!   JOINS that open list — any number is valid — no rewrite. Otherwise
+//!   (shallower landing, different marker family, or the scan broke on a
+//!   non-item/other-depth line) it would start a new list → rewrite.
+//!
+//!   No COSMETIC renumbering of siblings ever happens (view territory, per
+//!   research/07). Accepted v1 imprecision: `10.` → `1.` shrinks the marker
+//!   token width by one, so the line's descendants (shifted by the
+//!   pre-rewrite delta) may sit one column past the ideal content column —
+//!   still valid nesting.
+//! * **Adoption**: outdenting an item past a following equal-column sibling
+//!   makes that sibling (and anything deeper) a CHILD of the outdented item
+//!   on reparse — its column now exceeds the moved item's new content
+//!   column. This is intended standard outliner behavior (the sibling keeps
+//!   its itemness; a later re-indent of the parent carries it along as part
+//!   of the subtree).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -696,18 +718,30 @@ fn plan_list_nesting(
         return Some(no_op());
     }
 
-    // Paragraph-interruption guard (see the module doc comment): a moved
-    // non-1 ordered item that would START a new list — rather than join an
+    // Paragraph-interruption guard (see the module doc comment): a non-1
+    // ordered item that would START a new list — rather than join an
     // already-open same-delimiter ordered list at its landing column — is
     // refused by CommonMark in paragraph-interruption position and would
-    // silently degrade to lazy-continuation text. Rewrite its digits to "1"
-    // in the same batch. The first affected line's own splice is batch[0]
-    // (it is the minimum start of the affected set and always contributes),
-    // and the rewrite lands after it but before the next line's splice, so
-    // index 1 keeps the batch ascending and non-overlapping.
+    // silently degrade to lazy-continuation text. Two lines can end up in
+    // that position:
+    //
+    // 1. The moved (first affected) line itself. Its own splice is batch[0]
+    //    (it is the minimum start of the affected set and always
+    //    contributes), and the rewrite lands after it but before the next
+    //    line's splice, so index 1 keeps the batch ascending.
+    // 2. The first UNAFFECTED item line below the affected set (skipping
+    //    adopted descendants — see `below_line_rewrite`): the edit changed
+    //    the parse context ABOVE that line even though the command never
+    //    touched it. Its rewrite is on a later line than every whitespace
+    //    splice, so appending keeps the batch ascending.
     let new_col = if indent { first_col + delta } else { first_col - delta };
-    if let Some(rewrite) = interruption_rewrite(nodes, bytes, first, new_col) {
+    if let Some(rewrite) = interruption_rewrite(nodes, bytes, first, new_col, &affected, delta, indent) {
         batch.insert(1, rewrite);
+    }
+    if let Some(rewrite) =
+        below_line_rewrite(nodes, bytes, &affected, first_depth, new_col, delta, indent)
+    {
+        batch.push(rewrite);
     }
 
     // Selection maps through the batch like any other command (Bias::After:
@@ -745,48 +779,76 @@ fn ordered_marker(bytes: &[u8], item_start: usize) -> Option<(usize, bool, u8)> 
     Some((i - item_start, significant == b"1", delim))
 }
 
-/// Paragraph-interruption guard for the FIRST affected line (module doc
-/// comment, "Paragraph-interruption guard"): returns the digit-rewrite
-/// splice (pre-edit coordinates — the whitespace edits never touch the
-/// digits, so pre- and post-edit digit spans are the same bytes) when the
-/// moved line's non-1 ordered marker would start a new list rather than
-/// join an open one, `None` when no rewrite is needed. The landing scan
-/// reads pre-edit lines: everything ABOVE the first affected line is
-/// untouched by the batch (the affected set only extends downward), so
-/// pre-edit columns above are already the post-edit ones.
+/// A line's marker column as it will read AFTER the edit: affected lines
+/// shift by the batch's per-line whitespace change (`+delta` for indent,
+/// `-min(delta, col)` for outdent — the same clamp the batch applies);
+/// unaffected lines keep their pre-edit column.
+fn post_edit_col(
+    ctx: &ListLineCtx,
+    col: usize,
+    affected: &BTreeMap<usize, ListLineCtx>,
+    delta: usize,
+    indent: bool,
+) -> usize {
+    if !affected.contains_key(&ctx.start) {
+        return col;
+    }
+    if indent {
+        col + delta
+    } else {
+        col - delta.min(col)
+    }
+}
+
+/// Paragraph-interruption guard for one line (module doc comment,
+/// "Paragraph-interruption guard"): returns the digit-rewrite splice
+/// (pre-edit coordinates — the whitespace edits never touch the digits, so
+/// pre- and post-edit digit spans are the same bytes) when `line`'s non-1
+/// ordered marker, sitting at `line_col_post` after the edit, would start a
+/// new list rather than join an open one; `None` when no rewrite is needed.
+/// The landing scan uses post-edit columns throughout (`post_edit_col`):
+/// for the first-affected-line check the scan only crosses lines ABOVE the
+/// affected set (identity mapping), but the below-line check's scan crosses
+/// the affected set itself, whose columns the batch changes.
 fn interruption_rewrite(
     nodes: &[Node],
     bytes: &[u8],
-    first: &ListLineCtx,
-    new_col: usize,
+    line: &ListLineCtx,
+    line_col_post: usize,
+    affected: &BTreeMap<usize, ListLineCtx>,
+    delta: usize,
+    indent: bool,
 ) -> Option<ByteSplice> {
-    let (item_start, _) = first.marker?;
+    let (item_start, _) = line.marker?;
     let (digit_len, is_one, delim) = ordered_marker(bytes, item_start)?;
     if is_one {
         return None; // "1." can interrupt anything; never rewritten
     }
     // Landing scan: skip consecutive same-quote-depth item lines strictly
-    // deeper than the new column; the first line that isn't is the landing.
+    // deeper than the checked line's post-edit column; the first line that
+    // isn't is the landing.
     let mut joins = false;
-    let mut cursor = first.start;
+    let mut cursor = line.start;
     while let Some(range) = prev_line(bytes, cursor) {
         let ctx = list_line_ctx(nodes, bytes, range.clone());
-        if ctx.quote_depth != first.quote_depth {
+        if ctx.quote_depth != line.quote_depth {
             break; // landing outside the quote context: not an open list
         }
         let Some((land_start, _)) = ctx.marker else {
             break; // landing on a non-item line: not an open list
         };
-        let col = land_start - ctx.quote_end;
-        if col > new_col {
+        let col = post_edit_col(&ctx, land_start - ctx.quote_end, affected, delta, indent);
+        if col > line_col_post {
             cursor = range.start;
             continue;
         }
-        // Landing line: the moved item joins an open list only at an EQUAL
-        // column with the SAME ordered delimiter flavor ('.' vs ')') — a
-        // shallower item or a different family means the moved item starts
-        // a NEW list where a non-1 ordered marker cannot interrupt.
-        joins = col == new_col
+        // Landing line: the checked item joins an open list only at an
+        // EQUAL column with the SAME ordered delimiter flavor ('.' vs ')')
+        // — a shallower item or a different family means it starts a NEW
+        // list where a non-1 ordered marker cannot interrupt. (A landing
+        // line the FIRST guard rewrites keeps its delimiter — only digits
+        // change — so this family check is stable across the two guards.)
+        joins = col == line_col_post
             && ordered_marker(bytes, land_start).is_some_and(|(_, _, d)| d == delim);
         break;
         // Scan exhaustion (document start) would leave `joins` false and
@@ -801,6 +863,46 @@ fn interruption_rewrite(
         delete: digit_len,
         insert: "1".into(),
     })
+}
+
+/// Below-context paragraph-interruption guard: the edit can change the
+/// parse context of a line BELOW the affected set that the command never
+/// touched (e.g. outdenting a nested bullet to top level makes a following
+/// `3.` sibling — previously continuing the open outer ordered list — sit
+/// against the new bullet list instead, where a non-1 ordered marker
+/// cannot start a list). Walk down from the last affected line over
+/// consecutive same-quote-depth item lines, SKIPPING adopted descendants
+/// (post-edit column strictly greater than the moved line's new column —
+/// they nest under the moved block, whose itemness the first guard already
+/// preserves); the first item line at column <= the new column is the one
+/// whose landing the edit re-anchored — run the same landing-scan check on
+/// it at its own (unchanged) column. Stops at a non-item/blank line or
+/// quote-depth change, like every other scan here.
+fn below_line_rewrite(
+    nodes: &[Node],
+    bytes: &[u8],
+    affected: &BTreeMap<usize, ListLineCtx>,
+    root_depth: u8,
+    root_post_col: usize,
+    delta: usize,
+    indent: bool,
+) -> Option<ByteSplice> {
+    let last = affected.values().next_back()?;
+    let mut cursor_end = last.end;
+    loop {
+        let range = next_line(bytes, cursor_end)?;
+        let ctx = list_line_ctx(nodes, bytes, range.clone());
+        if ctx.quote_depth != root_depth {
+            return None;
+        }
+        let (item_start, _) = ctx.marker?;
+        let col = item_start - ctx.quote_end; // unaffected: pre == post
+        if col > root_post_col {
+            cursor_end = range.end; // adopted descendant of the moved block
+            continue;
+        }
+        return interruption_rewrite(nodes, bytes, &ctx, col, affected, delta, indent);
+    }
 }
 
 /// Indent every list-item line intersecting `[from_b, to_b]` — plus, for

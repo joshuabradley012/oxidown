@@ -7,10 +7,12 @@
 //! *including delimiters*, with boundary positions counting as intersecting
 //! (a cursor sitting immediately before or after a delimiter reveals).
 //! Revealed nodes emit `mark:delim` for their delimiter spans instead of
-//! `conceal`. Nodes reveal independently, so nesting works per-node. A task
-//! widget uses an alternate, larger extent for this predicate (see
-//! `parser::Node::reveal_extent`) — the *list item's* marker extent, per the
-//! contract, so that clicking the rendered checkbox still reveals.
+//! `conceal`. Nodes reveal independently, so nesting works per-node.
+//! Line-prefix marker constructs (list markers, task widgets, nested indent,
+//! blockquote runs) use an alternate extent for this predicate — their WHOLE
+//! LINE (see `parser::Node::reveal_extent`; contract v0.3): a cursor anywhere
+//! on the line reveals all of its markers, matching heading semantics.
+//! Fence lines likewise use the whole fenced block (block-level reveal).
 //!
 //! Composition stability (contract, model rule 5): while a session is active,
 //! any conceal span intersecting the composition range is emitted as

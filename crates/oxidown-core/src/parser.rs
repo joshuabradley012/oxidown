@@ -44,14 +44,12 @@ pub enum NodeKind {
     /// A fenced code block's body line.
     CodeBlockLine,
     ThematicBreak,
-    /// A list item's marker span (`- `, `1. `, `1) `, or the bullet portion
-    /// of a task item before its checkbox). Always visible, never concealed.
     /// A list-item marker run (`"- "`, `"1. "`). `task` marks the marker of
-    /// a task item, which conceals/reveals in lockstep with its checkbox
-    /// (shared reveal extent: the combined `- [ ]` run). Reveal is
-    /// Obsidian-style — only when the caret directly touches the marker
-    /// region. `depth` is the 1-based list nesting depth (drives the view's
-    /// hanging-indent line decoration).
+    /// a task item, which conceals/reveals in lockstep with its checkbox.
+    /// Reveal is LINE-level (contract v0.3, matching headings): the reveal
+    /// extent is the item's whole first line, so a caret anywhere on the
+    /// line reveals every marker construct on it. `depth` is the 1-based
+    /// list nesting depth (drives the view's hanging-indent line decoration).
     ListMarker { task: bool, depth: u8 },
     /// The leading indentation whitespace of a NESTED list item (depth >= 2).
     /// Emits a `line:list-item` decoration carrying the depth (the view
@@ -82,10 +80,10 @@ pub struct Node {
     /// emitted as `mark:url` when the node is revealed.
     pub url: Option<Range<usize>>,
     /// Alternate extent used for the reveal *predicate* only (not for
-    /// viewport filtering, which still uses `extent`). Currently only the
-    /// task widget: the reveal extent is the list item's marker extent
-    /// (bullet through the closing `]`), per the contract, so that clicking
-    /// the rendered checkbox — which sits inside that range — still reveals.
+    /// viewport filtering, which still uses `extent`). List markers, nested
+    /// indents, and task widgets carry their item's WHOLE LINE (line-level
+    /// reveal, contract v0.3); fence lines carry the whole fenced block
+    /// (block-level reveal).
     pub reveal_extent: Option<Range<usize>>,
     /// The enclosing list item's full extent — only present for task
     /// widgets, where the `toggleTask` command needs "pos anywhere in the
@@ -257,45 +255,33 @@ pub fn parse_document(src: &str) -> ParseResult {
                     vec![],
                 ));
             }
-            // Obsidian-style reveal: only when the caret is directly next to
-            // the marker GLYPHS — `-`/`1.` (trailing whitespace trimmed from
-            // the reveal extent, so "next to the space" does not reveal), or
-            // for tasks the combined `- [ ]` run through the closing `]`.
-            // The nested indent's reveal extent is widened to the same end,
-            // so a revealed marker always shows its raw leading spaces too —
-            // true source geometry, no invisible indentation.
-            let mut glyph_end = range.start;
-            while glyph_end > item_start && matches!(bytes[glyph_end - 1], b' ' | b'\t') {
-                glyph_end -= 1;
-            }
-            let reveal_end = if let Event::TaskListMarker(_) = &event {
-                range.end
-            } else {
-                glyph_end
-            };
+            // Reveal is LINE-level (matching headings, contract v0.3): a
+            // cursor/selection touching ANY part of the item's first line
+            // reveals its marker constructs — the marker glyphs, the task
+            // brackets, and the nested leading indent all flip to source in
+            // lockstep. (Replaces the earlier glyph-adjacency model: reveal
+            // no longer depends on which character the caret touches.)
+            let line = line_bounds(bytes, item_start);
             if item_depth >= 2 && ws_start < item_start {
                 if let Some(last) = nodes.last_mut() {
                     if matches!(last.kind, NodeKind::ListItemIndent { .. }) {
-                        last.reveal_extent = Some(ws_start..reveal_end);
+                        last.reveal_extent = Some(line.clone());
                     }
                 }
             }
-            // Reveal extents extend LEFT over the leading whitespace: a caret
-            // in the nesting spaces also opens the edit view (changing the
-            // nesting level needs the raw indent visible).
             if let Event::TaskListMarker(checked) = &event {
                 if range.start > item_start {
                     let mut marker = leaf(NodeKind::ListMarker { task: true, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
-                    marker.reveal_extent = Some(ws_start..range.end);
+                    marker.reveal_extent = Some(line.clone());
                     nodes.push(marker);
                 }
                 let mut task = leaf(NodeKind::TaskWidget { checked: *checked }, range.clone(), range.end..range.end, vec![]);
-                task.reveal_extent = Some(ws_start..range.end);
+                task.reveal_extent = Some(line.clone());
                 task.item_extent = Some(item);
                 nodes.push(task);
             } else if range.start > item_start {
                 let mut marker = leaf(NodeKind::ListMarker { task: false, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
-                marker.reveal_extent = Some(ws_start..glyph_end);
+                marker.reveal_extent = Some(line);
                 nodes.push(marker);
             }
         }
@@ -362,17 +348,11 @@ pub fn parse_document(src: &str) -> ParseResult {
             }
             let delims = blockquote_markers(bytes, line.clone());
             let _ = depth; // depth of the enclosing top-level interval; line_depth is authoritative
-            let mut node = leaf(NodeKind::BlockQuoteLine(line_depth), line.clone(), line.end..line.end, delims);
-            // Obsidian-style reveal: only when the caret is directly next to
-            // (touching) the `>` marker glyphs — trailing whitespace trimmed,
-            // so "next to the space" does not reveal.
-            if let (Some(f), Some(l)) = (node.delims.first(), node.delims.last()) {
-                let mut e = l.end;
-                while e > f.start && matches!(bytes[e - 1], b' ' | b'\t') {
-                    e -= 1;
-                }
-                node.reveal_extent = Some(f.start..e);
-            }
+            // Reveal is LINE-level (matching headings, contract v0.3): the
+            // node's extent IS the line (terminator excluded by split_lines),
+            // and the default reveal predicate uses the extent — a cursor
+            // anywhere on the line reveals the `>` run.
+            let node = leaf(NodeKind::BlockQuoteLine(line_depth), line.clone(), line.end..line.end, delims);
             nodes.push(node);
         }
     }
@@ -613,6 +593,24 @@ fn thematic_break_node(bytes: &[u8], range: Range<usize>) -> Option<Node> {
 /// Split a byte range into per-source-line sub-ranges, each excluding its
 /// own trailing `\n` (and a preceding `\r`, for CRLF). A final line with no
 /// trailing terminator (partial line at the range's end) is still included.
+/// The full line containing `pos`: from just after the previous `\n` through
+/// the line's end, terminator excluded (same bounds discipline as
+/// `split_lines`). Used for LINE-level reveal extents (contract v0.3).
+fn line_bounds(bytes: &[u8], pos: usize) -> Range<usize> {
+    let mut start = pos;
+    while start > 0 && bytes[start - 1] != b'\n' {
+        start -= 1;
+    }
+    let mut end = pos;
+    while end < bytes.len() && bytes[end] != b'\n' {
+        end += 1;
+    }
+    if end > start && end < bytes.len() && bytes.get(end - 1) == Some(&b'\r') {
+        end -= 1;
+    }
+    start..end
+}
+
 fn split_lines(bytes: &[u8], range: Range<usize>) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut pos = range.start;
@@ -903,8 +901,8 @@ mod tests {
         assert_eq!(widgets.len(), 2);
         assert_eq!(widgets[0].extent, 2..5);
         assert_eq!(widgets[0].kind, NodeKind::TaskWidget { checked: false });
-        // Obsidian-style reveal: the combined `- [ ]` marker run.
-        assert_eq!(widgets[0].reveal_extent, Some(0..5));
+        // LINE-level reveal (contract v0.3): the whole item line.
+        assert_eq!(widgets[0].reveal_extent, Some(0..10));
         assert_eq!(widgets[1].kind, NodeKind::TaskWidget { checked: true });
     }
 

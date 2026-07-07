@@ -191,39 +191,35 @@ M1 emission scope (parser may understand more than it decorates):
   body) reveals BOTH raw fences as `mark:delim`, so they are editable whenever the block is.
 - Lists — ordered markers emit `mark:list-marker` (always visible; alignment is view styling:
   fixed-width right-aligned box + tabular numerals). **Unordered markers emit `widget:bullet`
-  replacing the whole marker span (`"- "`)**, revealed as `mark:list-marker` under STRICT
-  interior overlap (`a < end && b > start`) — the cursor at the item text's first character or
-  at line start does not flash the raw marker. **Marker reveal is Obsidian-style adjacency**:
-  the reveal extent is the marker region itself (closed-interval touch) — the `- ` run, or for
-  task items the combined `- [ ]` run (dash and brackets reveal in LOCKSTEP, as `mark:delim`).
-  A caret in the item's text does NOT reveal; a caret directly next to the marker does.
+  replacing the whole marker span (`"- "`)**, revealed as `mark:list-marker`. Task markers
+  conceal (the checkbox widget represents the item) and reveal as `mark:delim`, dash and
+  brackets in lockstep.
 - **Every list item line** emits `{kind:"line", style:"list-item", depth, revealed?}` (1-based
   depth) at the marker position — the view uses it for hanging indent (wrapped item text aligns
   with the first line's text). Nested items (depth ≥ 2) additionally emit a `conceal` over the
   raw leading indent whitespace (revealed as `mark:delim`); the view supplies exact per-depth
   padding (1.5em per level) so each nested marker starts at its parent's text column.
-- **`revealed: true` on `blockquote`/`list-item` lines** means THAT CONSTRUCT's marker region
-  is being edited (caret adjacent). The flag is PER CONSTRUCT, not per line: on a mixed line
-  (`> > - item`) the `blockquote` and `list-item` line decorations carry independent flags,
-  and the view drops only the revealed construct's geometry — a revealed list item loses its
-  hanging indent/marker box but an unrevealed blockquote on the same line KEEPS its bars and
-  quote padding (and vice versa). Any revealed construct puts the line in source styling
-  (`ox-src`: marker boxes neutralized) so revealed markers render at natural width.
-  Reveal extents are per MARKER RUN: the blockquote run (all `> ` glyphs on the line, trailing
-  whitespace trimmed) and the list marker (leading indent whitespace + glyphs) are separate,
-  independently-revealed extents. They may share a boundary character (the space between `>`
-  and `-` is the quote run's separator AND the bullet's leading whitespace), so a caret there
-  reveals both; but a caret touching only the bullet edits `- ` as source while the `> > `
-  prefix stays concealed, and a caret at line start (left edge of `>`) reveals only the quote
-  run while the bullet stays a widget. Deeply nested prefixes are therefore edited PIECEWISE,
-  construct by construct — never all-or-nothing.
+- **Marker reveal is LINE-level (v0.3 amendment — matching headings).** The reveal extent of
+  every line-prefix marker construct — the blockquote `> ` run, the list marker, a task item's
+  `- [ ]` pair, and the nested leading indent — is the construct's whole line (terminator
+  excluded, closed-interval touch like every reveal extent). A cursor/selection touching ANY
+  part of the line therefore reveals ALL of that line's marker constructs together as raw
+  source, and every other line is untouched. This replaces v0.2's glyph-adjacency/piecewise
+  model: reveal no longer depends on which character the caret touches, and mixed prefixes
+  (`> > - item`) reveal all-or-nothing per line. The `revealed` flags on `blockquote` and
+  `list-item` line decorations remain PER CONSTRUCT in the schema (forward compatibility), but
+  under line-level extents they are always equal on a given line; a revealed line renders in
+  full source geometry (the view drops decorative padding/bars/indent and neutralizes marker
+  boxes — `ox-src`). Fenced-code reveal stays BLOCK-level; inline marks (strong/em/code/strike/
+  link) keep per-node reveal.
 - Thematic break — `line:hr` on the line, plus `conceal` over the raw dashes (revealed as
   `mark:delim` when the cursor is on the line). The view draws the actual rule on the hr line;
   nested blockquote bars are likewise the view's job (one bar per depth level).
 - Headings/strong/em/inline-code unchanged from v0.
 
-Reveal semantics are unchanged: per-node selection∩extent (task widget reveal = the LIST ITEM's
-marker extent, so clicking the rendered checkbox — which sits inside the range — still works).
+Reveal semantics are otherwise unchanged: per-node selection∩extent — for marker constructs
+that extent is the whole line (above), so clicking the rendered checkbox, which sits inside
+its own line, still reveals/toggles correctly.
 
 ## Core-driven changes (generalization of the undo rule)
 
@@ -320,37 +316,64 @@ line plus its subtree (deduplicated, applied in document order) is the final aff
   quote prefix on every line in it (clamped independently per line, so a shallower-than-expected
   descendant never goes negative).
 
+Adoption: outdenting an item past a following EQUAL-column sibling makes that sibling (and
+anything deeper under it) a CHILD of the outdented item on reparse — its column now exceeds the
+moved item's new content column. This is intended, standard outliner behavior: the sibling keeps
+its itemness, and a later re-indent of the moved item carries the adoptee along as part of its
+subtree (the round trip restores structure, not necessarily the byte-identical original shape).
+
 Renumbering: there is no COSMETIC renumbering of siblings — presenting `1./1./1.` sources as
-`1./2./3.` is the view's computed-number territory (research/07), and the command never touches
-lines the user didn't move. But the command DOES perform one minimal STRUCTURAL rewrite on the
-moved item itself, because CommonMark would otherwise refuse to parse the command's own output
-as a list item:
+`1./2./3.` is the view's computed-number territory (research/07). But the command DOES perform a
+minimal STRUCTURAL digit rewrite where CommonMark would otherwise refuse to parse the command's
+own output as list items:
 
 **Paragraph-interruption guard.** Per CommonMark, an ordered marker whose number != 1 cannot
 START a new list in paragraph-interruption position — indenting `2. b` directly under `1. a`'s
 open paragraph would make `   2. b` reparse as LAZY CONTINUATION text of item 1, silently
 de-listing the moved item (and stranding its carried subtree), after which Shift-Tab finds no
-item line and falls back. To prevent this, after computing the batch (indent AND outdent both),
-the FIRST affected line is checked with a deterministic structural rule (identical in the Rust
-core and the mock — a shared rule, not post-hoc parser validation, so both cores agree even
-where their parsers differ in leniency):
+item line and falls back. The same failure can hit a line the command never touched: the edit
+restructures the parse context BELOW the affected set — e.g. outdenting `   - bullet` (nested
+under `2. ordered`) to top level makes a following `3. ordered` sibling, which used to CONTINUE
+the open outer ordered list, now sit against the new top-level bullet list, where its non-1
+marker cannot start a list → it de-lists without ever being edited.
 
-- If the first affected line's marker is ordered with number != 1 (numeric — `01.` counts
-  as 1): scan upward from its post-edit position past consecutive same-quote-depth list-item
-  lines whose (post-edit) marker column is STRICTLY GREATER than its new column; land on the
-  nearest line with column <= the new column. (Lines above the first affected line are untouched
-  by the batch, so their pre-edit columns are already post-edit.)
-- If the landing line is a list-item line at column EQUAL to the new column whose marker is
-  also ordered with the SAME delimiter flavor (`.` vs `)`), the moved item JOINS that
-  already-open ordered list — any number is valid there — and nothing is rewritten
-  (e.g. Tab on `2. b` in `1. a` / `   1. a1` / `2. b` keeps `   2. b`).
+To prevent both, after computing the batch (indent AND outdent alike), TWO lines are checked
+with one deterministic structural rule (identical in the Rust core and the mock — a shared rule,
+not post-hoc parser validation, so both cores agree even where their parsers differ in
+leniency):
+
+1. the FIRST affected line (the moved item itself), at its new column;
+2. the first UNAFFECTED list-item line BELOW the affected set, at its own (unchanged) column —
+   found by walking down from the last affected line over consecutive same-quote-depth item
+   lines, SKIPPING adopted descendants (column strictly greater than the moved line's new
+   column: they nest under the moved block, whose itemness check 1 already covers), and stopping
+   at a non-item/blank line or quote-depth change like every other scan in this section.
+
+The landing-scan rule, for a checked line that will sit at column `c` after the edit:
+
+- Only ordered markers with number != 1 are ever candidates (numeric — `01.` counts as 1;
+  bullets and `1.`/`1)` are always safe).
+- Scan upward from the checked line past consecutive same-quote-depth list-item lines whose
+  POST-EDIT marker column is STRICTLY GREATER than `c` (affected lines count at their post-edit
+  columns — the batch's per-line shift; unaffected lines at their unchanged ones); land on the
+  nearest line with column <= `c`.
+- If the landing line is a list-item line at column EQUAL to `c` whose marker is also ordered
+  with the SAME delimiter flavor (`.` vs `)`), the checked item JOINS that already-open ordered
+  list — any number is valid there — and nothing is rewritten (e.g. Tab on `2. b` in `1. a` /
+  `   1. a1` / `2. b` keeps `   2. b`).
 - Otherwise (landing on a shallower item, a different marker family — e.g. a bullet list open
-  at that column — or the scan broke on a non-item or different-quote-depth line), the moved
+  at that column — or the scan broke on a non-item or different-quote-depth line), the checked
   item would START a new list in interruption position: its digits are rewritten to `1`
   (`2.` → `1.`, `10.` → `1.`) as additional splice(s) in the SAME batch and undo unit.
 
-The moved line is text the user explicitly commanded to transform, so this does not violate the
-never-rewrite-unedited-bytes invariant; only the moved item's own digits are ever touched.
+The moved line is text the user explicitly commanded to transform. The below line is not — but
+the command restructured that line's parse context, and keeping every pre-edit list item a list
+item is part of the command's contract (the whole-document invariant: itemness may never be
+destroyed by indent/outdent; marker digits may change). Its displayed number is cosmetic per
+CommonMark — view-computed numbering (research/07) renders sequence numbers correctly regardless
+of the raw digits. So neither rewrite violates the never-rewrite-unedited-bytes invariant's
+intent; only marker digits of at most those two lines are ever touched.
+
 Accepted v1 imprecision: `10.` → `1.` shrinks the marker token width by one, so the moved
 item's descendants (shifted by the pre-rewrite delta) may sit one column past the ideal content
 column — still valid nesting, just not byte-ideal.
@@ -358,8 +381,8 @@ column — still valid nesting, just not byte-ideal.
 Selection: the cursor/selection maps through the inserted/removed spaces (existing
 mapping/anchor machinery), so it stays logically attached to the same character.
 
-Undo: one undo unit for the whole affected set (however many lines it touches); undo restores
-every line at once.
+Undo: one undo unit for the whole affected set (however many lines it touches, digit rewrites
+included); undo restores every line at once.
 
 ## Streaming (plan §5.9)
 

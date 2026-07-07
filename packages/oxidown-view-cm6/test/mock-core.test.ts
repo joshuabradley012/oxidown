@@ -478,28 +478,25 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     ]);
   });
 
-  it("blockquote (depth 1): reveal only when the caret touches the marker run", () => {
+  it("blockquote (depth 1): LINE-level reveal, matching headings (v0.3)", () => {
     const doc = "> hello\nworld";
     const { core } = makeCore(doc);
+    // Cursor on the OTHER line: markers concealed, line not revealed.
     const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
     expect(lines(ds)).toEqual([{ kind: "line", at: 0, style: "blockquote", depth: 1 }]);
     expect(conceals(ds)).toEqual([{ kind: "conceal", from: 0, to: 2 }]);
 
-    // Cursor in the quote TEXT — and even at the position right after the
-    // marker's trailing space — still concealed (glyph adjacency only).
-    for (const pos of [2, 4]) {
-      const inText = core.decorations(core.revision(), 0, doc.length, cursor(pos));
-      expect(conceals(inText)).toEqual([{ kind: "conceal", from: 0, to: 2 }]);
+    // Caret anywhere on the quote line — marker, text, or line end — shows
+    // raw markers + revealed-flagged line (the view drops the bar/padding
+    // to show source geometry).
+    for (const pos of [0, 1, 2, 4, 7]) {
+      const revealed = core.decorations(core.revision(), 0, doc.length, cursor(pos));
+      expect(conceals(revealed)).toEqual([]);
+      expect(marks(revealed, "delim")).toEqual([{ kind: "mark", from: 0, to: 2, style: "delim" }]);
+      expect(lines(revealed)).toEqual([
+        { kind: "line", at: 0, style: "blockquote", depth: 1, revealed: true },
+      ]);
     }
-
-    // Caret adjacent to the `>` glyph: raw markers + revealed-flagged line
-    // (the view drops the bar/padding to show source geometry).
-    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(1));
-    expect(conceals(revealed)).toEqual([]);
-    expect(marks(revealed, "delim")).toEqual([{ kind: "mark", from: 0, to: 2, style: "delim" }]);
-    expect(lines(revealed)).toEqual([
-      { kind: "line", at: 0, style: "blockquote", depth: 1, revealed: true },
-    ]);
   });
 
   it("fenced code block: fence lines styled + raw fences concealed, revealed per line", () => {
@@ -539,41 +536,40 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     expect(conceals(revealed)).toEqual([]);
   });
 
-  it("bullets are widgets with ADJACENCY reveal; ordered markers stay marks", () => {
+  it("bullets are widgets with LINE-level reveal; ordered markers stay marks", () => {
     const doc = "- item\n1. other";
     const { core } = makeCore(doc);
-    // Cursor in the first item's TEXT: bullet stays a widget (Obsidian-style).
-    const ds = core.decorations(core.revision(), 0, doc.length, cursor(4));
+    // Cursor on the SECOND line: the first item's bullet stays a widget.
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(12));
     expect(ds.filter((d) => d.kind === "widget")).toEqual([
       { kind: "widget", from: 0, to: 2, widget: "bullet" },
     ]);
     expect(marks(ds, "list-marker")).toEqual([
       { kind: "mark", from: 7, to: 10, style: "list-marker" },
     ]);
-    // Every item line carries a list-item line decoration (hanging indent).
+    // Every item line carries a list-item line decoration (hanging indent);
+    // the cursor's own line is flagged revealed (LINE-level, v0.3).
     expect(lines(ds)).toEqual([
       { kind: "line", at: 0, style: "list-item", depth: 1 },
-      { kind: "line", at: 7, style: "list-item", depth: 1 },
+      { kind: "line", at: 7, style: "list-item", depth: 1, revealed: true },
     ]);
-    // Caret directly next to the `-` GLYPH (touching [0, 1]) reveals it and
-    // flags the line; the position after the trailing space does NOT.
-    const afterSpace = core.decorations(core.revision(), 0, doc.length, cursor(2));
-    expect(afterSpace.filter((d) => d.kind === "widget")).toEqual([
-      { kind: "widget", from: 0, to: 2, widget: "bullet" },
-    ]);
-    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(1));
-    expect(revealed.filter((d) => d.kind === "widget")).toEqual([]);
-    expect(marks(revealed, "list-marker")).toEqual([
-      { kind: "mark", from: 0, to: 2, style: "list-marker" },
-      { kind: "mark", from: 7, to: 10, style: "list-marker" },
-    ]);
-    expect(lines(revealed)[0]).toEqual({
-      kind: "line",
-      at: 0,
-      style: "list-item",
-      depth: 1,
-      revealed: true,
-    });
+    // Caret anywhere on the bullet line — marker, text, or line end —
+    // reveals the raw marker and flags the line.
+    for (const pos of [0, 1, 2, 4, 6]) {
+      const revealed = core.decorations(core.revision(), 0, doc.length, cursor(pos));
+      expect(revealed.filter((d) => d.kind === "widget")).toEqual([]);
+      expect(marks(revealed, "list-marker")).toEqual([
+        { kind: "mark", from: 0, to: 2, style: "list-marker" },
+        { kind: "mark", from: 7, to: 10, style: "list-marker" },
+      ]);
+      expect(lines(revealed)[0]).toEqual({
+        kind: "line",
+        at: 0,
+        style: "list-item",
+        depth: 1,
+        revealed: true,
+      });
+    }
     expect(conceals(ds)).toEqual([]);
   });
 
@@ -951,6 +947,107 @@ describe("MockCore indentList/outdentList (v0.2, marker-width-aware Tab nesting)
     expect(core.getText()).toBe("1. a\n   1. b\n");
     core.undo();
     expect(core.getText()).toBe("1. a\n2. b\n"); // digits AND indent restored together
+  });
+
+  // --- below-context interruption guard (parity with the Rust core) -------
+  //
+  // The edit can change the parse context of a line BELOW the affected set
+  // that the command never touched: the same landing-scan check runs on the
+  // first unaffected item line below (skipping adopted descendants).
+
+  const ORDERED_TORTURE =
+    "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n   - [x] a task nested under an ordered item\n3. ordered three\n";
+
+  it("outdenting the nested bullet rewrites the below '3.' it re-contexted and adopts the task", () => {
+    const { core } = makeCore(ORDERED_TORTURE);
+    const pos = ORDERED_TORTURE.indexOf("a bullet");
+    core.command("outdentList", pos, pos);
+    expect(core.getText()).toBe(
+      "1. ordered one\n2. ordered two\n   1. nested ordered item\n- a bullet nested under an ordered item\n   - [x] a task nested under an ordered item\n1. ordered three\n",
+    );
+  });
+
+  it("outdenting the nested task rewrites the below '3.' the same way", () => {
+    const { core } = makeCore(ORDERED_TORTURE);
+    const pos = ORDERED_TORTURE.indexOf("a task");
+    core.command("outdentList", pos, pos);
+    expect(core.getText()).toBe(
+      "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n- [x] a task nested under an ordered item\n1. ordered three\n",
+    );
+  });
+
+  it("the below line is byte-untouched when there is no interruption hazard", () => {
+    const pos = "1. a\n   - b\n- c\n".indexOf("b");
+    // A bullet below: never rewritten.
+    const a = makeCore("1. a\n   - b\n- c\n").core;
+    a.command("outdentList", pos, pos);
+    expect(a.getText()).toBe("1. a\n- b\n- c\n");
+    // An ordered "1." below: already safe.
+    const b = makeCore("1. a\n   - b\n1. c\n").core;
+    b.command("outdentList", pos, pos);
+    expect(b.getText()).toBe("1. a\n- b\n1. c\n");
+    // Below line continues the moved line's open same-flavor list.
+    const c = makeCore("1. a\n   1. b\n2. c\n").core;
+    c.command("outdentList", pos, pos);
+    expect(c.getText()).toBe("1. a\n1. b\n2. c\n");
+  });
+
+  it("user sequence: Shift-Tab x2 then Tab x2 on the nested bullet (one core)", () => {
+    const { core } = makeCore(ORDERED_TORTURE);
+    let pos = ORDERED_TORTURE.indexOf("a bullet");
+    const track = (c: { selection?: { head: number } | null } | null, p: number) =>
+      c?.selection ? c.selection.head : p;
+
+    let c = core.command("outdentList", pos, pos);
+    pos = track(c, pos);
+    expect(core.getText()).toBe(
+      "1. ordered one\n2. ordered two\n   1. nested ordered item\n- a bullet nested under an ordered item\n   - [x] a task nested under an ordered item\n1. ordered three\n",
+    );
+
+    c = core.command("outdentList", pos, pos); // top level: applies-but-no-op
+    expect(c!.splices).toEqual([]);
+    pos = track(c, pos);
+
+    c = core.command("indentList", pos, pos); // re-nest; adopted task carried
+    pos = track(c, pos);
+    expect(core.getText()).toBe(
+      "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n      - [x] a task nested under an ordered item\n1. ordered three\n",
+    );
+
+    c = core.command("indentList", pos, pos); // under the nested ordered item
+    pos = track(c, pos);
+    expect(core.getText()).toBe(
+      "1. ordered one\n2. ordered two\n   1. nested ordered item\n      - a bullet nested under an ordered item\n         - [x] a task nested under an ordered item\n1. ordered three\n",
+    );
+  });
+
+  it("user sequence: Shift-Tab x2 then Tab x2 on the nested task (one core)", () => {
+    const { core } = makeCore(ORDERED_TORTURE);
+    let pos = ORDERED_TORTURE.indexOf("a task");
+    const track = (c: { selection?: { head: number } | null } | null, p: number) =>
+      c?.selection ? c.selection.head : p;
+
+    let c = core.command("outdentList", pos, pos);
+    pos = track(c, pos);
+    expect(core.getText()).toBe(
+      "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n- [x] a task nested under an ordered item\n1. ordered three\n",
+    );
+
+    c = core.command("outdentList", pos, pos);
+    expect(c!.splices).toEqual([]);
+    pos = track(c, pos);
+
+    c = core.command("indentList", pos, pos);
+    pos = track(c, pos);
+    expect(core.getText()).toBe(
+      "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n   - [x] a task nested under an ordered item\n1. ordered three\n",
+    );
+
+    c = core.command("indentList", pos, pos); // under the bullet sibling (+2)
+    pos = track(c, pos);
+    expect(core.getText()).toBe(
+      "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n     - [x] a task nested under an ordered item\n1. ordered three\n",
+    );
   });
 });
 

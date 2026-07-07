@@ -25,10 +25,31 @@ fn apply_to_mirror(mirror: &mut String, splices: &[Splice]) {
     }
 }
 
+/// Line indices (0-based) of every line carrying its own list marker, per a
+/// fresh parse — the input to the indent/outdent whole-document invariant.
+fn item_line_indices(text: &str) -> Vec<usize> {
+    oxidown_core::parser::parse(text)
+        .iter()
+        .filter(|n| matches!(n.kind, oxidown_core::parser::NodeKind::ListMarker { .. }))
+        .map(|n| text[..n.extent.start].matches('\n').count())
+        .collect()
+}
+
 /// Run a command and verify the returned splices transform the mirror into
 /// the core's text (the "splices are what the VIEW needs" requirement).
+///
+/// For indentList/outdentList this additionally asserts the WHOLE-DOCUMENT
+/// itemness invariant — the acceptance bar for the paragraph-interruption
+/// guards: every line that parsed as a list item BEFORE the command still
+/// parses as a list item AFTER it (marker digits may differ; itemness may
+/// not). Neither command adds or removes lines, so line indices correspond.
 fn run(ed: &mut Editor, cmd: Command) -> Option<CoreChange> {
     let mut mirror = ed.get_text();
+    let is_nest = matches!(
+        cmd,
+        Command::IndentList { .. } | Command::OutdentList { .. }
+    );
+    let items_before = is_nest.then(|| item_line_indices(&mirror));
     let change = ed.command(cmd).unwrap()?;
     apply_to_mirror(&mut mirror, &change.splices);
     assert_eq!(
@@ -37,6 +58,17 @@ fn run(ed: &mut Editor, cmd: Command) -> Option<CoreChange> {
         "returned splices must reproduce the core's edit on the view buffer"
     );
     assert_eq!(change.revision, ed.revision());
+    if let Some(before) = items_before {
+        let after = item_line_indices(&ed.get_text());
+        for line in before {
+            assert!(
+                after.contains(&line),
+                "whole-doc invariant violated by {cmd:?}: line {line} was a list item \
+                 before the command and is not one after; result: {:?}",
+                ed.get_text()
+            );
+        }
+    }
     Some(change)
 }
 
@@ -827,4 +859,151 @@ fn outdent_onto_a_bullet_parent_rewrites_to_one() {
     run(&mut ed, Command::OutdentList { from: 16, to: 16 }).unwrap();
     assert_eq!(ed.get_text(), "- a\n  1. b\n1. c\n");
     assert_list_item_line(&ed, "1. c");
+}
+
+// ------------------------------- below-context interruption guard --
+//
+// The edit can change the parse context of a line BELOW the affected set
+// that the command never touched: outdenting a nested bullet to top level
+// puts a following non-1 ordered sibling against the new bullet list
+// instead of the outer ordered list it used to continue — without the
+// guard it de-lists (loses all list decorations). The guard runs the same
+// landing-scan check on the first unaffected item line below the affected
+// set (skipping adopted descendants).
+
+/// The demo doc's list torture block (apps/web-demo/src/sample-doc.ts).
+const ORDERED_TORTURE: &str = "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n   - [x] a task nested under an ordered item\n3. ordered three\n";
+
+#[test]
+fn outdent_bullet_rewrites_the_below_ordered_sibling_it_recontexted() {
+    let mut ed = Editor::new(1);
+    ed.load(ORDERED_TORTURE);
+    let pos = ORDERED_TORTURE.find("a bullet").unwrap(); // all-ASCII: byte == CU
+    run(&mut ed, Command::OutdentList { from: pos, to: pos }).unwrap();
+    assert_eq!(
+        ed.get_text(),
+        "1. ordered one\n2. ordered two\n   1. nested ordered item\n- a bullet nested under an ordered item\n   - [x] a task nested under an ordered item\n1. ordered three\n",
+        "the untouched '3.' line is guard-rewritten to '1.'; the task sibling is adopted"
+    );
+    // The below line the command never touched is still a list item...
+    assert_list_item_line(&ed, "1. ordered three");
+    // ...and the equal-column task sibling became the outdented bullet's
+    // CHILD (adoption — intended standard outliner behavior).
+    assert_list_item_line(&ed, "- [x] a task nested under an ordered item");
+}
+
+#[test]
+fn outdent_task_rewrites_the_below_ordered_sibling_the_same_way() {
+    let mut ed = Editor::new(1);
+    ed.load(ORDERED_TORTURE);
+    let pos = ORDERED_TORTURE.find("a task").unwrap();
+    run(&mut ed, Command::OutdentList { from: pos, to: pos }).unwrap();
+    assert_eq!(
+        ed.get_text(),
+        "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n- [x] a task nested under an ordered item\n1. ordered three\n",
+    );
+    assert_list_item_line(&ed, "1. ordered three");
+}
+
+#[test]
+fn below_line_untouched_when_no_interruption_hazard() {
+    // A bullet below: bullets always interrupt — never rewritten.
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n   - b\n- c\n");
+    let pos = "1. a\n   - b\n- c\n".find('b').unwrap();
+    run(&mut ed, Command::OutdentList { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n- b\n- c\n", "bullet below stays byte-identical");
+
+    // An ordered "1." below: already safe in any position — untouched.
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n   - b\n1. c\n");
+    run(&mut ed, Command::OutdentList { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n- b\n1. c\n", "'1.' below stays byte-identical");
+
+    // The below line lands on the moved line itself at an equal column with
+    // the same ordered flavor: it continues that open list — untouched.
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n   1. b\n2. c\n");
+    run(&mut ed, Command::OutdentList { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n1. b\n2. c\n", "same-flavor continuation keeps its number");
+}
+
+#[test]
+fn user_sequence_outdent_twice_then_indent_twice_on_the_nested_bullet() {
+    // The user's literal repro sequence, chained through ONE editor; run()
+    // asserts the whole-doc itemness invariant at every step.
+    let mut ed = Editor::new(1);
+    ed.load(ORDERED_TORTURE);
+    let mut pos = ORDERED_TORTURE.find("a bullet").unwrap();
+    let track = |c: &CoreChange, pos: usize| c.selection.map_or(pos, |s| s.head);
+
+    // Shift-Tab #1: bullet to top level; task adopted; "3." guard-rewritten.
+    let c = run(&mut ed, Command::OutdentList { from: pos, to: pos }).unwrap();
+    pos = track(&c, pos);
+    assert_eq!(
+        ed.get_text(),
+        "1. ordered one\n2. ordered two\n   1. nested ordered item\n- a bullet nested under an ordered item\n   - [x] a task nested under an ordered item\n1. ordered three\n"
+    );
+
+    // Shift-Tab #2: already top level — applies but is a no-op.
+    let c = run(&mut ed, Command::OutdentList { from: pos, to: pos }).unwrap();
+    assert!(c.splices.is_empty(), "top level: no-op, not a fallback");
+    pos = track(&c, pos);
+
+    // Tab #1: re-nests under "2. ordered two" (+3); the adopted task moves
+    // along as the bullet's subtree.
+    let c = run(&mut ed, Command::IndentList { from: pos, to: pos }).unwrap();
+    pos = track(&c, pos);
+    assert_eq!(
+        ed.get_text(),
+        "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n      - [x] a task nested under an ordered item\n1. ordered three\n"
+    );
+
+    // Tab #2: nests under "   1. nested ordered item" (+3), subtree carried.
+    let c = run(&mut ed, Command::IndentList { from: pos, to: pos }).unwrap();
+    pos = track(&c, pos);
+    let _ = pos;
+    assert_eq!(
+        ed.get_text(),
+        "1. ordered one\n2. ordered two\n   1. nested ordered item\n      - a bullet nested under an ordered item\n         - [x] a task nested under an ordered item\n1. ordered three\n"
+    );
+}
+
+#[test]
+fn user_sequence_outdent_twice_then_indent_twice_on_the_nested_task() {
+    let mut ed = Editor::new(1);
+    ed.load(ORDERED_TORTURE);
+    let mut pos = ORDERED_TORTURE.find("a task").unwrap();
+    let track = |c: &CoreChange, pos: usize| c.selection.map_or(pos, |s| s.head);
+
+    // Shift-Tab #1: task to top level; "3." guard-rewritten.
+    let c = run(&mut ed, Command::OutdentList { from: pos, to: pos }).unwrap();
+    pos = track(&c, pos);
+    assert_eq!(
+        ed.get_text(),
+        "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n- [x] a task nested under an ordered item\n1. ordered three\n"
+    );
+
+    // Shift-Tab #2: no-op at top level.
+    let c = run(&mut ed, Command::OutdentList { from: pos, to: pos }).unwrap();
+    assert!(c.splices.is_empty());
+    pos = track(&c, pos);
+
+    // Tab #1: back under "2. ordered two" (+3) — the original shape modulo
+    // the "3." → "1." rewrite.
+    let c = run(&mut ed, Command::IndentList { from: pos, to: pos }).unwrap();
+    pos = track(&c, pos);
+    assert_eq!(
+        ed.get_text(),
+        "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n   - [x] a task nested under an ordered item\n1. ordered three\n"
+    );
+
+    // Tab #2: nests under the bullet sibling (+2 — bullet token width).
+    let c = run(&mut ed, Command::IndentList { from: pos, to: pos }).unwrap();
+    pos = track(&c, pos);
+    let _ = pos;
+    assert_eq!(
+        ed.get_text(),
+        "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n     - [x] a task nested under an ordered item\n1. ordered three\n"
+    );
 }

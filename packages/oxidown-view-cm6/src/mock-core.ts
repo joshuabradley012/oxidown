@@ -481,12 +481,14 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
     // ordered nesting, close enough for the mock). EVERY item line emits
     // line:list-item (the view's hanging indent); nested indents conceal.
     const depth = Math.floor(markerFrom / 2) + 1;
+    // LINE-level reveal (contract v0.3, matching headings): every marker
+    // node spans the WHOLE line, so a caret anywhere on it flags the line
+    // revealed and shows all marker constructs (indent, dash, brackets) as
+    // raw source together.
+    const lineTo = base + content.length;
     nodes.push({
-      // Indent + marker GLYPH region (trailing space excluded): caret
-      // adjacency here flags the line revealed AND reveals the indent, so a
-      // revealed marker always shows its raw leading spaces.
       start: base,
-      end: base + glyphTo,
+      end: lineTo,
       conceals: depth >= 2 && markerFrom > 0 ? [[base, base + markerFrom]] : [],
       marks: [],
       line: { kind: "line", at: base, style: "list-item", depth },
@@ -494,19 +496,14 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
     const afterMarker = content.slice(contentFrom);
     const taskM = TASK_RE.exec(afterMarker);
     if (taskM) {
-      // Widen the li-line node (just pushed) to the checkbox end so the
-      // revealed flag + indent reveal share the task's `- [ ]` extent.
-      nodes[nodes.length - 1].end = base + contentFrom + 3;
       // Task items: the `- ` marker conceals (no bullet widget) and reveals
-      // in lockstep with the checkbox — LINE-level (node spans the line).
+      // in lockstep with the checkbox — both on the same line-spanning node.
       const checkboxFrom = base + contentFrom;
       const checkboxTo = checkboxFrom + 3; // "[ ]" / "[x]"
       const itemContentFrom = contentFrom + taskM[0].length;
       nodes.push({
-        // Leading spaces + `- [ ]` run: adjacency reveal (incl. the nesting
-        // spaces), lockstep dash+brackets.
         start: base,
-        end: checkboxTo,
+        end: lineTo,
         conceals: [[base + markerFrom, base + contentFrom]],
         marks: [],
         widget: { from: checkboxFrom, to: checkboxTo, checked: taskM[1] !== " " },
@@ -516,12 +513,9 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
     }
     const marks: InlineMark[] = [];
     if (isBullet) {
-      // Bullet node spans leading spaces + marker GLYPH: a caret in the
-      // nesting spaces or next to the `-` reveals the raw source (the
-      // position after the trailing space does not).
       nodes.push({
         start: base,
-        end: base + glyphTo,
+        end: lineTo,
         conceals: [],
         marks: [],
         bullet: { from: base + markerFrom, to: base + contentFrom },
@@ -612,7 +606,7 @@ export function parseDoc(doc: string): ParsedNode[] {
     }
 
     // Blockquote: depth = count of stripped "> " marker levels; reveal is
-    // Obsidian-style — only when the caret touches the marker run.
+    // LINE-level (contract v0.3) — a caret anywhere on the line reveals.
     if (BQ_MARKER_RE.test(line)) {
       let depth = 0;
       let rest = line;
@@ -624,10 +618,9 @@ export function parseDoc(doc: string): ParsedNode[] {
         rest = rest.slice(m[0].length);
         offset += m[0].length;
       }
-      const glyphRunEnd = lineStart + line.slice(0, offset - lineStart).trimEnd().length;
       nodes.push({
         start: lineStart,
-        end: glyphRunEnd, // marker glyphs only: "next to the space" != reveal
+        end: lineEnd, // whole line: LINE-level reveal (contract v0.3)
         conceals: [[lineStart, offset]],
         marks: [],
         line: { kind: "line", at: lineStart, style: "blockquote", depth },
@@ -1221,16 +1214,23 @@ export class MockCore implements OxidownCore {
       });
     if (splices.length === 0) return noOp();
 
-    // Paragraph-interruption guard (mirrors the Rust core exactly — see
+    // Paragraph-interruption guards (mirror the Rust core exactly — see
     // crates/oxidown-core/src/commands.rs, "Paragraph-interruption guard"):
-    // a moved non-1 ordered item that would START a new list, rather than
-    // join an already-open same-delimiter ordered list at its landing
-    // column, cannot interrupt a paragraph per CommonMark and would
-    // silently degrade to lazy-continuation text. Rewrite its digits to "1"
-    // in the same batch (index 1: after the first line's own splice, before
-    // the next line's).
-    const rewrite = this.interruptionRewrite(doc, first, indent ? firstCol + delta : firstCol - delta);
+    // a non-1 ordered item that would START a new list, rather than join an
+    // already-open same-delimiter ordered list at its landing column,
+    // cannot interrupt a paragraph per CommonMark and would silently
+    // degrade to lazy-continuation text. Two lines can end up there:
+    // 1. the moved (first affected) line itself — its rewrite goes at index
+    //    1 (after the first line's own splice, before the next line's);
+    // 2. the first UNAFFECTED item line below the affected set (skipping
+    //    adopted descendants) — the edit changed the parse context above it
+    //    even though the command never touched it; its rewrite is on a
+    //    later line than every whitespace splice, so it appends.
+    const newCol = indent ? firstCol + delta : firstCol - delta;
+    const rewrite = this.interruptionRewrite(doc, first, newCol, affected, delta, indent);
     if (rewrite) splices.splice(1, 0, rewrite);
+    const belowRewrite = this.belowLineRewrite(doc, affected, firstDepth, newCol, delta, indent);
+    if (belowRewrite) splices.push(belowRewrite);
 
     this.pushCommandUndoUnit();
     this.mutateDoc(splices);
@@ -1240,45 +1240,96 @@ export class MockCore implements OxidownCore {
   }
 
   /**
-   * Paragraph-interruption guard for the FIRST affected line: the
-   * digit-rewrite splice (pre-edit coordinates — the whitespace edits never
-   * touch the digits) when the moved line's non-1 ordered marker would
-   * start a new list rather than join an open one, else null. The landing
-   * scan reads pre-edit lines: everything ABOVE the first affected line is
-   * untouched by the batch (the affected set only extends downward), so
-   * pre-edit columns above are already the post-edit ones.
+   * Paragraph-interruption guard for one line (which will sit at
+   * `lineColPost` after the edit): the digit-rewrite splice (pre-edit
+   * coordinates — the whitespace edits never touch the digits) when its
+   * non-1 ordered marker would start a new list rather than join an open
+   * one, else null. The landing scan uses POST-EDIT columns: affected
+   * lines shift by the batch's per-line change (`+delta` indent,
+   * `-min(delta, col)` outdent); unaffected lines keep their pre-edit
+   * column. (The first-affected-line check only ever scans above the
+   * affected set, where that mapping is the identity; the below-line
+   * check's scan crosses the affected set itself.)
    */
-  private interruptionRewrite(doc: string, first: ListLineInfo, newCol: number): Splice | null {
-    const ordered = orderedMarkerParts(first.marker!.glyphs);
+  private interruptionRewrite(
+    doc: string,
+    line: ListLineInfo,
+    lineColPost: number,
+    affected: Map<number, ListLineInfo>,
+    delta: number,
+    indent: boolean,
+  ): Splice | null {
+    const ordered = orderedMarkerParts(line.marker!.glyphs);
     if (!ordered || ordered.isOne) return null; // bullets / "1." never rewrite
+    const postCol = (info: ListLineInfo): number => {
+      const col = info.marker!.col;
+      if (!affected.has(info.start)) return col;
+      return indent ? col + delta : col - Math.min(delta, col);
+    };
     // Landing scan: skip consecutive same-quote-depth item lines strictly
-    // deeper than the new column; the first line that isn't is the landing.
+    // deeper (post-edit) than the checked line's post-edit column; the
+    // first line that isn't is the landing.
     let joins = false;
-    let cursor = first.start;
+    let cursor = line.start;
     for (;;) {
       const range = prevLineRange(doc, cursor);
       if (!range) break; // document start (unreachable: a target/parent exists above)
       const info = listLineInfo(doc, range);
-      if (info.quoteDepth !== first.quoteDepth) break; // outside the quote context
+      if (info.quoteDepth !== line.quoteDepth) break; // outside the quote context
       if (!info.marker) break; // non-item landing: no open list
-      if (info.marker.col > newCol) {
+      const col = postCol(info);
+      if (col > lineColPost) {
         cursor = range.start;
         continue;
       }
       // Landing line: joins an open list only at an EQUAL column with the
       // SAME ordered delimiter flavor ('.' vs ')') — a shallower item or a
-      // different family means the moved item starts a NEW list, which a
+      // different family means the checked item starts a NEW list, which a
       // non-1 ordered marker cannot do in paragraph-interruption position.
       const landing = orderedMarkerParts(info.marker.glyphs);
-      joins = info.marker.col === newCol && landing !== null && landing.delim === ordered.delim;
+      joins = col === lineColPost && landing !== null && landing.delim === ordered.delim;
       break;
     }
     if (joins) return null;
     return {
-      at: first.quoteEnd + first.marker!.col,
+      at: line.quoteEnd + line.marker!.col,
       delete: ordered.digits.length,
       insert: "1",
     };
+  }
+
+  /**
+   * Below-context paragraph-interruption guard (mirrors the Rust core's
+   * `below_line_rewrite`): walk down from the last affected line over
+   * consecutive same-quote-depth item lines, SKIPPING adopted descendants
+   * (column strictly greater than the moved line's new column — they nest
+   * under the moved block and stay items with it); run the landing-scan
+   * check on the first item line at column <= the new column, at its own
+   * unchanged column. Stops at a non-item/blank line or quote-depth change.
+   */
+  private belowLineRewrite(
+    doc: string,
+    affected: Map<number, ListLineInfo>,
+    rootDepth: number,
+    rootPostCol: number,
+    delta: number,
+    indent: boolean,
+  ): Splice | null {
+    const last = [...affected.values()].sort((a, b) => a.start - b.start).pop();
+    if (!last) return null;
+    let cursorEnd = last.end;
+    for (;;) {
+      const range = nextLineRange(doc, cursorEnd);
+      if (!range) return null;
+      const info = listLineInfo(doc, range);
+      if (info.quoteDepth !== rootDepth) return null;
+      if (!info.marker) return null;
+      if (info.marker.col > rootPostCol) {
+        cursorEnd = range.end; // adopted descendant of the moved block
+        continue;
+      }
+      return this.interruptionRewrite(doc, info, info.marker.col, affected, delta, indent);
+    }
   }
 
   // ---------------------------------------------------------------------------
