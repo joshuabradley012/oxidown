@@ -112,9 +112,11 @@ const view = new EditorView({
 });
 view.focus();
 
-// Dev affordance: expose the view for debugging/automation (dev builds only).
+// Dev affordance: expose the view and core for debugging/automation/profiling
+// (dev builds only).
 if (import.meta.env.DEV) {
   (window as unknown as { __oxidownView?: EditorView }).__oxidownView = view;
+  (window as unknown as { __oxidownCore?: OxidownCore }).__oxidownCore = core;
 }
 
 // Source-mode toggle: swap out live-preview decorations; document syncing and
