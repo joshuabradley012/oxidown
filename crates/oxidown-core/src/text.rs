@@ -2,6 +2,7 @@
 //! API speaks UTF-16 code units (per docs/boundary-v0.md) and converts here
 //! using ropey's utf16 metrics.
 
+use std::cell::Cell;
 use std::ops::Range;
 
 use ropey::Rope;
@@ -144,6 +145,80 @@ impl TextBuffer {
             end -= 1;
         }
         start..end
+    }
+}
+
+/// Byte-oriented random-access reader over a [`TextBuffer`], for code that
+/// scans/compares small document regions with **doc-absolute byte indices**
+/// (the command planners). Replaces the old "materialize the entire rope
+/// into one `String` per command" pattern — an O(doc) allocation+copy of
+/// which the planners only ever read a handful of local lines
+/// (research/08-perf-baseline.md §10 item 4).
+///
+/// Access goes through ropey's contiguous chunks with a one-chunk cache
+/// (`Cell` — chunk refs borrow the rope, so they're `Copy`): sequential
+/// scans cost O(1) per byte with one O(log doc) chunk lookup per ~1KB
+/// crossed. Nothing is copied, ever; correctness never depends on any
+/// window/cache sizing.
+pub struct SrcBytes<'a> {
+    text: &'a TextBuffer,
+    len: usize,
+    /// `(chunk_start_byte, chunk)` of the most recently accessed chunk.
+    chunk: Cell<(usize, &'a str)>,
+}
+
+impl<'a> SrcBytes<'a> {
+    pub fn new(text: &'a TextBuffer) -> Self {
+        Self {
+            text,
+            len: text.len_bytes(),
+            chunk: Cell::new((0, "")),
+        }
+    }
+
+    /// Document length in bytes (NOT a window length — indices are always
+    /// doc-absolute).
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The byte at `i`, or `None` past the document's end. No char-boundary
+    /// requirement.
+    #[inline]
+    pub fn get(&self, i: usize) -> Option<u8> {
+        if i >= self.len {
+            return None;
+        }
+        let (start, chunk) = self.chunk.get();
+        if let Some(&b) = chunk.as_bytes().get(i.wrapping_sub(start)) {
+            return Some(b);
+        }
+        let (chunk, chunk_start, _, _) = self.text.rope.chunk_at_byte(i);
+        self.chunk.set((chunk_start, chunk));
+        Some(chunk.as_bytes()[i - chunk_start])
+    }
+
+    /// The byte at `i`; panics past the document's end (mirrors `bytes[i]`).
+    #[inline]
+    pub fn byte(&self, i: usize) -> u8 {
+        self.get(i).expect("SrcBytes::byte out of bounds")
+    }
+
+    /// Append the bytes of `range` (which must be char-boundary aligned,
+    /// like every parser-derived span) to `out`.
+    pub fn push_slice_to(&self, out: &mut String, range: Range<usize>) {
+        for chunk in self.text.rope.byte_slice(range).chunks() {
+            out.push_str(chunk);
+        }
+    }
+
+    /// Whether `range`'s bytes (char-boundary aligned) equal `s`.
+    pub fn slice_eq(&self, range: Range<usize>, s: &str) -> bool {
+        self.text.rope.byte_slice(range) == s
     }
 }
 

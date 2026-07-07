@@ -281,6 +281,19 @@ fn apply_edit_position_scaling() {
                 "{label}/{pos_label} apply_edit p95 {:.0}us exceeds the 200ms loose ceiling",
                 s.p95
             );
+            // Reparse-path regression gate: a mid-document keystroke on the
+            // 300KB doc must stay an order of magnitude below the ~1.3ms an
+            // accidental full reparse would cost (incremental path measured
+            // ~31-45us on an M4 Pro; 500us leaves >10x headroom for slower
+            // CI hardware while still catching any O(doc) dispatch bug).
+            if label == "~300KB" && pos_label == "middle" {
+                assert!(
+                    s.p95 < 500.0,
+                    "300KB mid-doc apply_edit p95 {:.0}us — the incremental \
+                     reparse path has regressed toward a full reparse",
+                    s.p95
+                );
+            }
         }
     }
 }
@@ -390,6 +403,18 @@ fn combined_apply_edit_plus_decorations_scaling() {
             "{label} combined p95 {:.0}us exceeds the 200ms loose ceiling",
             s.p95
         );
+        // Contract-shaped regression gate at the reference size: the core
+        // side of the 1ms boundary budget, with ~18x headroom over the
+        // measured ~56us (M4 Pro) so slow CI hardware never flakes, while a
+        // reparse-path regression (~440us+ at this size) still trips it.
+        if label == "~100KB" {
+            assert!(
+                s.p95 < 1000.0,
+                "100KB combined applyEdit+decorations p95 {:.0}us exceeds \
+                 the boundary contract's 1ms core budget",
+                s.p95
+            );
+        }
     }
 }
 
@@ -534,6 +559,63 @@ fn block_style_depth(style: BlockStyle) -> Option<u8> {
     }
 }
 
+/// Replica of `oxidown-wasm`'s `decorations_json_string` direct writer (the
+/// CURRENT wire path since the Stage-A serialization fix) — byte-identical
+/// output to the value-tree path above, pinned in that crate's `wire_format`
+/// test module.
+fn decorations_json_string(decos: &[Decoration]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(decos.len() * 56 + 2);
+    s.push('[');
+    for (i, d) in decos.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        match d {
+            Decoration::Mark { from, to, style } => {
+                let _ = write!(
+                    s,
+                    "{{\"from\":{from},\"kind\":\"mark\",\"style\":\"{}\",\"to\":{to}}}",
+                    style_str(*style)
+                );
+            }
+            Decoration::Conceal { from, to } => {
+                let _ = write!(s, "{{\"from\":{from},\"kind\":\"conceal\",\"to\":{to}}}");
+            }
+            Decoration::Line { at, level } => {
+                let _ = write!(s, "{{\"at\":{at},\"kind\":\"line\",\"style\":\"h{level}\"}}");
+            }
+            Decoration::Block { at, style, revealed } => {
+                let _ = write!(s, "{{\"at\":{at}");
+                if let Some(depth) = block_style_depth(*style) {
+                    let _ = write!(s, ",\"depth\":{depth}");
+                }
+                s.push_str(",\"kind\":\"line\"");
+                if *revealed {
+                    s.push_str(",\"revealed\":true");
+                }
+                let _ = write!(s, ",\"style\":\"{}\"}}", block_style_str(*style));
+            }
+            Decoration::Widget { from, to, kind } => match kind {
+                WidgetKind::Task { checked } => {
+                    let _ = write!(
+                        s,
+                        "{{\"checked\":{checked},\"from\":{from},\"kind\":\"widget\",\"to\":{to},\"widget\":\"task\"}}"
+                    );
+                }
+                WidgetKind::Bullet => {
+                    let _ = write!(
+                        s,
+                        "{{\"from\":{from},\"kind\":\"widget\",\"to\":{to},\"widget\":\"bullet\"}}"
+                    );
+                }
+            },
+        }
+    }
+    s.push(']');
+    s
+}
+
 #[test]
 #[ignore = "perf baseline; run with --release --ignored --nocapture"]
 fn wasm_decoration_json_serialization_100kb() {
@@ -556,6 +638,7 @@ fn wasm_decoration_json_serialization_100kb() {
     );
     println!("decorations in viewport: {}", decos.len());
 
+    // OLD wire path (pre-Stage-A): serde_json::Value tree, then to_string.
     let mut samples = Vec::with_capacity(n);
     let mut payload_bytes = 0usize;
     for _ in 0..n {
@@ -567,13 +650,31 @@ fn wasm_decoration_json_serialization_100kb() {
         std::hint::black_box(&json_str);
         samples.push(us);
     }
-    let s = stats(samples);
+    let old = stats(samples);
+
+    // NEW wire path: direct string writer (byte-identical output).
+    let mut samples = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t = Instant::now();
+        let json_str = decorations_json_string(&decos);
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        std::hint::black_box(&json_str);
+        samples.push(us);
+    }
+    let new = stats(samples);
+
+    assert_eq!(
+        decorations_json_string(&decos),
+        serde_json::Value::Array(decos.iter().map(decoration_to_json).collect()).to_string(),
+        "the two wire paths must stay byte-identical"
+    );
     println!("payload size: {payload_bytes} bytes");
-    println!("{s}");
+    println!("value-tree (old):    {old}");
+    println!("direct writer (new): {new}");
 
     assert!(
-        s.p95 < 50_000.0,
+        new.p95 < 50_000.0,
         "JSON serialization p95 {:.0}us exceeds the 50ms loose ceiling",
-        s.p95
+        new.p95
     );
 }

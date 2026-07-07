@@ -144,7 +144,7 @@ use std::ops::Range;
 use crate::block_index::BlockKind;
 use crate::mapping::{self, Bias};
 use crate::parser::{Node, NodeKind};
-use crate::text::ByteSplice;
+use crate::text::{ByteSplice, SrcBytes};
 
 /// Typed command surface (the wasm boundary flattens this to
 /// `command(name, a, b?)`). All positions are UTF-16 code units.
@@ -208,7 +208,7 @@ fn ins(at: usize, text: String) -> ByteSplice {
 
 pub fn toggle_inline(
     nodes: &[Node],
-    src: &str,
+    src: &SrcBytes,
     kind: InlineKind,
     from_b: usize,
     to_b: usize,
@@ -278,7 +278,7 @@ pub fn toggle_inline(
 /// content, space-padded when that content starts or ends with a backtick.
 fn delimiters(
     kind: InlineKind,
-    src: &str,
+    src: &SrcBytes,
     touched: &[&Node],
     t_start: usize,
     t_end: usize,
@@ -294,10 +294,10 @@ fn delimiters(
                 touched.iter().flat_map(|n| n.delims.iter()).collect();
             spans.sort_by_key(|r| r.start);
             for d in spans {
-                content.push_str(&src[pos..d.start]);
+                src.push_slice_to(&mut content, pos..d.start);
                 pos = d.end;
             }
-            content.push_str(&src[pos..t_end]);
+            src.push_slice_to(&mut content, pos..t_end);
             let mut longest = 0usize;
             let mut run = 0usize;
             for b in content.bytes() {
@@ -320,7 +320,7 @@ fn delimiters(
 
 pub fn set_heading(
     nodes: &[Node],
-    src: &str,
+    src: &SrcBytes,
     block_kind: Option<BlockKind>,
     line: Range<usize>,
     pos_b: usize,
@@ -362,7 +362,7 @@ pub fn set_heading(
         (Some(node), n) => {
             let d = node.delims[0].clone();
             let prefix = format!("{} ", "#".repeat(n as usize));
-            if &src[d.start..d.end] == prefix.as_str() {
+            if src.slice_eq(d.start..d.end, &prefix) {
                 return None; // already at this level, byte-identically
             }
             vec![ByteSplice {
@@ -444,15 +444,16 @@ impl ListLineCtx {
 }
 
 /// Byte range of the physical source line containing `pos` (the trailing
-/// `\n`/`\r\n` terminator excluded). Commands work directly off `src`
-/// (unlike `Editor`, which has `TextBuffer::line_range_at` over the rope).
-fn line_containing(bytes: &[u8], pos: usize) -> Range<usize> {
-    let mut start = pos.min(bytes.len());
-    while start > 0 && bytes[start - 1] != b'\n' {
+/// `\n`/`\r\n` terminator excluded). Commands scan bytes through the
+/// chunk-cached [`SrcBytes`] reader — doc-absolute indices, no document
+/// materialization (unlike the old whole-`String` copy per command).
+fn line_containing(src: &SrcBytes, pos: usize) -> Range<usize> {
+    let mut start = pos.min(src.len());
+    while start > 0 && src.byte(start - 1) != b'\n' {
         start -= 1;
     }
     let mut end = start;
-    while end < bytes.len() && bytes[end] != b'\n' && bytes[end] != b'\r' {
+    while end < src.len() && src.byte(end) != b'\n' && src.byte(end) != b'\r' {
         end += 1;
     }
     start..end
@@ -460,35 +461,35 @@ fn line_containing(bytes: &[u8], pos: usize) -> Range<usize> {
 
 /// The physical line immediately preceding `line_start`, or `None` at the
 /// start of the document.
-fn prev_line(bytes: &[u8], line_start: usize) -> Option<Range<usize>> {
+fn prev_line(src: &SrcBytes, line_start: usize) -> Option<Range<usize>> {
     if line_start == 0 {
         return None;
     }
     let mut end = line_start;
-    if end > 0 && bytes[end - 1] == b'\n' {
+    if end > 0 && src.byte(end - 1) == b'\n' {
         end -= 1;
     }
-    if end > 0 && bytes[end - 1] == b'\r' {
+    if end > 0 && src.byte(end - 1) == b'\r' {
         end -= 1;
     }
-    Some(line_containing(bytes, end))
+    Some(line_containing(src, end))
 }
 
 /// The physical line immediately following the line ending at `line_end`
 /// (that line's own extent, terminator excluded), or `None` when `line_end`
 /// has no terminator (the document's last line).
-fn next_line(bytes: &[u8], line_end: usize) -> Option<Range<usize>> {
+fn next_line(src: &SrcBytes, line_end: usize) -> Option<Range<usize>> {
     let mut next = line_end;
-    if bytes.get(next) == Some(&b'\r') {
+    if src.get(next) == Some(b'\r') {
         next += 1;
     }
-    if bytes.get(next) == Some(&b'\n') {
+    if src.get(next) == Some(b'\n') {
         next += 1;
     }
     if next == line_end {
         return None; // no terminator: `line_end` is the document's end
     }
-    Some(line_containing(bytes, next))
+    Some(line_containing(src, next))
 }
 
 /// Physical lines intersecting `[from_b, to_b]` (`from_b <= to_b`), mirroring
@@ -496,12 +497,12 @@ fn next_line(bytes: &[u8], line_end: usize) -> Option<Range<usize>> {
 /// always yields its containing line; a non-empty range excludes a trailing
 /// line touched only at its very start (`to_b` landing exactly on a line
 /// boundary selects none of that line).
-fn intersecting_lines(bytes: &[u8], from_b: usize, to_b: usize) -> Vec<Range<usize>> {
+fn intersecting_lines(src: &SrcBytes, from_b: usize, to_b: usize) -> Vec<Range<usize>> {
     let mut lines = Vec::new();
     let empty = from_b == to_b;
     let mut pos = from_b;
     loop {
-        let line = line_containing(bytes, pos);
+        let line = line_containing(src, pos);
         if empty || to_b > line.start {
             lines.push(line.clone());
         }
@@ -509,10 +510,10 @@ fn intersecting_lines(bytes: &[u8], from_b: usize, to_b: usize) -> Vec<Range<usi
             break;
         }
         let mut next = line.end;
-        if bytes.get(next) == Some(&b'\r') {
+        if src.get(next) == Some(b'\r') {
             next += 1;
         }
-        if bytes.get(next) == Some(&b'\n') {
+        if src.get(next) == Some(b'\n') {
             next += 1;
         }
         if next <= pos {
@@ -545,7 +546,7 @@ fn quote_context(nodes: &[Node], line_start: usize) -> (u8, usize) {
 /// not however much whitespace the source actually has after the marker
 /// (CommonMark lets a marker's real content start several spaces later;
 /// that extra whitespace is deliberately not part of this arithmetic).
-fn line_marker(nodes: &[Node], bytes: &[u8], line: &Range<usize>) -> Option<(usize, usize)> {
+fn line_marker(nodes: &[Node], src: &SrcBytes, line: &Range<usize>) -> Option<(usize, usize)> {
     let raw_start = nodes.iter().find_map(|n| match n.kind {
         NodeKind::ListMarker { .. } if n.extent.start >= line.start && n.extent.start < line.end => {
             Some(n.extent.start)
@@ -562,23 +563,23 @@ fn line_marker(nodes: &[Node], bytes: &[u8], line: &Range<usize>) -> Option<(usi
     // column always measures from the actual `-`/`+`/`*`/digit glyph, per
     // the spec's literal definition — never from stray leading spaces.
     let mut item_start = raw_start;
-    while matches!(bytes.get(item_start), Some(b' ' | b'\t')) {
+    while matches!(src.get(item_start), Some(b' ' | b'\t')) {
         item_start += 1;
     }
-    Some((item_start, marker_token_width(bytes, item_start)))
+    Some((item_start, marker_token_width(src, item_start)))
 }
 
 /// Marker glyph run length + 1 (the required following space) — see
 /// [`line_marker`].
-fn marker_token_width(bytes: &[u8], item_start: usize) -> usize {
+fn marker_token_width(src: &SrcBytes, item_start: usize) -> usize {
     let mut i = item_start;
-    match bytes.get(i) {
+    match src.get(i) {
         Some(b'-' | b'+' | b'*') => i += 1,
         Some(b) if b.is_ascii_digit() => {
-            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            while src.get(i).is_some_and(|b| b.is_ascii_digit()) {
                 i += 1;
             }
-            if matches!(bytes.get(i), Some(b'.' | b')')) {
+            if matches!(src.get(i), Some(b'.' | b')')) {
                 i += 1;
             }
         }
@@ -587,9 +588,9 @@ fn marker_token_width(bytes: &[u8], item_start: usize) -> usize {
     (i - item_start) + 1
 }
 
-fn list_line_ctx(nodes: &[Node], bytes: &[u8], line: Range<usize>) -> ListLineCtx {
+fn list_line_ctx(nodes: &[Node], src: &SrcBytes, line: Range<usize>) -> ListLineCtx {
     let (quote_depth, quote_end) = quote_context(nodes, line.start);
-    let marker = line_marker(nodes, bytes, &line);
+    let marker = line_marker(nodes, src, &line);
     ListLineCtx {
         start: line.start,
         end: line.end,
@@ -603,15 +604,14 @@ fn list_line_ctx(nodes: &[Node], bytes: &[u8], line: Range<usize>) -> ListLineCt
 /// editor normalizes before calling, same convention as `toggle_inline`).
 fn plan_list_nesting(
     nodes: &[Node],
-    src: &str,
+    src: &SrcBytes,
     from_b: usize,
     to_b: usize,
     indent: bool,
 ) -> Option<CommandPlan> {
-    let bytes = src.as_bytes();
-    let lines: Vec<ListLineCtx> = intersecting_lines(bytes, from_b, to_b)
+    let lines: Vec<ListLineCtx> = intersecting_lines(src, from_b, to_b)
         .into_iter()
-        .map(|l| list_line_ctx(nodes, bytes, l))
+        .map(|l| list_line_ctx(nodes, src, l))
         .collect();
 
     // Applies iff at least one intersecting line carries a marker.
@@ -631,8 +631,8 @@ fn plan_list_nesting(
     // that isn't itself a list-item line, or whose quote depth differs.
     let mut target: Option<(usize, usize)> = None; // (marker_column, token_width)
     let mut cursor = first.start;
-    while let Some(range) = prev_line(bytes, cursor) {
-        let ctx = list_line_ctx(nodes, bytes, range.clone());
+    while let Some(range) = prev_line(src, cursor) {
+        let ctx = list_line_ctx(nodes, src, range.clone());
         if ctx.quote_depth != first_depth {
             break;
         }
@@ -675,8 +675,8 @@ fn plan_list_nesting(
         };
         affected.entry(line.start).or_insert(*line);
         let mut cursor_end = line.end;
-        while let Some(range) = next_line(bytes, cursor_end) {
-            let ctx = list_line_ctx(nodes, bytes, range.clone());
+        while let Some(range) = next_line(src, cursor_end) {
+            let ctx = list_line_ctx(nodes, src, range.clone());
             if ctx.quote_depth != line.quote_depth {
                 break;
             }
@@ -735,11 +735,11 @@ fn plan_list_nesting(
     //    touched it. Its rewrite is on a later line than every whitespace
     //    splice, so appending keeps the batch ascending.
     let new_col = if indent { first_col + delta } else { first_col - delta };
-    if let Some(rewrite) = interruption_rewrite(nodes, bytes, first, new_col, &affected, delta, indent) {
+    if let Some(rewrite) = interruption_rewrite(nodes, src, first, new_col, &affected, delta, indent) {
         batch.insert(1, rewrite);
     }
     if let Some(rewrite) =
-        below_line_rewrite(nodes, bytes, &affected, first_depth, new_col, delta, indent)
+        below_line_rewrite(nodes, src, &affected, first_depth, new_col, delta, indent)
     {
         batch.push(rewrite);
     }
@@ -759,24 +759,25 @@ fn plan_list_nesting(
 /// The ordered-marker shape at `item_start`: `(digit_run_len, value_is_one,
 /// delimiter_byte)`. `None` for bullet markers. `value_is_one` is numeric
 /// (`01.` counts as 1, per CommonMark's "start number" semantics).
-fn ordered_marker(bytes: &[u8], item_start: usize) -> Option<(usize, bool, u8)> {
+fn ordered_marker(src: &SrcBytes, item_start: usize) -> Option<(usize, bool, u8)> {
     let mut i = item_start;
-    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+    while src.get(i).is_some_and(|b| b.is_ascii_digit()) {
         i += 1;
     }
     if i == item_start {
         return None;
     }
-    let delim = *bytes.get(i)?;
+    let delim = src.get(i)?;
     if delim != b'.' && delim != b')' {
         return None;
     }
-    let digits = &bytes[item_start..i];
-    let significant = digits
-        .iter()
-        .position(|&b| b != b'0')
-        .map_or(&b""[..], |p| &digits[p..]);
-    Some((i - item_start, significant == b"1", delim))
+    // `value_is_one` ⇔ the digits, leading zeros stripped, are exactly "1".
+    let mut sig = item_start;
+    while sig < i && src.byte(sig) == b'0' {
+        sig += 1;
+    }
+    let is_one = sig + 1 == i && src.byte(sig) == b'1';
+    Some((i - item_start, is_one, delim))
 }
 
 /// A line's marker column as it will read AFTER the edit: affected lines
@@ -812,7 +813,7 @@ fn post_edit_col(
 /// the affected set itself, whose columns the batch changes.
 fn interruption_rewrite(
     nodes: &[Node],
-    bytes: &[u8],
+    src: &SrcBytes,
     line: &ListLineCtx,
     line_col_post: usize,
     affected: &BTreeMap<usize, ListLineCtx>,
@@ -820,7 +821,7 @@ fn interruption_rewrite(
     indent: bool,
 ) -> Option<ByteSplice> {
     let (item_start, _) = line.marker?;
-    let (digit_len, is_one, delim) = ordered_marker(bytes, item_start)?;
+    let (digit_len, is_one, delim) = ordered_marker(src, item_start)?;
     if is_one {
         return None; // "1." can interrupt anything; never rewritten
     }
@@ -829,8 +830,8 @@ fn interruption_rewrite(
     // isn't is the landing.
     let mut joins = false;
     let mut cursor = line.start;
-    while let Some(range) = prev_line(bytes, cursor) {
-        let ctx = list_line_ctx(nodes, bytes, range.clone());
+    while let Some(range) = prev_line(src, cursor) {
+        let ctx = list_line_ctx(nodes, src, range.clone());
         if ctx.quote_depth != line.quote_depth {
             break; // landing outside the quote context: not an open list
         }
@@ -849,7 +850,7 @@ fn interruption_rewrite(
         // line the FIRST guard rewrites keeps its delimiter — only digits
         // change — so this family check is stable across the two guards.)
         joins = col == line_col_post
-            && ordered_marker(bytes, land_start).is_some_and(|(_, _, d)| d == delim);
+            && ordered_marker(src, land_start).is_some_and(|(_, _, d)| d == delim);
         break;
         // Scan exhaustion (document start) would leave `joins` false and
         // rewrite; unreachable in practice, since the indent target /
@@ -880,7 +881,7 @@ fn interruption_rewrite(
 /// quote-depth change, like every other scan here.
 fn below_line_rewrite(
     nodes: &[Node],
-    bytes: &[u8],
+    src: &SrcBytes,
     affected: &BTreeMap<usize, ListLineCtx>,
     root_depth: u8,
     root_post_col: usize,
@@ -890,8 +891,8 @@ fn below_line_rewrite(
     let last = affected.values().next_back()?;
     let mut cursor_end = last.end;
     loop {
-        let range = next_line(bytes, cursor_end)?;
-        let ctx = list_line_ctx(nodes, bytes, range.clone());
+        let range = next_line(src, cursor_end)?;
+        let ctx = list_line_ctx(nodes, src, range.clone());
         if ctx.quote_depth != root_depth {
             return None;
         }
@@ -901,7 +902,7 @@ fn below_line_rewrite(
             cursor_end = range.end; // adopted descendant of the moved block
             continue;
         }
-        return interruption_rewrite(nodes, bytes, &ctx, col, affected, delta, indent);
+        return interruption_rewrite(nodes, src, &ctx, col, affected, delta, indent);
     }
 }
 
@@ -911,7 +912,7 @@ fn below_line_rewrite(
 /// list item; `Some` with an empty batch when it applies but no movement is
 /// possible (first item of its list, or already as deep as its parent
 /// allows).
-pub fn indent_list(nodes: &[Node], src: &str, from_b: usize, to_b: usize) -> Option<CommandPlan> {
+pub fn indent_list(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Option<CommandPlan> {
     plan_list_nesting(nodes, src, from_b, to_b, true)
 }
 
@@ -919,6 +920,6 @@ pub fn indent_list(nodes: &[Node], src: &str, from_b: usize, to_b: usize) -> Opt
 /// one's subtree — by the first line's distance to its nesting parent.
 /// `None`/no-op cases mirror [`indent_list`] (already top-level → no-op
 /// instead of `None`, since the command still applies).
-pub fn outdent_list(nodes: &[Node], src: &str, from_b: usize, to_b: usize) -> Option<CommandPlan> {
+pub fn outdent_list(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Option<CommandPlan> {
     plan_list_nesting(nodes, src, from_b, to_b, false)
 }

@@ -116,6 +116,32 @@ impl Node {
             shift(r);
         }
     }
+
+    /// Signed variant of [`offset`](Self::offset): shift every span by
+    /// `by` (negative for deletions) — used by the incremental reparse to
+    /// rebase the kept-after portion of the overlay through an edit's net
+    /// length delta. Every shifted position is by construction at/after the
+    /// edit, so the result never underflows.
+    pub fn offset_signed(&mut self, by: isize) {
+        let shift = |r: &mut Range<usize>| {
+            r.start = (r.start as isize + by) as usize;
+            r.end = (r.end as isize + by) as usize;
+        };
+        shift(&mut self.extent);
+        shift(&mut self.content);
+        for d in &mut self.delims {
+            shift(d);
+        }
+        if let Some(u) = &mut self.url {
+            shift(u);
+        }
+        if let Some(r) = &mut self.reveal_extent {
+            shift(r);
+        }
+        if let Some(r) = &mut self.item_extent {
+            shift(r);
+        }
+    }
 }
 
 fn leaf(kind: NodeKind, extent: Range<usize>, content: Range<usize>, delims: Vec<Range<usize>>) -> Node {

@@ -127,6 +127,20 @@ Nesting (`**bold *italic***`) must work; reveal applies per-node, not per-line.
 `applyEdit` + `decorations` for a ~3k-code-unit viewport on a 100KB document: **< 1ms combined
 p95 in the core** (excluding DOM work), measured from the JS side of the wasm boundary.
 
+**Complexity note (amended with the incremental-reparse implementation).** `applyEdit`'s
+"O(edit + dirty block), not O(doc)" holds as follows: parse work is bounded by a window of
+top-level blocks around the edit (one block of slack above, extended below until the fresh
+parse's block boundaries realign with the old ones), plus a small-constant linear pass that
+rebases the untouched suffix's cached spans and re-matches block IDs. Edits whose effect
+cannot realign with any downstream block boundary — canonically, toggling a code fence open
+mid-document, which reinterprets everything below it — degrade, correctness-first, to
+re-parsing from the window start to the end of the document (and in rare shapes the whole
+document). The fast paths are byte-equivalence-gated against a from-scratch parse
+(`crates/oxidown-core/tests/reparse_equivalence.rs`); the known whole-document couplings that
+a windowed parse cannot see (link reference definitions, footnote definitions) affect only
+constructs M1 does not decorate — the same documented assumption as the streaming append
+fast-path below.
+
 ## Clarifications (v0.1 — pinned after first implementations)
 
 1. **Composition vs coalescing:** `compositionBegin` closes any open undo group; while composing,

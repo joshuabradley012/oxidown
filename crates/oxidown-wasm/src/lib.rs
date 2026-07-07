@@ -101,6 +101,77 @@ fn change_to_js(change: Option<CoreChange>) -> Result<JsValue, JsError> {
     }
 }
 
+/// Serialize a decoration batch straight into one JSON string — the hot
+/// half of the `decorations()` boundary call. The old path built a
+/// `serde_json::Value` tree first (one `Map` plus fresh key/tag `String`
+/// allocations per decoration) and measurably cost MORE than computing the
+/// decorations themselves (research/08-perf-baseline.md §8); this writer
+/// allocates nothing but the output buffer.
+///
+/// Wire format: byte-identical to the previous `serde_json::Value`
+/// serialization — compact separators, keys in ALPHABETICAL order (what
+/// serde_json's default `BTreeMap` emitted), same optional-field omission
+/// rules. Every field value is an integer, a boolean, or a fixed vocabulary
+/// of static tags (`MarkStyle::as_str`/`BlockStyle::as_str`/`h{level}`), so
+/// no string escaping is ever needed. Pinned byte-for-byte against the
+/// `serde_json` path by the `wire_format` test module below.
+fn decorations_json_string(decos: &[Decoration]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(decos.len() * 56 + 2);
+    s.push('[');
+    for (i, d) in decos.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        match d {
+            Decoration::Mark { from, to, style } => {
+                let _ = write!(
+                    s,
+                    "{{\"from\":{from},\"kind\":\"mark\",\"style\":\"{}\",\"to\":{to}}}",
+                    style.as_str()
+                );
+            }
+            Decoration::Conceal { from, to } => {
+                let _ = write!(s, "{{\"from\":{from},\"kind\":\"conceal\",\"to\":{to}}}");
+            }
+            Decoration::Line { at, level } => {
+                let _ = write!(s, "{{\"at\":{at},\"kind\":\"line\",\"style\":\"h{level}\"}}");
+            }
+            Decoration::Block { at, style, revealed } => {
+                let _ = write!(s, "{{\"at\":{at}");
+                if let Some(depth) = style.depth() {
+                    let _ = write!(s, ",\"depth\":{depth}");
+                }
+                s.push_str(",\"kind\":\"line\"");
+                if *revealed {
+                    s.push_str(",\"revealed\":true");
+                }
+                let _ = write!(s, ",\"style\":\"{}\"}}", style.as_str());
+            }
+            Decoration::Widget { from, to, kind } => match kind {
+                oxidown_core::WidgetKind::Task { checked } => {
+                    let _ = write!(
+                        s,
+                        "{{\"checked\":{checked},\"from\":{from},\"kind\":\"widget\",\"to\":{to},\"widget\":\"task\"}}"
+                    );
+                }
+                oxidown_core::WidgetKind::Bullet => {
+                    let _ = write!(
+                        s,
+                        "{{\"from\":{from},\"kind\":\"widget\",\"to\":{to},\"widget\":\"bullet\"}}"
+                    );
+                }
+            },
+        }
+    }
+    s.push(']');
+    s
+}
+
+/// The previous `serde_json::Value`-tree construction, kept ONLY as the
+/// oracle pinning `decorations_json_string`'s byte-exact wire format (see
+/// the `wire_format` test module).
+#[cfg(test)]
 fn decoration_json(d: &Decoration) -> serde_json::Value {
     match d {
         Decoration::Mark { from, to, style } => json!({
@@ -231,8 +302,8 @@ impl OxidownCore {
             .inner
             .decorations(revision as u64, from as usize, to as usize, &sels)
             .map_err(core_err)?;
-        let payload = serde_json::Value::Array(decos.iter().map(decoration_json).collect());
-        to_js(&payload)
+        js_sys::JSON::parse(&decorations_json_string(&decos))
+            .map_err(|_| JsError::new("InternalError: produced invalid JSON"))
     }
 
     #[wasm_bindgen(js_name = compositionBegin)]
@@ -375,5 +446,68 @@ impl OxidownCore {
 
     pub fn revision(&self) -> f64 {
         self.inner.revision() as f64
+    }
+}
+
+#[cfg(test)]
+mod wire_format {
+    //! Pins `decorations_json_string` byte-for-byte against the previous
+    //! `serde_json::Value` serialization (compact separators, alphabetical
+    //! key order from serde_json's default `BTreeMap`, identical
+    //! optional-field omission) — the boundary's JSON.parse contract must
+    //! not change shape. Runs natively (no wasm/js_sys involved).
+
+    use oxidown_core::{BlockStyle, Decoration, MarkStyle, WidgetKind};
+
+    use super::{decoration_json, decorations_json_string};
+
+    fn all_variants() -> Vec<Decoration> {
+        let mut v = vec![Decoration::Conceal { from: 0, to: 2 }];
+        for style in [
+            MarkStyle::Strong,
+            MarkStyle::Em,
+            MarkStyle::Code,
+            MarkStyle::Delim,
+            MarkStyle::Strike,
+            MarkStyle::Link,
+            MarkStyle::Url,
+            MarkStyle::ListMarker,
+        ] {
+            v.push(Decoration::Mark { from: 3, to: 12345, style });
+        }
+        for level in 1..=6 {
+            v.push(Decoration::Line { at: 7 * level as usize, level });
+        }
+        for style in [
+            BlockStyle::BlockQuote(1),
+            BlockStyle::BlockQuote(3),
+            BlockStyle::CodeBlock,
+            BlockStyle::CodeFence,
+            BlockStyle::ThematicBreak,
+            BlockStyle::ListItem(1),
+            BlockStyle::ListItem(4),
+        ] {
+            for revealed in [false, true] {
+                v.push(Decoration::Block { at: 42, style, revealed });
+            }
+        }
+        for checked in [false, true] {
+            v.push(Decoration::Widget { from: 9, to: 14, kind: WidgetKind::Task { checked } });
+        }
+        v.push(Decoration::Widget { from: 0, to: 2, kind: WidgetKind::Bullet });
+        v
+    }
+
+    #[test]
+    fn writer_matches_value_path_byte_for_byte() {
+        let decos = all_variants();
+        let value_path =
+            serde_json::Value::Array(decos.iter().map(decoration_json).collect()).to_string();
+        assert_eq!(decorations_json_string(&decos), value_path);
+    }
+
+    #[test]
+    fn empty_batch_is_an_empty_array() {
+        assert_eq!(decorations_json_string(&[]), "[]");
     }
 }

@@ -15,7 +15,7 @@ use crate::history::History;
 use crate::mapping::Bias;
 use crate::oplog::{EditOrigin, OpLog};
 use crate::parser::{self, Node};
-use crate::text::{ByteSplice, TextBuffer};
+use crate::text::{ByteSplice, SrcBytes, TextBuffer};
 
 /// Boundary splice: positions in UTF-16 code units, in original-doc
 /// coordinates for the batch it belongs to (CM6 ChangeSet semantics).
@@ -50,6 +50,25 @@ struct StreamState {
     anchor: u64,
 }
 
+/// Which reparse strategy each text change took — exposed for tests and perf
+/// diagnostics (see [`Editor::reparse_counts`]). The counters let the
+/// equivalence tests assert the fast paths actually FIRE (a dispatch bug
+/// that silently full-reparsed everything would still be correct, just
+/// slow — invisible to any correctness assertion).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReparseCounts {
+    /// Full-document reparses (`reparse_with`).
+    pub full: u64,
+    /// Tail-only reparses (`reparse_tail`: streaming appends, qualifying
+    /// end-of-document edits, and incremental reparses whose window reached
+    /// the document's end).
+    pub tail: u64,
+    /// Windowed mid-document reparses that CONVERGED (`reparse_incremental`
+    /// splicing a bounded window into the overlay/blocks). Non-converging
+    /// attempts degrade and count under `full` or `tail` instead.
+    pub incremental: u64,
+}
+
 #[derive(Debug)]
 pub struct Editor {
     text: TextBuffer,
@@ -69,6 +88,7 @@ pub struct Editor {
     history: History,
     composition: Option<Composition>,
     revision: u64,
+    reparse_counts: ReparseCounts,
 }
 
 impl Editor {
@@ -84,6 +104,7 @@ impl Editor {
             history: History::new(),
             composition: None,
             revision: 0,
+            reparse_counts: ReparseCounts::default(),
         }
     }
 
@@ -166,11 +187,20 @@ impl Editor {
         }
         let forward_single = (batch.len() == 1)
             .then(|| (batch[0].at, batch[0].delete, batch[0].insert.len()));
+        // Fast-path decision BEFORE the text mutates (same discipline as
+        // `stream_append`): the precondition reads pre-edit text and the
+        // pre-edit block index, in the batch's own (pre-edit) coordinates.
+        let fast_region = (batch.len() == 1)
+            .then(|| self.tail_edit_fast_path_region(&batch[0]))
+            .flatten();
         let composing = self.composition.is_some();
         let inverse = self.apply_bytes(&batch, origin);
         self.history
             .record_edit(inverse, origin, now_ms, forward_single, composing);
-        self.reparse_with(&batch);
+        match fast_region {
+            Some(region_start) => self.reparse_tail(region_start, &batch),
+            None => self.reparse_incremental(&batch),
+        }
         self.revision += 1;
         Ok(self.revision)
     }
@@ -185,7 +215,7 @@ impl Editor {
         let selection = self.change_cursor(&redo_inverse);
         self.history.push_redo(redo_inverse);
         self.history.set_break();
-        self.reparse_with(&unit.inverse);
+        self.reparse_incremental(&unit.inverse);
         self.revision += 1;
         Some(CoreChange {
             revision: self.revision,
@@ -202,7 +232,7 @@ impl Editor {
         let selection = self.change_cursor(&undo_inverse);
         self.history.push_undo_unit(undo_inverse);
         self.history.set_break();
-        self.reparse_with(&unit.inverse);
+        self.reparse_incremental(&unit.inverse);
         self.revision += 1;
         Some(CoreChange {
             revision: self.revision,
@@ -303,7 +333,10 @@ impl Editor {
     /// with the applied change otherwise. Command edits enter the op log
     /// with origin `command` and form single, never-coalescing undo units.
     pub fn command(&mut self, cmd: Command) -> Result<Option<CoreChange>, CoreError> {
-        let src = self.text.text();
+        // Chunk-cached byte reader — the planners only ever read a handful
+        // of local lines, so the old whole-document `String` materialization
+        // here was a pure O(doc) waste (research/08-perf-baseline.md §10.4).
+        let src = SrcBytes::new(&self.text);
         let plan = match cmd {
             Command::ToggleStrong { from, to }
             | Command::ToggleEm { from, to }
@@ -418,7 +451,7 @@ impl Editor {
         self.history.record_stream_append(id, at_b, chunk.len());
         match fast_region {
             Some(region_start) => self.reparse_tail(region_start, &batch),
-            None => self.reparse_with(&batch),
+            None => self.reparse_incremental(&batch),
         }
         self.revision += 1;
         Ok(CoreChange {
@@ -460,6 +493,19 @@ impl Editor {
     /// `(undo_depth, redo_depth)` — for tests and debugging.
     pub fn history_depths(&self) -> (usize, usize) {
         (self.history.undo_depth(), self.history.redo_depth())
+    }
+
+    /// Read access to the cached parse overlay (debug/verification/tests;
+    /// not a boundary API). The equivalence tests compare this node-for-node
+    /// against a from-scratch `parser::parse_document` of the current text.
+    pub fn overlay_nodes(&self) -> &[Node] {
+        &self.overlay
+    }
+
+    /// How many times each reparse strategy has run on this editor
+    /// (debug/verification/tests; not a boundary API).
+    pub fn reparse_counts(&self) -> ReparseCounts {
+        self.reparse_counts
     }
 
     // ---- internals ----------------------------------------------------
@@ -509,7 +555,7 @@ impl Editor {
         let inverse = self.apply_bytes(&plan.batch, EditOrigin::Command);
         self.history
             .record_edit(inverse, EditOrigin::Command, 0.0, None, composing);
-        self.reparse_with(&plan.batch);
+        self.reparse_incremental(&plan.batch);
         self.revision += 1;
         let selection = plan.selection.map(|(anchor_b, head_b)| SelectionRange {
             anchor: self.text.byte_to_utf16(anchor_b),
@@ -555,6 +601,7 @@ impl Editor {
     /// Full reparse: one pulldown pass producing overlay + block spans;
     /// block IDs re-matched through `batch` (empty on `load`).
     fn reparse_with(&mut self, batch: &[ByteSplice]) {
+        self.reparse_counts.full += 1;
         let text = self.text.text();
         let parsed = parser::parse_document(&text);
         self.overlay = parsed.nodes;
@@ -586,10 +633,96 @@ impl Editor {
         }
     }
 
+    /// Tail fast path for `apply_edit` (interactive typing). STRICTER than
+    /// the streaming precondition above, because editing the tail block's
+    /// FIRST LINE can change how the block relates to the block ABOVE it —
+    /// which a standalone tail-slice reparse cannot see:
+    ///
+    /// * de-interruption: `"para\n# head"` — deleting the `#` (or making the
+    ///   line `"-x"`, `"x# head"`, …) turns the line into a lazy
+    ///   continuation of the directly adjacent paragraph, MERGING the two;
+    /// * setext: the first line becoming `"==="` heading-ifies a directly
+    ///   preceding paragraph;
+    /// * indent/marker capture: `"- item\n\npara"` — giving `para`'s first
+    ///   line leading indent (or a list marker) merges it into the list
+    ///   above, even ACROSS the blank line.
+    ///
+    /// The first two require direct line adjacency, so a blank line above
+    /// the tail block ("insulation") rules them out. The third survives
+    /// blank lines but only for block kinds that absorb indented/marker
+    /// lines (lists, indented code, footnote definitions) and only when the
+    /// edit leaves the first line with an absorbable SHAPE (leading
+    /// space/tab or a list-marker character). Hence:
+    ///
+    /// * an edit strictly past the first line is always safe (the block's
+    ///   start boundary is byte-determined by unchanged text);
+    /// * a first-line edit is safe iff the tail block is insulated AND
+    ///   (the block above cannot absorb, OR the post-edit first line does
+    ///   not start with an absorbable byte).
+    ///
+    /// Under these conditions the standalone tail parse is exactly
+    /// equivalent to a full reparse (not merely decoration-equivalent),
+    /// modulo the documented whole-document couplings (link reference
+    /// definitions, footnote definitions) that M1 does not decorate —
+    /// gated by `tests/reparse_equivalence.rs`. Everything else takes the
+    /// ordinary reparse path.
+    fn tail_edit_fast_path_region(&self, splice: &ByteSplice) -> Option<usize> {
+        let region_start = self.tail_fast_path_region(splice.at)?;
+        let first_line = self.text.line_range_at(region_start);
+        // An edit AT `first_line.end` still appends to the first line's
+        // text (`"-"` + `"x"` = `"-x"`, no longer a list item), so only
+        // strictly-past positions skip the first-line analysis.
+        if splice.at > first_line.end {
+            return Some(region_start);
+        }
+        // Insulation: a blank line (or document start) directly above.
+        // `region_start == 1` means byte 0 is the preceding `'\n'` (already
+        // verified by `tail_fast_path_region`), i.e. an empty first line.
+        let insulated = region_start <= 1
+            || (self.text.byte_at(region_start - 1) == Some(b'\n')
+                && self.text.byte_at(region_start - 2) == Some(b'\n'));
+        if !insulated {
+            return None;
+        }
+        let blocks = self.block_index.blocks();
+        let above_absorbs = blocks
+            .len()
+            .checked_sub(2)
+            .map(|i| blocks[i].kind)
+            .is_some_and(|k| {
+                matches!(
+                    k,
+                    parser::BlockKind::List
+                        | parser::BlockKind::CodeBlock
+                        | parser::BlockKind::FootnoteDefinition
+                )
+            });
+        if !above_absorbs {
+            return Some(region_start);
+        }
+        // Post-edit first byte of the first line: from the insert when the
+        // edit sits exactly at the block start, else the (unchanged) byte
+        // already there.
+        let post_first_byte = if splice.at == region_start {
+            splice
+                .insert
+                .as_bytes()
+                .first()
+                .copied()
+                .or_else(|| self.text.byte_at(region_start + splice.delete))
+        } else {
+            self.text.byte_at(region_start)
+        };
+        let absorbable_shape = post_first_byte
+            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'-' | b'+' | b'*') || b.is_ascii_digit());
+        (!absorbable_shape).then_some(region_start)
+    }
+
     /// Re-parse only `[region_start, end)` and splice the results into the
     /// overlay and block index. `batch` (the applied append) lands entirely
     /// at/after `region_start`, so everything before it is untouched.
     fn reparse_tail(&mut self, region_start: usize, batch: &[ByteSplice]) {
+        self.reparse_counts.tail += 1;
         self.overlay.retain(|n| n.extent.end <= region_start);
         let slice = self
             .text
@@ -605,5 +738,228 @@ impl Editor {
             .map(|(k, r)| (k, r.start + region_start..r.end + region_start))
             .collect();
         self.block_index.update_tail(region_start, tail_spans, batch);
+    }
+
+    /// Incremental, block-local reparse after `batch` (ascending,
+    /// non-overlapping, PRE-application byte coordinates; the text has
+    /// already been mutated). Makes `apply_edit` O(edit + dirty region)
+    /// instead of O(doc) for typical edits — boundary-v0.md line 64's
+    /// complexity requirement. Multi-splice batches are handled as one
+    /// UNION dirty region `[first.at, last.end()]` (commands and undo/redo
+    /// batches are line-local clusters, so the union stays small; a
+    /// pathological far-apart batch simply gets a large window and, at
+    /// worst, degrades below).
+    ///
+    /// ## Algorithm
+    ///
+    /// 1. **Window start** — the start of the top-level block ONE BEFORE the
+    ///    block containing the dirty region's start (walked further back to
+    ///    a line-boundary block start; document start if none). The one
+    ///    block of slack is load-bearing: an edit at/near a block's first
+    ///    line can change that block's relationship to the block directly
+    ///    above it (lazy continuation / de-interruption, setext
+    ///    underlining, list indent-capture), so the block above must be
+    ///    inside the reparsed window. It cannot reach FURTHER back: those
+    ///    effects need either direct line adjacency to a paragraph or an
+    ///    absorbing container, and the slack block's own first line and its
+    ///    relationship to everything above it are untouched bytes — if the
+    ///    slack block was a top-level boundary before, it still is.
+    /// 2. **Window end / convergence** — parse the post-edit slice
+    ///    `[region_start, W)` where `W` is an old block end (shifted by the
+    ///    batch's net `delta`) past the dirty region; accept a convergence
+    ///    point `P` when:
+    ///      * `P` is a top-level block boundary of the SLICE parse with at
+    ///        least one more slice block after it (see safety below),
+    ///      * `P - delta` is an OLD top-level block end, and
+    ///      * `P` sits at/after every edit (the text from `P` on is
+    ///        untouched bytes).
+    ///
+    ///    Then everything in `[region_start, P)` is replaced with the fresh
+    ///    parse and everything from `P` on is the old overlay/blocks
+    ///    shifted by `delta`. No convergence by document end → the window
+    ///    becomes the whole tail → `reparse_tail` semantics (and a window
+    ///    reaching EOF on the FIRST attempt short-circuits the same way).
+    ///
+    /// ## Why boundary alignment (plus a successor block) suffices
+    ///
+    /// The slice parser reads exactly the same bytes as a full parse would
+    /// until `W`, so the only way the slice parse can disagree with the
+    /// true parse of `[region_start, ..)` is TRUNCATION at `W` — and every
+    /// truncation artifact lives in the slice's FINAL block:
+    ///
+    /// * a construct closed by slice-EOF rather than real syntax (an
+    ///   unterminated fence, an HTML block) is one slice block running to
+    ///   exactly `W` — it can never contain an interior boundary, so `P`
+    ///   (which must have a successor block) can never land inside or at
+    ///   the end of it; requiring a successor block is precisely what
+    ///   rejects "the boundary that realigns by coincidence inside a
+    ///   fence": a fence opened by the edit swallows the rest of the slice,
+    ///   leaving no interior boundaries to falsely accept, and its
+    ///   coincidental end-at-`W` is excluded for having no successor;
+    /// * a block cut mid-way (paragraph continuing past `W`, a setext
+    ///   underline just past `W`) is likewise the final block.
+    ///
+    /// Interior boundaries of the slice are therefore REAL: nothing spans
+    /// `P` in the new parse, so the parser state at `P` is clean
+    /// (top-of-document); `P - delta` being an old block end means the old
+    /// parse state there was clean too; and the text from `P` on is
+    /// unchanged — identical bytes parsed from identical clean state parse
+    /// identically, so the old overlay/blocks from `P` on (shifted) ARE the
+    /// new parse's tail. Comparing block KINDS at `P` would be wrong rather
+    /// than extra-safe — the block ENDING at `P` is dirty and may have
+    /// legitimately changed kind — but as belt-and-braces this check DOES
+    /// require the successor slice block to match the corresponding old
+    /// block's start and kind (by the argument above it always does; a
+    /// mismatch means the reasoning broke and we degrade instead of
+    /// corrupting). The known whole-document couplings that violate
+    /// "identical bytes ⇒ identical parse" — link reference definitions and
+    /// footnote definitions — affect constructs M1 does not decorate
+    /// (documented Phase-A assumption, same as the streaming fast path).
+    ///
+    /// Equivalence is gated by `tests/reparse_equivalence.rs` (node-for-node
+    /// against a from-scratch parse after every fuzzed edit).
+    fn reparse_incremental(&mut self, batch: &[ByteSplice]) {
+        let blocks = self.block_index.blocks();
+        let Some(last_splice) = batch.last() else {
+            return self.reparse_with(batch); // load-style: no dirty region
+        };
+        if blocks.is_empty() {
+            return self.reparse_with(batch);
+        }
+        let dirty_lo = batch[0].at;
+        let dirty_hi = last_splice.end();
+        let delta: isize = batch
+            .iter()
+            .map(|s| s.insert.len() as isize - s.delete as isize)
+            .sum();
+        let len_post = self.text.len_bytes();
+
+        // 1. Window start: one block of slack, at a line-boundary start.
+        //    (Bytes before `dirty_lo` are unchanged, so probing the mutated
+        //    text below is probing pre-edit bytes.)
+        let containing = blocks.partition_point(|b| b.span.start <= dirty_lo);
+        let mut region_start = 0usize;
+        let mut idx = containing as isize - 2; // one block before the containing one
+        while idx >= 0 {
+            let s = blocks[idx as usize].span.start;
+            if s == 0 || self.text.byte_at(s - 1) == Some(b'\n') {
+                region_start = s;
+                break;
+            }
+            idx -= 1;
+        }
+
+        // 2. Grow the window over candidate old block ends until the slice
+        //    parse converges. `after_hi` is the first block starting past
+        //    the dirty region; the first window already includes one whole
+        //    untouched block (the convergence certificate needs a successor
+        //    block inside the slice).
+        let after_hi = blocks.partition_point(|b| b.span.start <= dirty_hi);
+        let mut cand = after_hi;
+        let mut step = 1usize;
+        loop {
+            if cand >= blocks.len() {
+                // Window reached EOF without (or before) convergence: the
+                // whole tail is the dirty region. reparse_tail from a
+                // mid-document region_start is sound by the same clean-
+                // boundary argument (see the doc comment's step 1).
+                return self.reparse_tail(region_start, batch);
+            }
+            let w_pre = blocks[cand].span.end;
+            let w_post = (w_pre as isize + delta) as usize;
+            if w_post >= len_post {
+                return self.reparse_tail(region_start, batch);
+            }
+            let slice = self.text.byte_slice_to_string(region_start..w_post);
+            let parsed = parser::parse_document(&slice);
+
+            // Earliest valid convergence point: an interior slice boundary
+            // at/after every edit whose pre-image is an old block end, with
+            // a start+kind-matching successor.
+            let mut found: Option<(usize, usize)> = None; // (p_abs, old idx m)
+            for i in 0..parsed.blocks.len().saturating_sub(1) {
+                let p_abs = region_start + parsed.blocks[i].1.end;
+                let p_pre = p_abs as isize - delta;
+                if p_pre < dirty_hi as isize {
+                    continue; // text before P still touched by the batch
+                }
+                let p_pre = p_pre as usize;
+                // Old block ends are strictly increasing (ordered,
+                // non-overlapping spans): binary-search for m with
+                // blocks[m].span.end == p_pre.
+                let m = blocks.partition_point(|b| b.span.end < p_pre);
+                if m >= blocks.len() || blocks[m].span.end != p_pre {
+                    continue;
+                }
+                // Belt-and-braces successor check (see the doc comment).
+                let succ = &parsed.blocks[i + 1];
+                let succ_matches = blocks.get(m + 1).is_some_and(|old| {
+                    old.kind == succ.0
+                        && old.span.start as isize + delta
+                            == (region_start + succ.1.start) as isize
+                });
+                if !succ_matches {
+                    continue;
+                }
+                found = Some((p_abs, m));
+                break;
+            }
+            let Some((p_abs, m)) = found else {
+                cand += step;
+                step *= 2; // geometric growth: total work <= 2x final window
+                continue;
+            };
+            self.reparse_counts.incremental += 1;
+            let p_rel = p_abs - region_start;
+            let p_pre = (p_abs as isize - delta) as usize;
+
+            // 3a. Overlay splice. The overlay is sorted by extent.start and
+            //     no node spans a top-level block boundary, so the replaced
+            //     range is a contiguous run.
+            let prefix_len = self
+                .overlay
+                .partition_point(|n| n.extent.start < region_start);
+            let suffix_start = self.overlay.partition_point(|n| n.extent.start < p_pre);
+            let fresh: Vec<Node> = parsed
+                .nodes
+                .into_iter()
+                .filter(|n| n.extent.end <= p_rel)
+                .map(|mut n| {
+                    n.offset(region_start);
+                    n
+                })
+                .collect();
+            let fresh_len = fresh.len();
+            self.overlay.splice(prefix_len..suffix_start, fresh);
+            for n in &mut self.overlay[prefix_len + fresh_len..] {
+                n.offset_signed(delta);
+            }
+
+            // 3b. Block index: assemble the full new span list (before ++
+            //     fresh ++ shifted-after) and let the ordinary `update`
+            //     re-match IDs — identical stability semantics to a full
+            //     reparse, O(#blocks) with a small constant.
+            let blocks = self.block_index.blocks();
+            let before_len = blocks.partition_point(|b| b.span.end <= region_start);
+            let mut new_spans: Vec<(parser::BlockKind, std::ops::Range<usize>)> =
+                Vec::with_capacity(blocks.len() + 4);
+            new_spans.extend(blocks[..before_len].iter().map(|b| (b.kind, b.span.clone())));
+            new_spans.extend(
+                parsed
+                    .blocks
+                    .iter()
+                    .filter(|(_, r)| r.end <= p_rel)
+                    .map(|(k, r)| (*k, r.start + region_start..r.end + region_start)),
+            );
+            new_spans.extend(blocks[m + 1..].iter().map(|b| {
+                (
+                    b.kind,
+                    (b.span.start as isize + delta) as usize
+                        ..(b.span.end as isize + delta) as usize,
+                )
+            }));
+            self.block_index.update(new_spans, batch);
+            return;
+        }
     }
 }

@@ -219,6 +219,139 @@ Corroborating observations, consistent with the native numbers:
 
 ---
 
+## After: results with the staged optimizations (§10 items 1-4 implemented)
+
+> Measured July 2026 on the same machine (M4 Pro, release mode, quiescent run — the
+> `parse_document` control re-measured within noise of the baseline: 392µs vs 360-377µs at
+> 100KB, 1271µs vs 1204-1247µs at 300KB — so the columns are comparable). "Before" numbers
+> are this report's baseline sections; "after" numbers are the same benches on the optimized
+> tree. What landed, in the order of §10's ranking:
+>
+> 1. **Tail fast path wired into `apply_edit`** (item 1): a single-splice edit at/after the
+>    last top-level block's start takes `reparse_tail`. Stricter than streaming's
+>    precondition: first-line edits only qualify when the tail block is blank-line-insulated
+>    and the block above cannot absorb indented/marker lines (guards the de-interruption /
+>    setext / indent-capture merge hazards — see `tail_edit_fast_path_region`'s doc comment).
+> 2. **Block-local incremental reparse** (item 2, the big one): `reparse_incremental` in
+>    `editor.rs` — dirty window = one block of slack above the edit, extended below until the
+>    fresh parse's top-level boundaries realign with the old ones (boundary + successor-block
+>    certificate; justification in the function's doc comment); fresh nodes/blocks spliced
+>    into the overlay, untouched suffix rebased by the edit's delta, block IDs re-matched
+>    through the ordinary `BlockIndex::update`. Non-realigning edits (canonical case: typing
+>    ``` ``` ``` mid-document opens a fence that swallows everything below) degrade,
+>    correctness-first, to a tail/full reparse. Routed: `apply_edit`, `undo`, `redo`,
+>    `command` (multi-splice batches as one union dirty region), `stream_append`'s fallback.
+> 3. **Direct JSON writer for the decorations payload** (item 3): `decorations_json_string`
+>    in `oxidown-wasm` — byte-identical wire format (pinned by a test against the old
+>    `serde_json::Value` path), zero allocations beyond the output buffer.
+> 4. **`Editor::command` no longer materializes the document** (item 4): planners read
+>    through `text::SrcBytes`, a chunk-cached byte reader over the rope (doc-absolute
+>    indices, nothing copied; correctness independent of cache behavior).
+
+### apply_edit (1-char insert), before → after (mean, release)
+
+| size | start | middle | end |
+|---|---|---|---|
+| ~3KB | 15.9µs → **1.4µs** | 14.2µs → **2.9µs** | 14.7µs → **1.1µs** |
+| ~30KB | 119.2µs → **4.7µs** | 116.2µs → **5.2µs** | 117.8µs → **1.8µs** |
+| ~100KB | 402.7µs → **14.5µs** (28x) | 404.0µs → **12.7µs** (32x) | 397.8µs → **3.7µs** (108x) |
+| ~300KB | 1311.2µs → **41.0µs** (32x) | 1272.4µs → **31.0µs** (41x) | 1263.5µs → **9.5µs** (133x) |
+
+**The Stage-B gate — mid-doc single-char `apply_edit` at 300KB < 100µs — passes at 31.0µs
+mean / 34.0µs p95** (target was <100µs; before: ~1272µs). Position no longer selects a cost
+class the way it did (start/middle/end all cheap); the residual size dependence (2.9µs at
+3KB → 31µs at 300KB mid-doc) is NOT parse work — it is the O(#suffix nodes + #blocks)
+bookkeeping pass (span rebasing of the kept overlay tail + block-ID re-matching), linear
+with a ~0.1µs/KB constant. Honest asymptotics: parse cost is O(edit + dirty window);
+bookkeeping remains O(doc) with a ~40x smaller constant than the old full reparse. (If
+million-plus-byte documents become a target, block-relative spans / an offset epoch would
+remove that term; not needed at current sizes.)
+
+### applyEdit + decorations combined (contract shape), before → after
+
+| size | before (mean / p95) | after (mean / p95) |
+|---|---|---|
+| ~3KB | 41.4 / 50.8µs | **29.9 / 37.7µs** |
+| ~30KB | 140.8 / 157.2µs | **34.1 / 38.5µs** |
+| **~100KB** | 422.4 / 442.4µs | **48.5 / 55.6µs** (8x) |
+| ~300KB | 1316.3 / 1398.1µs | **72.6 / 80.5µs** (17x) |
+
+Combined cost is now decorations-dominated (§6's viewport filter, ~26-43µs, unchanged) and
+near-flat across sizes. Cross-check `perf_smoke.rs` (random-position wander, unmodified
+test): p95 747µs → **154µs**. `stream_perf.rs`: mean 10µs → **5-6µs** (its full-reparse
+fallback also became incremental).
+
+### Everything else, before → after
+
+| bench | before | after |
+|---|---|---|
+| `command(IndentList)` ~3KB mean | 15.4µs | **2.8µs** |
+| `command(IndentList)` ~100KB mean | 407.6µs | **30.9µs** (13x) |
+| `command(IndentList)` ~300KB mean | 1348.1µs | **96.0µs** (14x) |
+| decorations JSON serialization (281 decos, 14KB payload) | 45.3µs mean (baseline §8) | **8.5µs mean / 8.9µs p95** (5.6x; old path re-measured 47.7µs in the same run) |
+| `parse_document` (control — untouched) | 360-377µs @100KB | 392µs @100KB (noise) |
+
+Serialization now costs a quarter of the decorations compute instead of 1.4x it, with a
+byte-identical payload.
+
+### Contract verdict, after
+
+* **Complexity (line 64, "O(edit + dirty block), not O(doc)")**: now holds for parse work,
+  with the documented degrade case (non-realigning edits such as mid-document fence toggles
+  → O(tail), correctness-first) and the small-constant linear bookkeeping pass noted above —
+  both recorded as an amendment note under the contract's "Performance budget" section in
+  `docs/boundary-v0.md`. Empirically: position-insensitive µs-scale keystrokes at every
+  tested size, 97% of a 400-step adversarial whole-doc fuzz on the incremental path.
+* **Latency (< 1ms combined p95 at 100KB, JS-side)**: core-side is now 55.6µs p95 — ~18x
+  margin. **JS-side re-verified in the live demo (`?core=wasm`, same method as the
+  browser-side baseline section): combined p95 at 100KB = 0.5ms — PASSES with 2x margin**
+  (was 1.1ms, failing). The result beat the 0.6-0.7ms prediction: the serialization fix
+  shrank the boundary tax itself. Full JS-side after-numbers, same benches as before:
+
+  | Metric (JS side of the boundary) | Before | After |
+  |---|---|---|
+  | `applyEdit` mid-doc, 100KB (med / p95) | 0.7 / 0.8 ms | 0.04 / 0.1 ms |
+  | `applyEdit` + `decorations` combined p95, 100KB | 1.1 ms — FAIL | **0.5 ms — PASS** |
+  | `applyEdit` mid-doc, 292KB (med / p95) | 2.1 / 3.3 ms | 0.1 / 0.2 ms |
+  | keystroke incl. CM measure/draw, 292KB (med / p95) | 3.0 / 3.6 ms | 0.4 / 1.2 ms |
+
+  Mid-document `applyEdit` is now effectively position- and size-insensitive from the JS
+  side (0.04ms at 100KB vs 0.1ms at 292KB — the residual slope is the documented O(doc)
+  bookkeeping pass).
+
+### Correctness gates (all green)
+
+* New `crates/oxidown-core/tests/reparse_equivalence.rs` (runs un-ignored in CI): after
+  EVERY edit the cached overlay + block index are compared **node-for-node / span-for-span
+  against a from-scratch `parse_document`** — a 400-step whole-doc fuzz (fence/list/quote/
+  heading/setext/blank-line inserts, multi-byte text, deletes up to 40 bytes, undo/redo and
+  indent/outdent commands mixed in), a tail-region fuzz, a multi-splice fuzz, directed
+  first-line merge-hazard cases, and the canonical fence-open degradation test. Also re-run
+  at 10,000 steps per fuzz in release (30k adversarial steps total): all node-identical.
+  `ReparseCounts` (a new debug accessor) asserts the fast paths actually FIRE — a dispatch
+  bug that silently full-reparsed everything would be caught, not just tolerated.
+* The full pre-existing suite (246 tests incl. the 300-hostile-edit mirror test, corpus
+  conformance, all 64 command tests, streaming, history, composition stability): green in
+  debug and release. `clippy -D warnings`: clean. `pnpm -r build && pnpm -r test`: green
+  (wasm interface and wire format unchanged).
+
+### src/ changes in this round (implementation work, per the staged plan)
+
+* `crates/oxidown-core/src/editor.rs` — tail fast path wiring + guard, `reparse_incremental`,
+  `ReparseCounts` + `reparse_counts()` and `overlay_nodes()` debug accessors, `command()`
+  uses `SrcBytes`.
+* `crates/oxidown-core/src/parser.rs` — `Node::offset_signed` (signed span rebase).
+* `crates/oxidown-core/src/text.rs` — `SrcBytes` chunk-cached reader.
+* `crates/oxidown-core/src/commands.rs` — planners take `&SrcBytes` instead of `&str`
+  (mechanical; behavior pinned by the 64 command tests).
+* `crates/oxidown-wasm/src/lib.rs` — `decorations_json_string` direct writer (+ wire-format
+  pin tests); old `Value` path kept under `#[cfg(test)]` as the oracle.
+* `crates/oxidown-core/tests/perf_baseline.rs` — regression asserts tightened: 300KB mid-doc
+  `apply_edit` p95 < 500µs, 100KB combined p95 < 1ms (release); both ≥10x above measured so
+  CI noise cannot flake them, both well below what any full-reparse regression would cost.
+
+---
+
 ## Appendix: reproducing these numbers
 
 ```
@@ -228,6 +361,11 @@ cargo test -p oxidown-core --release --test stream_perf    -- --ignored --nocapt
 
 # Deeper local run (more iterations, better tail-percentile confidence):
 OXIDOWN_PERF_ITERS=1000 cargo test -p oxidown-core --release --test perf_baseline -- --ignored --nocapture
+
+# Fast-path equivalence gates (run un-ignored in every CI test pass):
+cargo test -p oxidown-core --test reparse_equivalence
+# Deeper adversarial fuzz:
+OXIDOWN_FUZZ_EDITS=10000 cargo test -p oxidown-core --release --test reparse_equivalence -- --nocapture
 ```
 
 Files added/changed for this report:
