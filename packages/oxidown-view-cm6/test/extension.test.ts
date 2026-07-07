@@ -12,6 +12,18 @@ import { MockCore } from "../src/mock-core";
 import { applyCoreChange, oxidown } from "../src/extension";
 import type { Decoration } from "../src/protocol";
 
+// jsdom implements Range but none of its layout methods. CM6's rAF-driven
+// measure cycle (reached since drawSelection joined the extension bundle)
+// calls Range.getClientRects mid-frame; without this stub the throw escapes
+// as an UNHANDLED error in whatever test happens to be running when jsdom's
+// animation-frame timer fires — a CI-only race (locally the process usually
+// exits first) that fails the run even with all tests passing.
+const emptyRect = { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+(Range.prototype as unknown as { getClientRects: () => unknown }).getClientRects = () =>
+  Object.assign([], { item: () => null });
+(Range.prototype as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect =
+  () => ({ ...emptyRect, toJSON: () => emptyRect });
+
 function makeView(doc: string, core: MockCore) {
   const parent = document.createElement("div");
   document.body.appendChild(parent);
