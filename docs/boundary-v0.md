@@ -308,6 +308,7 @@ command(name: "toggleStrong"|"toggleEm"|"toggleStrike"|"toggleCode", from: numbe
 command(name: "setHeading", pos: number, level: 0|1|2|3|4|5|6): CoreChange | null;   // 0 = paragraph
 command(name: "toggleTask", pos: number): CoreChange | null;  // pos anywhere in the list item
 command(name: "indentList"|"outdentList", from: number, to: number): CoreChange | null;
+command(name: "enter", from: number, to: number): CoreChange | null;  // v0.3 addition — see "enter" below
 ```
 
 Commands are text transforms computed against the overlay (plan §5.8): they emit minimal
@@ -438,6 +439,81 @@ mapping/anchor machinery), so it stays logically attached to the same character.
 
 Undo: one undo unit for the whole affected set (however many lines it touches, digit rewrites
 included); undo restores every line at once.
+
+### `enter` (v0.3 addition)
+
+Construct-aware Enter (research/07 §1.3/§1.4/§2.1): continue a list marker or quote prefix on
+non-empty content; exit an EMPTY one in a **single press**. Obsidian requires an awkward
+double-Enter (blank-line intermediate) to leave a list from an empty item — research/07 §1.4
+documents that even obsidian-outliner replaces it with the one-press outliner mechanic; we ship
+the better mechanic directly. Every rule below resolves constructs from the parsed overlay,
+never a line regex — the same discipline as `indentList`/`outdentList`, and the reason (per
+research/07 §2.1/§2.3) Obsidian's own Enter/Tab heuristics have quote+list interaction bugs
+this design structurally cannot.
+
+The view binds Enter (before its default keymap, never while composing — rule 8): `null` →
+fall through to the default Enter (plain newline); otherwise apply the CoreChange. Unlike
+`indentList`/`outdentList` there is NO applies-but-no-op case: every applicable case produces
+real splices, so `enter` returns `null` or a change with a non-empty splice list, never an
+empty one.
+
+Let L = the line containing `from` (after normalizing `from <= to`). Vocabulary is the
+indentList section's: quote prefix, list marker, marker column, marker token width. **Content
+start** = the marker token's end — for a task item, the end of the whole `- [ ] ` run (checkbox
+plus its required trailing space); clamped to L's own end (a bare `-` with no trailing space is
+still an empty item per CommonMark).
+
+1. **Not applicable → null.** L has neither a list marker nor a quote prefix (plain paragraph,
+   heading, code, …), OR `from` sits INSIDE L's prefix region (before the item's content start;
+   inside the quote marker run). **v1 punt, documented:** the inside-the-prefix cases fall back
+   to the default plain newline rather than attempting anything construct-aware.
+2. **Continue** (list item, non-empty content after the marker): replace `[from, to]` with
+   `"\n"` + continuation prefix — L's quote prefix + L's leading indent (raw bytes, verbatim) +
+   the next marker:
+   - bullet: the same glyph L uses (`- `, `* `, `+ `) — byte-faithful to the source flavor;
+   - ordered: L's raw source number + 1, same delimiter (`7) ` after `6) `; `9. ` → `10. `,
+     width grows naturally). Display numbering is view-computed (v0.3 ordered widget) so any
+     digits render right, but the source stays sensible;
+   - task (bullet or ordered): append `[ ] ` — new items always start unchecked.
+   Text after `to` on L becomes the new item's content (mid-line Enter splits the item — a
+   natural consequence, no special casing). Selection lands at the end of the inserted prefix.
+3. **Exit/outdent** (list item, content EMPTY — nothing or only whitespace after the marker
+   token/checkbox — and `from` at/after content start). No `"\n"` is inserted in either branch:
+   ONE Enter press = ONE level of escape.
+   - Marker column > 0 (nested, incl. nested-in-quote): OUTDENT one level in place — the same
+     delta/parent computation as `outdentList` restricted to this single line (no subtree; an
+     empty item has none), INCLUDING both structural rewrite guards (the moved line's
+     interruption rewrite and the below-line rewrite — the whole-document itemness invariant
+     holds exactly as for `outdentList`). If the upward scan finds no qualifying parent (the
+     same v1 blank-line-scan limit as outdentList), the press falls through to the top-level
+     branch instead of doing nothing.
+   - Else (top-level item): DELETE the marker token — and a task item's brackets+space with
+     it — from L, leaving the quote prefix (if any). L becomes an (empty) paragraph/quote line.
+4. **Quote continue** (quote prefix, no list marker, non-empty content after the prefix):
+   insert `"\n"` + L's exact quote prefix at `[from, to]`.
+5. **Quote exit** (quote-only line, empty after the prefix): remove the LAST `> ` run element
+   only — ONE level per press: `> > ` → `> ` on the first press, `> ` → plain on the second.
+   Never all levels at once (the single-press philosophy applies per level, not per line).
+6. **Mixed (list inside quote)**: innermost construct first, piecewise — rules 2/3 keep the
+   quote prefix intact in the continuation/outdent; an empty top-level item inside a quote
+   clears just the marker and keeps `> ` (rule 5 then applies on the next press).
+7. **Selection** (`from != to`): context comes from the pre-edit parse at `from`; the
+   replacement covers the selection (delete + continue in one batch, one undo unit). **v1
+   punt:** a selection extending past L's own end skips rule 3's below-line guard (the guard's
+   scan could otherwise overlap lines the selection consumed).
+8. **Composition:** the view keymap must not intercept Enter while `view.composing` (return
+   false — the key belongs to the IME).
+
+Undo: one unit per press (`"command"` origin — never coalesces), like every other command.
+
+**Empty-item parser note (v0.3, shipped with this command).** An empty list item (`- ` with
+nothing after it — the exact shape every continue press creates) previously emitted NO overlay
+nodes at all (the underlying parser produces no content event to anchor the marker's span), so
+it rendered with no bullet/ordered widget and no `list-item` line decoration, and no command
+could see its marker. The parser now synthesizes the marker node for empty items directly from
+the source bytes — same node shape, LINE-level reveal, ordered items keep their slot in the
+view-computed sequence (an empty `2. ` between `1. `/`3. ` still counts). Purely additive:
+empty items now decorate and behave like any other item.
 
 ## Streaming (plan §5.9)
 

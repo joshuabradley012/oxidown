@@ -1103,6 +1103,177 @@ describe("MockCore indentList/outdentList (v0.2, marker-width-aware Tab nesting)
   });
 });
 
+describe("MockCore enter (v0.3, construct-aware Enter)", () => {
+  // Parity with crates/oxidown-core/src/commands.rs `enter` (module doc
+  // comment "## enter"): continue on non-empty content, single-press exit
+  // on empty constructs, null when neither applies.
+
+  // -- continue -------------------------------------------------------------
+
+  it("continues each bullet flavor with the source glyph", () => {
+    for (const glyph of ["-", "*", "+"]) {
+      const doc = `${glyph} a\n`;
+      const { core } = makeCore(doc);
+      const pos = doc.indexOf("a") + 1;
+      core.command("enter", pos, pos);
+      expect(core.getText()).toBe(`${glyph} a\n${glyph} \n`);
+    }
+  });
+
+  it("increments an ordered marker's raw source digits, same delimiter", () => {
+    const { core } = makeCore("6) a\n");
+    core.command("enter", 4, 4);
+    expect(core.getText()).toBe("6) a\n7) \n");
+  });
+
+  it("grows the digit width naturally (9. -> 10.)", () => {
+    const { core } = makeCore("9. a\n");
+    const change = core.command("enter", 4, 4);
+    expect(core.getText()).toBe("9. a\n10. \n");
+    expect(change!.selection).toEqual({ anchor: 9, head: 9 });
+  });
+
+  it("task continuation always starts unchecked", () => {
+    const a = makeCore("- [ ] a\n").core;
+    a.command("enter", 7, 7);
+    expect(a.getText()).toBe("- [ ] a\n- [ ] \n");
+
+    const b = makeCore("- [x] a\n").core;
+    b.command("enter", 7, 7);
+    expect(b.getText()).toBe("- [x] a\n- [ ] \n");
+  });
+
+  it("keeps the quote prefix when continuing a list inside a quote", () => {
+    const { core } = makeCore("> - a\n");
+    core.command("enter", 5, 5);
+    expect(core.getText()).toBe("> - a\n> - \n");
+  });
+
+  it("continues a plain quote line with its exact prefix", () => {
+    const { core } = makeCore("> text\n");
+    core.command("enter", 6, 6);
+    expect(core.getText()).toBe("> text\n> \n");
+  });
+
+  it("a nested item continues at its own indent", () => {
+    const doc = "- a\n  - b\n";
+    const { core } = makeCore(doc);
+    core.command("enter", 9, 9);
+    expect(core.getText()).toBe("- a\n  - b\n  - \n");
+  });
+
+  it("mid-line Enter splits the item (trailing text becomes the new item)", () => {
+    const { core } = makeCore("- hello world\n");
+    core.command("enter", "- hello ".length, "- hello ".length);
+    expect(core.getText()).toBe("- hello \n- world\n");
+  });
+
+  it("a selection is deleted and continued in one batch", () => {
+    const { core } = makeCore("- hello world\n");
+    const change = core.command("enter", 2, "- hello".length);
+    expect(core.getText()).toBe("- \n-  world\n");
+    expect(change!.splices.length).toBe(1);
+  });
+
+  // -- exit (single press per level) ----------------------------------------
+
+  it("an empty nested item outdents ONE level per press, no newline inserted", () => {
+    const doc = "- a\n  - b\n  - \n";
+    const { core } = makeCore(doc);
+    const change = core.command("enter", doc.length - 1, doc.length - 1);
+    expect(core.getText()).toBe("- a\n  - b\n- \n");
+    expect(change!.splices.every((s) => !s.insert.includes("\n"))).toBe(true);
+  });
+
+  it("outdenting an empty nested task fires the below-line rewrite guard", () => {
+    // Same shape as the Rust test: outdenting "   - [ ] " to top level puts
+    // the untouched "3. c" against the new bullet list, where the guard's
+    // landing-scan says a non-1 ordered marker cannot start a list.
+    const doc = "1. a\n2. b\n   - [ ] x\n   - [ ] \n3. c\n";
+    const { core } = makeCore(doc);
+    const pos = doc.indexOf("   - [ ] \n") + "   - [ ] ".length;
+    const change = core.command("enter", pos, pos);
+    expect(core.getText()).toBe("1. a\n2. b\n   - [ ] x\n- [ ] \n1. c\n");
+    expect(change!.splices.length).toBe(2);
+  });
+
+  it("an empty top-level item clears its marker (no newline)", () => {
+    const { core } = makeCore("- a\n- \n");
+    const change = core.command("enter", 6, 6);
+    expect(core.getText()).toBe("- a\n\n");
+    expect(change!.selection).toEqual({ anchor: 4, head: 4 });
+  });
+
+  it("an empty top-level task clears marker AND brackets", () => {
+    const doc = "- [ ] a\n- [ ] \n";
+    const { core } = makeCore(doc);
+    core.command("enter", doc.length - 1, doc.length - 1);
+    expect(core.getText()).toBe("- [ ] a\n\n");
+  });
+
+  it("an empty quote line drops ONE level per press ('> > ' -> '> ' -> plain)", () => {
+    const { core } = makeCore("> > x\n> > \n");
+    core.command("enter", "> > x\n> > ".length, "> > x\n> > ".length);
+    expect(core.getText()).toBe("> > x\n> \n");
+    core.command("enter", "> > x\n> ".length, "> > x\n> ".length);
+    expect(core.getText()).toBe("> > x\n\n");
+  });
+
+  it("an empty top-level item inside a quote clears the marker but keeps '> '", () => {
+    const doc = "> - a\n> - \n";
+    const { core } = makeCore(doc);
+    core.command("enter", doc.length - 1, doc.length - 1);
+    expect(core.getText()).toBe("> - a\n> \n");
+  });
+
+  it("an empty nested item inside a quote outdents within the quote", () => {
+    const doc = "> - a\n>   - b\n>   - \n";
+    const { core } = makeCore(doc);
+    core.command("enter", doc.length - 1, doc.length - 1);
+    expect(core.getText()).toBe("> - a\n>   - b\n> - \n");
+  });
+
+  it("continues an ordered task with incremented digits and fresh brackets", () => {
+    const { core } = makeCore("1. [x] a\n");
+    core.command("enter", 8, 8);
+    expect(core.getText()).toBe("1. [x] a\n2. [ ] \n");
+  });
+
+  // -- null (falls back to the view's default newline) -----------------------
+
+  it("returns null on a plain paragraph", () => {
+    const { core } = makeCore("plain text\n");
+    expect(core.command("enter", 5, 5)).toBeNull();
+  });
+
+  it("returns null when the cursor sits inside the marker/quote prefix", () => {
+    const a = makeCore("- item\n").core;
+    expect(a.command("enter", 1, 1)).toBeNull();
+    const b = makeCore("> text\n").core;
+    expect(b.command("enter", 1, 1)).toBeNull();
+  });
+
+  it("returns null on a heading line", () => {
+    const { core } = makeCore("# Heading\n");
+    expect(core.command("enter", 5, 5)).toBeNull();
+  });
+
+  // -- undo ------------------------------------------------------------------
+
+  it("each press is a single, non-coalescing undo unit", () => {
+    const { core } = makeCore("- a\n");
+    core.command("enter", 3, 3);
+    expect(core.getText()).toBe("- a\n- \n");
+    core.command("enter", 6, 6); // exit the fresh empty item
+    expect(core.getText()).toBe("- a\n\n");
+    core.undo();
+    // One press per undo step.
+    expect(core.getText()).toBe("- a\n- \n");
+    core.undo();
+    expect(core.getText()).toBe("- a\n");
+  });
+});
+
 describe("MockCore streaming (v0.2)", () => {
   it("streamOpen/Append/Close: appends land at the (mapped) insertion anchor", () => {
     const { core } = makeCore("head\n");

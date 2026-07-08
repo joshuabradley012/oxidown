@@ -35,6 +35,58 @@ fn item_line_indices(text: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Start offsets of every line carrying its own list marker. The `enter`
+/// invariant is keyed by POSITION mapped through the change's splices (not
+/// line index like indent/outdent's) because a continue press inserts a
+/// newline, shifting every following line index by one. Offsets are byte ==
+/// UTF-16 code unit for the all-ASCII enter fixtures.
+fn item_line_starts(text: &str) -> Vec<usize> {
+    oxidown_core::parser::parse(text)
+        .iter()
+        .filter(|n| matches!(n.kind, oxidown_core::parser::NodeKind::ListMarker { .. }))
+        .map(|n| text[..n.extent.start].rfind('\n').map_or(0, |i| i + 1))
+        .collect()
+}
+
+/// Map a position through an ascending splice batch (original -> new doc
+/// coordinates, before-bias: an insertion exactly at the position leaves it
+/// in place; a position inside a deleted range collapses to its start).
+fn map_pos16(pos: usize, splices: &[Splice]) -> usize {
+    let mut shift: isize = 0;
+    for s in splices {
+        let end = s.at + s.delete;
+        if end < pos || (end == pos && s.delete > 0) {
+            shift += s.insert.len() as isize - s.delete as isize;
+        } else if s.at < pos {
+            return (s.at as isize + shift) as usize; // inside the deletion
+        } else {
+            break;
+        }
+    }
+    (pos as isize + shift) as usize
+}
+
+/// Whole-document itemness invariant for `enter` (mirrors indent/outdent's,
+/// but position-mapped — see `item_line_starts` — and exempting the line
+/// containing `from`: an EXIT press de-lists that line by design; every
+/// OTHER pre-edit item line must still parse as an item afterwards).
+fn assert_enter_itemness(before: &str, after: &str, splices: &[Splice], from: usize) {
+    let from_line_start = before[..from.min(before.len())].rfind('\n').map_or(0, |i| i + 1);
+    let after_items: std::collections::BTreeSet<usize> = item_line_starts(after).into_iter().collect();
+    for start in item_line_starts(before) {
+        if start == from_line_start {
+            continue; // the pressed line: exit may de-list it by design
+        }
+        let mapped = map_pos16(start, splices);
+        let mapped_line_start = after[..mapped.min(after.len())].rfind('\n').map_or(0, |i| i + 1);
+        assert!(
+            after_items.contains(&mapped_line_start),
+            "enter itemness invariant violated: pre-edit item line at {start} \
+             (mapped to line start {mapped_line_start}) is no longer a list item in {after:?}"
+        );
+    }
+}
+
 /// Run a command and verify the returned splices transform the mirror into
 /// the core's text (the "splices are what the VIEW needs" requirement).
 ///
@@ -44,7 +96,8 @@ fn item_line_indices(text: &str) -> Vec<usize> {
 /// parses as a list item AFTER it (marker digits may differ; itemness may
 /// not). Neither command adds or removes lines, so line indices correspond.
 fn run(ed: &mut Editor, cmd: Command) -> Option<CoreChange> {
-    let mut mirror = ed.get_text();
+    let before_text = ed.get_text();
+    let mut mirror = before_text.clone();
     let is_nest = matches!(
         cmd,
         Command::IndentList { .. } | Command::OutdentList { .. }
@@ -68,6 +121,9 @@ fn run(ed: &mut Editor, cmd: Command) -> Option<CoreChange> {
                 ed.get_text()
             );
         }
+    }
+    if let Command::Enter { from, to } = cmd {
+        assert_enter_itemness(&before_text, &ed.get_text(), &change.splices, from.min(to));
     }
     Some(change)
 }
@@ -1003,6 +1059,323 @@ fn user_sequence_outdent_twice_then_indent_twice_on_the_nested_bullet() {
         ed.get_text(),
         "1. ordered one\n2. ordered two\n   1. nested ordered item\n      - a bullet nested under an ordered item\n         - [x] a task nested under an ordered item\n1. ordered three\n"
     );
+}
+
+// ------------------------------------------------------------------ enter --
+//
+// Construct-aware Enter (boundary v0.3, research/07 §1.3/§1.4/§2.1):
+// continues a list marker/quote prefix on non-empty content, exits an EMPTY
+// one in a SINGLE press. Every applicable case produces real splices —
+// `enter` returns `None` or `Some` with a change, never a no-op `Some` like
+// indentList/outdentList's applies-but-no-movement case.
+
+/// Byte range of the Nth (0-based) physical line in `text` (terminator
+/// excluded) — for asserting itemness of a line whose CONTENT can't
+/// disambiguate it from another line (an emptied marker reads just "- "
+/// regardless of which line it's on).
+fn nth_line_range(text: &str, n: usize) -> std::ops::Range<usize> {
+    let mut start = 0;
+    for _ in 0..n {
+        start = text[start..]
+            .find('\n')
+            .map(|i| start + i + 1)
+            .unwrap_or_else(|| panic!("line {n} out of range in {text:?}"));
+    }
+    let end = text[start..].find('\n').map_or(text.len(), |i| start + i);
+    start..end
+}
+
+/// Whole-document itemness invariant, keyed by LINE INDEX rather than needle
+/// text (see `nth_line_range`): the line still carries its own `ListMarker`
+/// after reparse.
+fn assert_list_item_at_line(text: &str, line_idx: usize) {
+    let range = nth_line_range(text, line_idx);
+    let nodes = oxidown_core::parser::parse(text);
+    assert!(
+        nodes.iter().any(|n| {
+            matches!(n.kind, oxidown_core::parser::NodeKind::ListMarker { .. })
+                && n.extent.start >= range.start
+                && n.extent.start < range.end
+        }),
+        "line {line_idx} ({:?}) must still parse as a list item in {text:?}",
+        &text[range]
+    );
+}
+
+// -- continue -----------------------------------------------------------
+
+#[test]
+fn enter_continue_bullet_flavors_match_source_glyph() {
+    for glyph in ["-", "*", "+"] {
+        let doc = format!("{glyph} a\n");
+        let mut ed = Editor::new(1);
+        ed.load(&doc);
+        let pos = doc.find('a').unwrap() + 1; // right after "a"
+        run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+        assert_eq!(ed.get_text(), format!("{glyph} a\n{glyph} \n"));
+        assert_list_item_at_line(&ed.get_text(), 0);
+    }
+}
+
+#[test]
+fn enter_continue_ordered_increments_raw_source_digits() {
+    let mut ed = Editor::new(1);
+    ed.load("6) a\n");
+    let pos = "6) a".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "6) a\n7) \n");
+}
+
+#[test]
+fn enter_continue_ordered_grows_digit_width() {
+    // "9." -> "10. " — digit width grows naturally, no zero-padding.
+    let mut ed = Editor::new(1);
+    ed.load("9. a\n");
+    let pos = "9. a".len();
+    let change = run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "9. a\n10. \n");
+    assert_list_item_at_line(&ed.get_text(), 1);
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (9, 9), "cursor lands right after the inserted '10. '");
+}
+
+#[test]
+fn enter_continue_task_adds_unchecked_brackets_regardless_of_source_state() {
+    let mut ed = Editor::new(1);
+    ed.load("- [ ] a\n");
+    let pos = "- [ ] a".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] a\n- [ ] \n");
+
+    let mut ed = Editor::new(1);
+    ed.load("- [x] a\n");
+    let pos = "- [x] a".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "- [x] a\n- [ ] \n", "new items always start unchecked");
+}
+
+#[test]
+fn enter_continue_ordered_task_increments_digits_and_adds_brackets() {
+    let mut ed = Editor::new(1);
+    ed.load("1. [x] a\n");
+    let pos = "1. [x] a".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "1. [x] a\n2. [ ] \n");
+}
+
+#[test]
+fn enter_continue_preserves_quote_prefix_for_a_list_inside_a_quote() {
+    let mut ed = Editor::new(1);
+    ed.load("> - a\n");
+    let pos = "> - a".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "> - a\n> - \n");
+}
+
+#[test]
+fn enter_continue_plain_quote_line() {
+    let mut ed = Editor::new(1);
+    ed.load("> text\n");
+    let pos = "> text".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "> text\n> \n");
+}
+
+#[test]
+fn enter_continue_nested_item_continues_at_its_own_indent() {
+    let mut ed = Editor::new(1);
+    ed.load("- a\n  - b\n");
+    let pos = "- a\n  - b".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n  - b\n  - \n");
+    assert_list_item_at_line(&ed.get_text(), 1);
+}
+
+#[test]
+fn enter_continue_mid_line_splits_the_item() {
+    let mut ed = Editor::new(1);
+    ed.load("- hello world\n");
+    let pos = "- hello ".len(); // right before "world"
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "- hello \n- world\n", "trailing text becomes the new item's content");
+    assert_list_item_at_line(&ed.get_text(), 1);
+}
+
+#[test]
+fn enter_continue_selection_deletes_and_continues_in_one_batch() {
+    let mut ed = Editor::new(1);
+    ed.load("- hello world\n");
+    let from = "- ".len();
+    let to = "- hello".len();
+    let change = run(&mut ed, Command::Enter { from, to }).unwrap();
+    assert_eq!(ed.get_text(), "- \n-  world\n");
+    assert_eq!(change.splices.len(), 1, "delete + continue is one splice");
+    let sel = change.selection.unwrap();
+    assert_eq!(sel.anchor, sel.head);
+}
+
+// -- exit/outdent ---------------------------------------------------------
+
+#[test]
+fn enter_exit_basic_nested_item_outdents_one_level() {
+    // The realistic continue-created shape: Enter on "  - b" made "  - ",
+    // Enter again outdents it one level. (A lone "  - " directly under
+    // paragraph content would parse as a setext-H2 underline per CommonMark
+    // — not an item — so this is the honest empty-nested-item fixture.)
+    let mut ed = Editor::new(1);
+    ed.load("- a\n  - b\n  - \n");
+    let pos = "- a\n  - b\n  - ".len();
+    let change = run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n  - b\n- \n");
+    assert!(
+        change.splices.iter().all(|s| !s.insert.contains('\n')),
+        "exit never inserts a newline — one press is one level of escape"
+    );
+    assert_list_item_at_line(&ed.get_text(), 2);
+}
+
+#[test]
+fn enter_exit_nested_item_outdents_and_rewrites_a_below_sibling_the_edit_recontexted() {
+    // "   - [ ] " is an EMPTY nested task under "2. b" (a task item's
+    // checkbox is GFM content, so unlike a bare "   - " — which CommonMark
+    // reads as a setext underline for "b", not an item — it really is an
+    // empty item both before and after the outdent). Outdenting it to top
+    // level re-anchors the below "3. c" against the new top-level BULLET
+    // list — where the guard's landing-scan rule says a non-1 ordered marker
+    // would START a new list — so the below-context guard fires and rewrites
+    // "3." -> "1." in the SAME batch/undo unit, exactly like `outdentList`'s
+    // own guard on this shape.
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n2. b\n   - [ ] x\n   - [ ] \n3. c\n");
+    let pos = "1. a\n2. b\n   - [ ] x\n   - [ ] ".len();
+    let change = run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n2. b\n   - [ ] x\n- [ ] \n1. c\n");
+    assert_eq!(
+        change.splices.len(),
+        2,
+        "the outdent's whitespace removal + the below-line digit rewrite"
+    );
+    assert_list_item_at_line(&ed.get_text(), 3);
+    assert_list_item_at_line(&ed.get_text(), 4);
+}
+
+#[test]
+fn enter_exit_empty_top_level_item_clears_the_marker() {
+    let mut ed = Editor::new(1);
+    ed.load("- a\n- \n");
+    let pos = "- a\n- ".len();
+    let change = run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n\n");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (4, 4));
+}
+
+#[test]
+fn enter_exit_empty_top_level_task_clears_marker_and_brackets() {
+    let mut ed = Editor::new(1);
+    ed.load("- [ ] a\n- [ ] \n");
+    let pos = "- [ ] a\n- [ ] ".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] a\n\n");
+}
+
+#[test]
+fn enter_exit_quote_drops_one_level_per_press() {
+    let mut ed = Editor::new(1);
+    ed.load("> > x\n> > \n");
+    let pos = "> > x\n> > ".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "> > x\n> \n", "first press: '> > ' -> '> '");
+
+    let pos2 = "> > x\n> ".len();
+    run(&mut ed, Command::Enter { from: pos2, to: pos2 }).unwrap();
+    assert_eq!(ed.get_text(), "> > x\n\n", "second press: '> ' -> plain");
+}
+
+#[test]
+fn enter_exit_empty_top_level_item_inside_a_quote_keeps_the_quote_prefix() {
+    let mut ed = Editor::new(1);
+    ed.load("> - a\n> - \n");
+    let pos = "> - a\n> - ".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "> - a\n> \n", "marker clears but '> ' stays for the next press");
+}
+
+#[test]
+fn enter_exit_empty_nested_item_inside_a_quote_outdents_within_the_quote() {
+    // Rule 6 (mixed): the outdent keeps the quote prefix intact — the item
+    // steps out one LIST level, not out of the quote.
+    let mut ed = Editor::new(1);
+    ed.load("> - a\n>   - b\n>   - \n");
+    let pos = "> - a\n>   - b\n>   - ".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "> - a\n>   - b\n> - \n");
+}
+
+// -- null cases -----------------------------------------------------------
+
+#[test]
+fn enter_null_on_plain_paragraph() {
+    let mut ed = Editor::new(1);
+    ed.load("plain text\n");
+    assert!(ed.command(Command::Enter { from: 5, to: 5 }).unwrap().is_none());
+}
+
+#[test]
+fn enter_null_when_cursor_sits_inside_the_marker_prefix() {
+    let mut ed = Editor::new(1);
+    ed.load("- item\n");
+    // Between "-" and the content start.
+    assert!(ed.command(Command::Enter { from: 1, to: 1 }).unwrap().is_none());
+
+    let mut ed = Editor::new(1);
+    ed.load("> text\n");
+    // Inside the quote's own marker run.
+    assert!(ed.command(Command::Enter { from: 1, to: 1 }).unwrap().is_none());
+}
+
+#[test]
+fn enter_null_on_heading_line() {
+    let mut ed = Editor::new(1);
+    ed.load("# Heading\n");
+    assert!(ed.command(Command::Enter { from: 5, to: 5 }).unwrap().is_none());
+}
+
+// -- undo -------------------------------------------------------------------
+
+#[test]
+fn enter_is_a_single_undo_unit() {
+    let mut ed = Editor::new(1);
+    ed.load("- a\n");
+    let (undo_depth, _) = ed.history_depths();
+    let pos = "- a".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.history_depths().0, undo_depth + 1, "one undo unit for the whole press");
+
+    let mut mirror = ed.get_text();
+    let u = ed.undo().unwrap();
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "- a\n");
+    assert_eq!(mirror, ed.get_text());
+}
+
+#[test]
+fn enter_presses_never_coalesce() {
+    let mut ed = Editor::new(1);
+    ed.load("- a\n");
+    let (undo0, _) = ed.history_depths();
+    let pos = "- a".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n- \n");
+    let (undo1, _) = ed.history_depths();
+    assert_eq!(undo1, undo0 + 1);
+
+    // Second press, immediately after (no coalescing window applies to
+    // commands at all — "command" origin never coalesces).
+    let pos2 = ed.get_text().len() - 1; // content start of the new empty item
+    run(&mut ed, Command::Enter { from: pos2, to: pos2 }).unwrap();
+    let (undo2, _) = ed.history_depths();
+    assert_eq!(undo2, undo1 + 1, "second press is its own undo unit");
 }
 
 #[test]

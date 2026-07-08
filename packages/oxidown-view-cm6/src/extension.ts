@@ -778,11 +778,42 @@ function commandKeymap(core: OxidownCore): Extension {
       applyCoreChange(view, change, "oxidown.command");
       return true;
     };
+  // Enter: construct-aware continuation/exit (docs/boundary-v0.md "enter",
+  // v0.3; research/07 §1.3/§1.4/§2.1). The core continues a list marker or
+  // quote prefix on non-empty content, and exits an EMPTY one in a SINGLE
+  // press (one level per press — no Obsidian double-Enter quirk). `null` =
+  // no list/quote context at the cursor → return false so the default Enter
+  // (a plain newline, via defaultKeymap registered after this keymap) runs.
+  // Never intercept while an IME composition is active: Enter then belongs
+  // to the composition (confirming a candidate), not to us.
+  const runEnter = (view: EditorView): boolean => {
+    if (view.composing) return false;
+    const { from, to } = view.state.selection.main;
+    let change: CoreChange | null;
+    try {
+      change = core.command("enter", from, to);
+    } catch (err) {
+      console.error(
+        "[oxidown] core error during command(enter) — re-loading core from view buffer:",
+        err,
+      );
+      core.load(view.state.doc.toString());
+      return true;
+    }
+    if (change === null) return false; // default Enter runs
+    applyCoreChange(view, change, "oxidown.command");
+    return true;
+  };
   return keymap.of([
     { key: "Mod-b", run: runToggle("toggleStrong"), preventDefault: true },
     { key: "Mod-i", run: runToggle("toggleEm"), preventDefault: true },
     { key: "Mod-Shift-x", run: runToggle("toggleStrike"), preventDefault: true },
     { key: "Mod-e", run: runToggle("toggleCode"), preventDefault: true },
+    // Enter continues/exits list markers and quote prefixes through the core
+    // (null → falls through to the default newline). No preventDefault: when
+    // the binding declines (plain paragraph, composing), the event must stay
+    // fully default so CM6's own Enter path handles it.
+    { key: "Enter", run: runEnter },
     // Tab indents (falling back to CM6's fixed 2-space indentUnit outside
     // list context) instead of moving focus — the standard editor tradeoff;
     // Escape then Tab leaves the editor.
@@ -820,8 +851,11 @@ export function oxidownCommands(core: OxidownCore): Extension {
  * - Renders core-computed decorations (mark/conceal/line/widget) for the
  *   viewport, recomputing at most once per frame and never during IME
  *   composition or mouse drag-selection (the anti-flicker playbook, research/01 §4).
- * - Binds Mod-z / Mod-y / Mod-Shift-z to CORE-DRIVEN undo/redo, and
- *   Mod-b / Mod-i / Mod-Shift-x / Mod-e to CORE-DRIVEN formatting commands.
+ * - Binds Mod-z / Mod-y / Mod-Shift-z to CORE-DRIVEN undo/redo,
+ *   Mod-b / Mod-i / Mod-Shift-x / Mod-e to CORE-DRIVEN formatting commands,
+ *   Tab / Shift-Tab / Mod-] / Mod-[ to marker-width-aware list nesting, and
+ *   Enter to construct-aware list/quote continuation (single-press exit on
+ *   empty items; plain paragraphs fall through to the default newline).
  *
  * IMPORTANT: do NOT include CM6's own history extension
  * (`@codemirror/commands` `history()` / `historyKeymap`) alongside this one —

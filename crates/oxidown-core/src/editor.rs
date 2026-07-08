@@ -384,6 +384,12 @@ impl Editor {
                     commands::outdent_list(&self.overlay, &src, from_b, to_b)
                 }
             }
+            Command::Enter { from, to } => {
+                let (lo, hi) = (from.min(to), from.max(to));
+                let from_b = self.text.utf16_to_byte(lo)?;
+                let to_b = self.text.utf16_to_byte(hi)?;
+                commands::enter(&self.overlay, &src, from_b, to_b)
+            }
         };
         // A plan with an empty batch means the command APPLIES but no
         // movement is possible (boundary v0.2: indentList/outdentList at the

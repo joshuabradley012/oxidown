@@ -373,6 +373,8 @@ impl OxidownCore {
     /// - `command("toggleTask", pos)`
     /// - `command("indentList"|"outdentList", from, to)` (marker-width-aware
     ///   Tab nesting, boundary v0.2)
+    /// - `command("enter", from, to)` (construct-aware Enter: list/quote
+    ///   continuation, single-press empty-item exit; boundary v0.3)
     ///
     /// Returns `CoreChange | null` (`null` when the command doesn't apply at
     /// the target). Throws on unknown names, missing arguments, or invalid
@@ -400,6 +402,11 @@ impl OxidownCore {
                 } else {
                     Command::OutdentList { from, to }
                 }
+            }
+            "enter" => {
+                let from = a as usize;
+                let to = need_b("a `to` position")? as usize;
+                Command::Enter { from, to }
             }
             "setHeading" => {
                 let level = need_b("a heading level")?;

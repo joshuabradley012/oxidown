@@ -1141,6 +1141,8 @@ export class MockCore implements OxidownCore {
         return this.indentOutdentList(a, b as number, true);
       case "outdentList":
         return this.indentOutdentList(a, b as number, false);
+      case "enter":
+        return this.enterCmd(a, b as number);
       default:
         return null;
     }
@@ -1493,6 +1495,131 @@ export class MockCore implements OxidownCore {
       }
       return this.interruptionRewrite(doc, info, info.marker.col, affected, delta, indent);
     }
+  }
+
+  /**
+   * enter (boundary v0.3): construct-aware Enter — continue a list marker or
+   * quote prefix on non-empty content, exit an EMPTY one in a SINGLE press
+   * (one level per press). A direct transcription of the Rust core's
+   * algorithm (crates/oxidown-core/src/commands.rs `enter`, module doc
+   * comment "## enter") over the same line scanning `indentOutdentList`
+   * uses. Null when neither construct applies at `from` (plain paragraph,
+   * heading, cursor inside the marker/quote prefix region) — the view falls
+   * back to the default newline. Unlike indentList/outdentList this never
+   * returns an empty-splice no-op: every applicable case produces an edit.
+   */
+  private enterCmd(fromArg: number, toArg: number): CoreChange | null {
+    if (fromArg < 0 || toArg > this.doc.length) return null;
+    const from = Math.min(fromArg, toArg);
+    const to = Math.max(fromArg, toArg);
+    const doc = this.doc;
+    const line = lineRangeContaining(doc, from);
+    const info = listLineInfo(doc, line);
+    const isBlank = (s: string): boolean => /^[ \t]*$/.test(s);
+
+    const finish = (splices: Splice[], cursor: number): CoreChange => {
+      this.pushCommandUndoUnit();
+      this.mutateDoc(splices);
+      return { revision: this.rev, splices, selection: { anchor: cursor, head: cursor } };
+    };
+
+    if (info.marker) {
+      const { col, width, glyphs } = info.marker;
+      const markerStart = info.quoteEnd + col;
+      // Content start: past the marker token; for a task item, past the
+      // "[ ] " run too. Clamped to the line's own end (a bare "-" with no
+      // trailing space is still an empty item).
+      const taskM = TASK_RE.exec(doc.slice(markerStart + width, line.end));
+      const contentStart = Math.min(
+        markerStart + width + (taskM ? taskM[0].length : 0),
+        line.end,
+      );
+      if (from < contentStart) return null; // inside the marker's prefix region
+      if (!isBlank(doc.slice(contentStart, line.end))) {
+        // CONTINUE: "\n" + quote prefix + leading indent + next marker.
+        const ordered = orderedMarkerParts(glyphs);
+        const nextMarker = ordered
+          ? `${parseInt(ordered.digits, 10) + 1}${ordered.delim} `
+          : `${glyphs} `;
+        const insert = `\n${doc.slice(line.start, markerStart)}${nextMarker}${taskM ? "[ ] " : ""}`;
+        const splices: Splice[] = [{ at: from, delete: to - from, insert }];
+        return finish(splices, from + insert.length);
+      }
+      // EXIT/OUTDENT (never inserts a newline — one press, one level).
+      if (col > 0) {
+        // Outdent this ONE line by the same target-scan/delta arithmetic as
+        // indentOutdentList's outdent path, INCLUDING both structural
+        // rewrite guards. No subtree: an empty item has none.
+        let targetCol: number | null = null;
+        let cursor = line.start;
+        for (;;) {
+          const range = prevLineRange(doc, cursor);
+          if (!range) break;
+          const prev = listLineInfo(doc, range);
+          if (prev.quoteDepth !== info.quoteDepth) break;
+          if (!prev.marker) break;
+          if (prev.marker.col < col) {
+            targetCol = prev.marker.col;
+            break;
+          }
+          cursor = range.start;
+        }
+        if (targetCol !== null) {
+          const delta = col - targetCol;
+          const newCol = col - delta;
+          const affected = new Map<number, ListLineInfo>([[info.start, info]]);
+          const splices: Splice[] = [{ at: info.quoteEnd, delete: delta, insert: "" }];
+          const rewrite = this.interruptionRewrite(doc, info, newCol, affected, delta, false);
+          if (rewrite) splices.splice(1, 0, rewrite);
+          if (from !== to) splices.push({ at: from, delete: to - from, insert: "" });
+          // v1 punt (mirrors the Rust core): a selection consuming past this
+          // line skips the below-line guard rather than risk overlap.
+          if (to <= line.end) {
+            const below = this.belowLineRewrite(doc, affected, info.quoteDepth, newCol, delta, false);
+            if (below) splices.push(below);
+          }
+          return finish(splices, mapPos(contentStart, splices, 1));
+        }
+        // No qualifying parent above: fall through to the marker clear.
+      }
+      // Top-level: delete the marker token (task brackets included), keep
+      // any quote prefix — the line becomes an (empty) paragraph/quote line.
+      const splices: Splice[] = [
+        { at: markerStart, delete: contentStart - markerStart, insert: "" },
+      ];
+      if (from !== to) splices.push({ at: from, delete: to - from, insert: "" });
+      return finish(splices, mapPos(contentStart, splices, 1));
+    }
+
+    if (info.quoteDepth > 0) {
+      if (from < info.quoteEnd) return null; // inside the quote markers
+      if (!isBlank(doc.slice(info.quoteEnd, line.end))) {
+        // QUOTE CONTINUE: "\n" + the line's exact quote prefix.
+        const insert = `\n${doc.slice(line.start, info.quoteEnd)}`;
+        const splices: Splice[] = [{ at: from, delete: to - from, insert }];
+        return finish(splices, from + insert.length);
+      }
+      // QUOTE EXIT: drop the LAST "> " run element only — one level per
+      // press ("> > " -> "> " -> plain), never the whole prefix at once.
+      let rest = doc.slice(line.start, line.end);
+      let consumed = 0;
+      let lastLen = 0;
+      for (;;) {
+        const m = BQ_MARKER_RE.exec(rest);
+        if (!m) break;
+        lastLen = m[0].length;
+        consumed += lastLen;
+        rest = rest.slice(lastLen);
+      }
+      if (lastLen === 0) return null; // defensive: quoteDepth said otherwise
+      const splices: Splice[] = [
+        { at: line.start + consumed - lastLen, delete: lastLen, insert: "" },
+      ];
+      if (from !== to) splices.push({ at: from, delete: to - from, insert: "" });
+      return finish(splices, mapPos(info.quoteEnd, splices, 1));
+    }
+
+    return null; // neither a list marker nor a quote prefix applies here
   }
 
   // ---------------------------------------------------------------------------

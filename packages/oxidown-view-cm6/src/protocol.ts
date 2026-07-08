@@ -117,11 +117,16 @@ export interface CoreChange {
 }
 
 /**
- * v0.2 command names accepting a (from, to) range. `indentList`/
+ * v0.2/v0.3 command names accepting a (from, to) range. `indentList`/
  * `outdentList` are marker-width-aware Tab nesting (docs/boundary-v0.md
  * "indentList / outdentList"): they apply only when the range touches a
  * list-item line, and return a NO-OP CoreChange (empty splices) rather than
- * `null` when they apply but no movement is possible.
+ * `null` when they apply but no movement is possible. `enter` (v0.3,
+ * docs/boundary-v0.md "enter") is construct-aware Enter — continue a list
+ * marker/quote prefix on non-empty content, exit an EMPTY one in a SINGLE
+ * press: `null` when neither construct applies at the target (the view
+ * falls back to the default newline); unlike indentList/outdentList it
+ * never returns an empty-splice no-op (every applicable case edits).
  */
 export type RangeCommandName =
   | "toggleStrong"
@@ -129,7 +134,8 @@ export type RangeCommandName =
   | "toggleStrike"
   | "toggleCode"
   | "indentList"
-  | "outdentList";
+  | "outdentList"
+  | "enter";
 
 export interface OxidownCore {
   /** Create/replace the document. Returns revision 0's successor. */

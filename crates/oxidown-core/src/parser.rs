@@ -337,17 +337,38 @@ pub fn parse_document(src: &str) -> ParseResult {
                 task.reveal_extent = Some(line.clone());
                 task.item_extent = Some(item);
                 nodes.push(task);
-            } else if range.start > item_start {
-                let delim = ordered_marker_delim(bytes, item_start, range.start);
-                let number = delim.and(item_number);
-                let mut marker = leaf(
-                    NodeKind::ListMarker { task: false, depth: item_depth, number, delim },
-                    item_start..range.start,
-                    range.end..range.end,
-                    vec![],
-                );
-                marker.reveal_extent = Some(line);
-                nodes.push(marker);
+            } else {
+                // Marker end: normally the next event's start (pulldown's
+                // lookahead — the item's real content begins there). An
+                // EMPTY item (`"- \n"`, `"1. \n"`, a bare `"-"`) emits
+                // nothing between `Start(Item)` and `End(Item)`, so the
+                // materializing event is the item's own End, whose range
+                // starts back at `item_start` — the marker token is then
+                // SYNTHESIZED by scanning the source bytes directly (glyphs
+                // + delimiter + the single trailing space if present),
+                // exactly as if content followed. Without this an empty
+                // item had NO marker node at all: no bullet/ordered widget,
+                // no `line:list-item` decoration, and the `enter` command's
+                // empty-item exit rules couldn't see the item. Empty items
+                // still consumed their `list_seq` slot at `Start(Item)`, so
+                // ordered numbering counts them like any sibling.
+                let marker_end = if range.start > item_start {
+                    range.start
+                } else {
+                    empty_item_marker_end(bytes, item_start)
+                };
+                if marker_end > item_start {
+                    let delim = ordered_marker_delim(bytes, item_start, marker_end);
+                    let number = delim.and(item_number);
+                    let mut marker = leaf(
+                        NodeKind::ListMarker { task: false, depth: item_depth, number, delim },
+                        item_start..marker_end,
+                        marker_end..marker_end,
+                        vec![],
+                    );
+                    marker.reveal_extent = Some(line);
+                    nodes.push(marker);
+                }
             }
         }
 
@@ -682,6 +703,40 @@ fn thematic_break_node(bytes: &[u8], range: Range<usize>) -> Option<Node> {
 /// run followed by one of those two bytes (i.e. this is a bullet marker, or
 /// malformed). Read directly from source bytes — the parser's own lookahead
 /// already located the marker span; this just classifies it.
+/// Marker-token end for an EMPTY list item, synthesized directly from the
+/// source bytes because pulldown emits no content event whose start would
+/// otherwise locate it: leading fold-in whitespace (pulldown can fold a few
+/// bytes of incidental indentation into an item's span), the marker glyphs
+/// (`-`/`+`/`*` or a digit run plus `.`/`)`), and the single trailing
+/// space/tab IF PRESENT (a bare `"-"` with no trailing space is still an
+/// empty item per CommonMark/pulldown — its marker is just the glyph).
+/// Returns `item_start` (an empty span — no marker emitted) if no marker
+/// shape is found; unreachable for spans pulldown reported as items, but
+/// never worth corrupting spans over.
+fn empty_item_marker_end(bytes: &[u8], item_start: usize) -> usize {
+    let mut i = item_start;
+    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(b'-' | b'+' | b'*') => i += 1,
+        Some(b) if b.is_ascii_digit() => {
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+            match bytes.get(i) {
+                Some(b'.' | b')') => i += 1,
+                _ => return item_start,
+            }
+        }
+        _ => return item_start,
+    }
+    if matches!(bytes.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    i
+}
+
 fn ordered_marker_delim(bytes: &[u8], start: usize, end: usize) -> Option<u8> {
     if !bytes.get(start).is_some_and(u8::is_ascii_digit) {
         return None;
@@ -1105,6 +1160,75 @@ mod tests {
             markers.iter().map(|m| ordered_number_delim(m).0).collect::<Vec<_>>(),
             vec![Some(1), Some(2)]
         );
+    }
+
+    #[test]
+    fn empty_bullet_item_gets_a_synthesized_marker() {
+        // pulldown emits NOTHING between Start(Item) and End(Item) for an
+        // empty item, so the marker is synthesized from source bytes: same
+        // node shape as if content followed (extent = glyphs + the single
+        // trailing space, LINE-level reveal extent).
+        let nodes = parse("- a\n- \n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[1].extent, 4..6, "\"- \" incl. the trailing space");
+        assert_eq!(markers[1].reveal_extent, Some(4..6), "the item's whole (empty) line");
+        assert_eq!(markers[1].kind, NodeKind::ListMarker { task: false, depth: 1, number: None, delim: None });
+    }
+
+    #[test]
+    fn bare_dash_empty_item_marker_is_just_the_glyph() {
+        // A bare "-" with no trailing space is still an empty item per
+        // CommonMark; its synthesized marker is glyph-only.
+        let nodes = parse("- a\n-\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[1].extent, 4..5);
+    }
+
+    #[test]
+    fn empty_ordered_item_keeps_its_sequence_slot() {
+        // The empty middle item consumed its list_seq slot at Start(Item):
+        // displayed numbering counts it like any sibling (1, 2, 3).
+        let nodes = parse("1. a\n2. \n3. c\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 3);
+        assert_eq!(markers[1].extent, 5..8, "\"2. \" incl. the trailing space");
+        assert_eq!(
+            markers.iter().map(|m| ordered_number_delim(m)).collect::<Vec<_>>(),
+            vec![(Some(1), Some(b'.')), (Some(2), Some(b'.')), (Some(3), Some(b'.'))]
+        );
+    }
+
+    #[test]
+    fn empty_nested_item_gets_marker_and_indent_nodes() {
+        // The continue-created shape ("- a" > "  - b" > Enter): the empty
+        // nested item still emits BOTH its ListItemIndent (hanging-indent
+        // line decoration + concealed spaces) and its marker.
+        let doc = "- a\n  - b\n  - \n";
+        let nodes = parse(doc);
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 3);
+        let empty_marker = markers[2];
+        assert_eq!(empty_marker.extent, 12..14);
+        assert!(matches!(empty_marker.kind, NodeKind::ListMarker { task: false, depth: 2, .. }));
+        assert_eq!(empty_marker.reveal_extent, Some(10..14), "whole line incl. the indent");
+        let indents: Vec<_> = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::ListItemIndent { .. }))
+            .collect();
+        assert!(
+            indents.iter().any(|n| n.extent == (10..12)),
+            "the empty nested item's leading indent is its own node"
+        );
+    }
+
+    #[test]
+    fn empty_item_inside_a_blockquote_gets_a_marker() {
+        let nodes = parse("> - a\n> - \n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[1].extent, 8..10);
     }
 
     #[test]

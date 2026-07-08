@@ -357,6 +357,67 @@ fn ordered_list_marker_reveals_raw_digits_on_the_line() {
 }
 
 #[test]
+fn empty_bullet_item_still_renders_widget_and_line_decoration() {
+    // An EMPTY item ("- " with nothing after it — the shape every Enter
+    // continuation press creates) must render exactly like any other item:
+    // bullet widget over the marker span + the list-item line decoration.
+    // (Previously it emitted NOTHING: pulldown produces no content event
+    // for an empty item, so no marker node existed — the parser now
+    // synthesizes it from source bytes.)
+    let d = decos("- one\n- \n", &[]);
+    assert_eq!(d, vec![li(0, 1), bullet(0, 2), li(6, 1), bullet(6, 8)]);
+}
+
+#[test]
+fn empty_ordered_item_renders_a_counted_widget() {
+    // The empty middle item occupies its slot in the run: 1, 2, 3.
+    let d = decos("1. a\n2. \n3. c\n", &[]);
+    assert_eq!(
+        d,
+        vec![
+            li(0, 1),
+            ordered(0, 3, 1, b'.'),
+            li(5, 1),
+            ordered(5, 8, 2, b'.'),
+            li(9, 1),
+            ordered(9, 12, 3, b'.'),
+        ]
+    );
+}
+
+#[test]
+fn empty_nested_item_renders_indent_conceal_and_widget() {
+    // The continue-created nested shape: the empty depth-2 item still gets
+    // its indent conceal + li(depth 2) + bullet widget, and reveals as raw
+    // source with a cursor on its line, like any other item.
+    let doc = "- a\n  - b\n  - \n";
+    let d = decos(doc, &[]);
+    assert_eq!(
+        d,
+        vec![
+            li(0, 1),
+            bullet(0, 2),
+            conceal(4, 6),
+            li(6, 2),
+            bullet(6, 8),
+            conceal(10, 12),
+            li(12, 2),
+            bullet(12, 14),
+        ]
+    );
+    let pos = doc.len() - 1; // on the empty item's line
+    let d = decos(doc, &[(pos, pos)]);
+    assert_eq!(
+        d[5..],
+        vec![
+            mark(10, 12, MarkStyle::Delim),
+            li_rev(12, 2),
+            mark(12, 14, MarkStyle::ListMarker),
+        ]
+    );
+}
+
+#[test]
 fn ordered_markers_display_sequential_numbers_ignoring_raw_digits() {
     // "1./1./3." must DISPLAY 1,2,3 (research/07 §0: CommonMark only fixes
     // the list's start number; sibling digits are cosmetic).

@@ -137,6 +137,96 @@
 //!   column. This is intended standard outliner behavior (the sibling keeps
 //!   its itemness; a later re-indent of the parent carries it along as part
 //!   of the subtree).
+//!
+//! ## enter
+//!
+//! Construct-aware Enter (contract v0.3 addition, research/07 §1.3/§1.4/§2.1):
+//! continues a list marker or quote prefix, or exits an EMPTY one in a
+//! SINGLE press — Obsidian needs an awkward double-Enter for the latter; we
+//! don't. Every rule below reads constructs from the parsed overlay (never a
+//! line regex) — the same discipline `indentList`/`outdentList` uses, and
+//! the reason research/07 §2.3 gives for why Obsidian's own Tab/Enter have
+//! quote+list interaction bugs it doesn't.
+//!
+//! Let `L` = the line containing `from` (after `from`/`to` are normalized to
+//! `from <= to`, matching every other range command). Vocabulary reused
+//! from `indentList`/`outdentList`: quote prefix, list marker, marker
+//! column, marker token width. **Content start** = marker column's content
+//! column (marker token width past the marker glyph), EXCEPT for a task
+//! item, where it is past the `- [ ] ` run — found via the `TaskWidget`
+//! node's own extent (`widget.extent.end + 1`, the required space after
+//! `]`) rather than a fixed-width guess, so any tolerated extra pre-checkbox
+//! whitespace is still handled correctly.
+//!
+//! 1. **Not applicable → `None`**: `L` has neither a list marker nor a quote
+//!    prefix, OR `from` sits inside `L`'s prefix region (before content
+//!    start for a list item; before the quote prefix's end for a quote-only
+//!    line). **v1 punt**: both cases fall back to the view's default Enter
+//!    (a plain newline) rather than doing anything construct-aware.
+//! 2. **Continue** (list item, content after the marker is non-empty):
+//!    replace `[from, to]` with `"\n"` + `L`'s quote prefix + `L`'s leading
+//!    indent (the raw bytes between the quote prefix and the marker glyph,
+//!    copied verbatim) + the next marker: same bullet glyph; ordered raw
+//!    source digits + 1 with the same delimiter (`"9. "` → `"10. "`, digit
+//!    width grows naturally — no zero-padding); task items append `"[ ] "`
+//!    (new items always start unchecked). Text after `to` on `L` becomes the
+//!    new item's content — a mid-line Enter splits the item, no special
+//!    casing needed. Selection collapses to the end of the inserted prefix.
+//! 3. **Exit/outdent** (list item, content EMPTY — nothing or only
+//!    whitespace from content start to `L`'s end, and `from` is at/after
+//!    content start): NO `"\n"` is ever inserted in this branch — one Enter
+//!    press is one level of escape, matching §1.4's "ship the better
+//!    mechanic" recommendation.
+//!    - Marker column `> 0` (nested, incl. nested-in-quote): outdent this
+//!      ONE line by the same target-scan/delta arithmetic as
+//!      `plan_list_nesting`'s outdent path, INCLUDING both structural
+//!      rewrite guards (`interruption_rewrite`/`below_line_rewrite`) — the
+//!      whole-document itemness invariant must hold exactly as it does for
+//!      `outdentList`. No subtree walk: an empty item is accepted to carry
+//!      none (v1 simplification — a degenerate empty item with block
+//!      children below it is out of scope). If the target scan finds no
+//!      qualifying parent above (the same v1 "doesn't look past a blank
+//!      line" limitation `outdentList` has — vanishingly rare for a
+//!      genuinely nested marker), falls through to the top-level branch
+//!      instead of leaving the press inert.
+//!    - Marker column `0` (top-level): delete the marker token
+//!      (dash/digits+delimiter+space, PLUS the task brackets+space for a
+//!      task item) from `L`, leaving any quote prefix intact — `L` becomes
+//!      an (empty) paragraph/quote line. No guard needed here: deleting a
+//!      line's entire marker run always leaves that line blank, which
+//!      naturally inserts the blank-line separator CommonMark needs before
+//!      any non-1 ordered sibling below can safely start/continue a list —
+//!      the interruption hazard `outdentList`'s guards exist for cannot
+//!      arise from this branch.
+//! 4. **Quote continue** (quote prefix, no marker, non-empty content after
+//!    the prefix): replace `[from, to]` with `"\n"` + `L`'s exact quote
+//!    prefix bytes.
+//! 5. **Quote exit** (quote-only line, content after the prefix EMPTY):
+//!    drop the LAST `"> "` run element only — one level per press
+//!    (`"> > "` → `"> "` on the first press, `"> "` → plain on the second),
+//!    never all levels at once (the single-press philosophy applies per
+//!    level, not per line).
+//! 6. **Mixed** (list inside a quote): the innermost construct governs,
+//!    piecewise, matching the contract's construct-aware discipline
+//!    elsewhere — rules 2/3 keep `L`'s quote prefix intact in the
+//!    continuation/outdent; an empty TOP-LEVEL item inside a quote clears
+//!    just the marker (rule 3's top-level branch), leaving `"> "` for rule 5
+//!    to strip on a later press.
+//! 7. **Selection** (`from != to`): context is resolved from the pre-edit
+//!    parse at `from` only. Rules 2/4 fold the delete into the same splice
+//!    as the continuation insert. Rules 3/5 (no insert) instead append a
+//!    separate delete-`[from, to]` splice after the marker/prefix edit
+//!    (ascending: `from` is always at/after content start, strictly past
+//!    where the marker/prefix edit lands) — one batch, one undo unit either
+//!    way. **v1 punt**: if `to` extends past `L`'s own end (a selection
+//!    spanning into further lines) rule 3's below-line guard is skipped
+//!    rather than risk overlapping the consumed lines; this is expected to
+//!    be a vanishingly rare gesture (Enter is not usually pressed over a
+//!    multi-line selection that also needs the interruption guard).
+//! 8. Unlike `indentList`/`outdentList`, the applies-but-no-op distinction
+//!    never arises here: every applicable case (2 through 6) produces a real
+//!    splice batch. `enter` returns either `None` (rule 1) or `Some` with a
+//!    non-empty batch — never `Some` with an empty one.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -161,6 +251,12 @@ pub enum Command {
     /// toggles; the editor resolves to bytes and normalizes `from <= to`.
     IndentList { from: usize, to: usize },
     OutdentList { from: usize, to: usize },
+    /// Construct-aware Enter (boundary v0.3): continue a list marker/quote
+    /// prefix, or exit an empty one in one press. UTF-16 range; the editor
+    /// resolves to bytes and normalizes `from <= to`. `None` when neither
+    /// construct applies at the target (the view falls back to a plain
+    /// newline) — see the module doc comment's "## enter" section.
+    Enter { from: usize, to: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -756,12 +852,16 @@ fn plan_list_nesting(
     })
 }
 
-/// The ordered-marker shape at `item_start`: `(digit_run_len, value_is_one,
-/// delimiter_byte)`. `None` for bullet markers. `value_is_one` is numeric
-/// (`01.` counts as 1, per CommonMark's "start number" semantics).
-fn ordered_marker(src: &SrcBytes, item_start: usize) -> Option<(usize, bool, u8)> {
+/// Parse a raw ordered marker's literal digit run at `item_start`:
+/// `(digit_run_len, numeric_value, delimiter_byte)`. `None` for a bullet
+/// marker. Shared by `ordered_marker` (which only needs the "is this `1`"
+/// family check for the paragraph-interruption guard) and `enter`'s CONTINUE
+/// rule (which needs the actual literal value, to increment it).
+fn ordered_marker_value(src: &SrcBytes, item_start: usize) -> Option<(usize, u64, u8)> {
     let mut i = item_start;
+    let mut value: u64 = 0;
     while src.get(i).is_some_and(|b| b.is_ascii_digit()) {
+        value = value * 10 + u64::from(src.byte(i) - b'0');
         i += 1;
     }
     if i == item_start {
@@ -771,13 +871,17 @@ fn ordered_marker(src: &SrcBytes, item_start: usize) -> Option<(usize, bool, u8)
     if delim != b'.' && delim != b')' {
         return None;
     }
-    // `value_is_one` ⇔ the digits, leading zeros stripped, are exactly "1".
-    let mut sig = item_start;
-    while sig < i && src.byte(sig) == b'0' {
-        sig += 1;
-    }
-    let is_one = sig + 1 == i && src.byte(sig) == b'1';
-    Some((i - item_start, is_one, delim))
+    Some((i - item_start, value, delim))
+}
+
+/// The ordered-marker shape at `item_start`: `(digit_run_len, value_is_one,
+/// delimiter_byte)`. `None` for bullet markers. `value_is_one` is numeric
+/// (`01.` counts as 1, per CommonMark's "start number" semantics) —
+/// `ordered_marker_value`'s parsed value already has any leading zeros
+/// stripped arithmetically.
+fn ordered_marker(src: &SrcBytes, item_start: usize) -> Option<(usize, bool, u8)> {
+    let (digit_len, value, delim) = ordered_marker_value(src, item_start)?;
+    Some((digit_len, value == 1, delim))
 }
 
 /// A line's marker column as it will read AFTER the edit: affected lines
@@ -922,4 +1026,234 @@ pub fn indent_list(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -
 /// instead of `None`, since the command still applies).
 pub fn outdent_list(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Option<CommandPlan> {
     plan_list_nesting(nodes, src, from_b, to_b, false)
+}
+
+// ---------------------------------------------------------------------
+// enter (boundary v0.3: construct-aware Enter — continue/exit list markers
+// and quote prefixes). See the module doc comment's "## enter" section for
+// the full spec — this is a direct transcription of it.
+// ---------------------------------------------------------------------
+
+/// Whether every byte in `range` is a plain space or tab — "no real content"
+/// for `enter`'s empty-item/empty-quote-line checks. An empty range counts
+/// as blank (nothing at all after the marker/prefix).
+fn is_blank(src: &SrcBytes, range: Range<usize>) -> bool {
+    (range.start..range.end).all(|i| matches!(src.get(i), Some(b' ' | b'\t')))
+}
+
+/// The `BlockQuoteLine` node for the physical line starting at `line_start`,
+/// if any — gives direct access to that line's per-level `"> "` delimiter
+/// spans (`enter`'s QUOTE EXIT rule drops only the LAST one).
+fn blockquote_line_node(nodes: &[Node], line_start: usize) -> Option<&Node> {
+    nodes
+        .iter()
+        .find(|n| matches!(n.kind, NodeKind::BlockQuoteLine(_)) && n.extent.start == line_start)
+}
+
+/// `enter`'s EXIT/OUTDENT rule for a NESTED empty item (marker column > 0):
+/// outdent this ONE line (no subtree — an empty item is accepted to carry
+/// none, per the module doc comment) by the same target-scan/delta
+/// arithmetic as `plan_list_nesting`'s outdent path, INCLUDING both
+/// structural rewrite guards. `content_start` is the line's own (pre-edit)
+/// content start, used to place the post-edit cursor. Returns `None` when no
+/// qualifying parent is found above (the same v1 blank-line-scan limitation
+/// `outdentList` has) so the caller can fall back to a full marker clear
+/// instead of leaving the press inert.
+fn outdent_single_line(
+    nodes: &[Node],
+    src: &SrcBytes,
+    line: &ListLineCtx,
+    content_start: usize,
+    from_b: usize,
+    to_b: usize,
+) -> Option<CommandPlan> {
+    let first_col = line.marker_column().expect("caller verified this line has a marker");
+
+    // Target scan: nearest line above, same quote depth, strictly smaller
+    // marker column (identical to `plan_list_nesting`'s outdent branch, just
+    // restricted to a single starting line rather than a whole batch).
+    let mut target_col: Option<usize> = None;
+    let mut cursor = line.start;
+    while let Some(range) = prev_line(src, cursor) {
+        let ctx = list_line_ctx(nodes, src, range.clone());
+        if ctx.quote_depth != line.quote_depth {
+            break;
+        }
+        let Some(col) = ctx.marker_column() else {
+            break;
+        };
+        if col < first_col {
+            target_col = Some(col);
+            break;
+        }
+        cursor = range.start;
+    }
+    let target_col = target_col?;
+    let delta = first_col - target_col; // > 0 by construction
+
+    let mut affected: BTreeMap<usize, ListLineCtx> = BTreeMap::new();
+    affected.insert(line.start, *line);
+
+    let mut batch = vec![ByteSplice {
+        at: line.quote_end,
+        delete: delta,
+        insert: String::new(),
+    }];
+    let new_col = first_col - delta; // == target_col
+    if let Some(rewrite) = interruption_rewrite(nodes, src, line, new_col, &affected, delta, false) {
+        batch.insert(1, rewrite);
+    }
+    if from_b != to_b {
+        batch.push(ByteSplice {
+            at: from_b,
+            delete: to_b - from_b,
+            insert: String::new(),
+        });
+    }
+    // v1 punt (module doc comment, rule 7): skip the below-line guard rather
+    // than risk it overlapping a selection that consumed past this line.
+    if to_b <= line.end {
+        if let Some(rewrite) =
+            below_line_rewrite(nodes, src, &affected, line.quote_depth, new_col, delta, false)
+        {
+            batch.push(rewrite);
+        }
+    }
+    let cursor = mapping::map_pos(content_start, &batch, Bias::After);
+    Some(CommandPlan {
+        batch,
+        selection: Some((cursor, cursor)),
+    })
+}
+
+/// Construct-aware Enter (boundary v0.3): continue a list marker/quote
+/// prefix, or exit an empty one in one press. `None` when neither construct
+/// applies at `from` (the view falls back to a plain newline). See the
+/// module doc comment's "## enter" section for the full spec.
+pub fn enter(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Option<CommandPlan> {
+    let (from_b, to_b) = (from_b.min(to_b), from_b.max(to_b));
+    let line_range = line_containing(src, from_b);
+    let ctx = list_line_ctx(nodes, src, line_range.clone());
+
+    if let Some((item_start, token_width)) = ctx.marker {
+        let marker_node = nodes.iter().find(|n| {
+            matches!(n.kind, NodeKind::ListMarker { .. })
+                && n.extent.start <= item_start
+                && item_start < n.extent.end
+        })?;
+        let task = matches!(marker_node.kind, NodeKind::ListMarker { task: true, .. });
+        let after_glyphs = item_start + token_width;
+        let content_start = if task {
+            // Read the checkbox's own extent rather than assuming a fixed
+            // width, so any (CommonMark-tolerated) extra pre-checkbox
+            // whitespace is still handled correctly.
+            let widget = nodes.iter().find(|n| {
+                matches!(n.kind, NodeKind::TaskWidget { .. })
+                    && n.extent.start >= after_glyphs
+                    && n.extent.start < line_range.end
+            })?;
+            widget.extent.end + 1 // the checkbox's required trailing space
+        } else {
+            after_glyphs
+        }
+        // A bare "-"/"1." with NO trailing space is still an empty item per
+        // CommonMark/pulldown; the fixed token width assumes the space
+        // exists, so clamp — content can never start past the line's end.
+        .min(line_range.end);
+        if from_b < content_start {
+            return None; // cursor sits inside the marker's prefix region
+        }
+        if !is_blank(src, content_start..line_range.end) {
+            // CONTINUE (rule 2).
+            let mut prefix = String::new();
+            src.push_slice_to(&mut prefix, line_range.start..ctx.quote_end); // quote prefix
+            src.push_slice_to(&mut prefix, ctx.quote_end..item_start); // leading indent
+            if let Some((_, value, delim)) = ordered_marker_value(src, item_start) {
+                prefix.push_str(&(value + 1).to_string());
+                prefix.push(delim as char);
+                prefix.push(' ');
+            } else {
+                prefix.push(src.byte(item_start) as char);
+                prefix.push(' ');
+            }
+            if task {
+                prefix.push_str("[ ] ");
+            }
+            let insert = format!("\n{prefix}");
+            let end = from_b + insert.len();
+            return Some(CommandPlan {
+                batch: vec![ByteSplice {
+                    at: from_b,
+                    delete: to_b - from_b,
+                    insert,
+                }],
+                selection: Some((end, end)),
+            });
+        }
+        // EXIT/OUTDENT (rule 3).
+        let marker_column = item_start - ctx.quote_end;
+        if marker_column > 0 {
+            if let Some(plan) = outdent_single_line(nodes, src, &ctx, content_start, from_b, to_b) {
+                return Some(plan);
+            }
+            // No qualifying parent above: fall through to the top-level
+            // marker-clear branch below rather than leaving the press inert.
+        }
+        let mut batch = vec![ByteSplice {
+            at: item_start,
+            delete: content_start - item_start,
+            insert: String::new(),
+        }];
+        if from_b != to_b {
+            batch.push(ByteSplice {
+                at: from_b,
+                delete: to_b - from_b,
+                insert: String::new(),
+            });
+        }
+        let cursor = mapping::map_pos(content_start, &batch, Bias::After);
+        return Some(CommandPlan {
+            batch,
+            selection: Some((cursor, cursor)),
+        });
+    }
+
+    if ctx.quote_depth > 0 {
+        if from_b < ctx.quote_end {
+            return None; // cursor sits inside the quote markers
+        }
+        if !is_blank(src, ctx.quote_end..line_range.end) {
+            // QUOTE CONTINUE (rule 4).
+            let mut prefix = String::new();
+            src.push_slice_to(&mut prefix, line_range.start..ctx.quote_end);
+            let insert = format!("\n{prefix}");
+            let end = from_b + insert.len();
+            return Some(CommandPlan {
+                batch: vec![ByteSplice {
+                    at: from_b,
+                    delete: to_b - from_b,
+                    insert,
+                }],
+                selection: Some((end, end)),
+            });
+        }
+        // QUOTE EXIT (rule 5): drop the LAST "> " run element only.
+        let bq = blockquote_line_node(nodes, line_range.start)?;
+        let last = bq.delims.last()?.clone();
+        let mut batch = vec![del(&last)];
+        if from_b != to_b {
+            batch.push(ByteSplice {
+                at: from_b,
+                delete: to_b - from_b,
+                insert: String::new(),
+            });
+        }
+        let cursor = mapping::map_pos(ctx.quote_end, &batch, Bias::After);
+        return Some(CommandPlan {
+            batch,
+            selection: Some((cursor, cursor)),
+        });
+    }
+
+    None // rule 1: neither a list marker nor a quote prefix applies here
 }

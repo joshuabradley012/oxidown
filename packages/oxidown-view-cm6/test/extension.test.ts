@@ -7,7 +7,8 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { EditorState } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { EditorView, keymap } from "@codemirror/view";
+import { defaultKeymap } from "@codemirror/commands";
 import { MockCore } from "../src/mock-core";
 import { applyCoreChange, oxidown } from "../src/extension";
 import type { Decoration } from "../src/protocol";
@@ -269,6 +270,80 @@ describe("Tab/Shift-Tab keymap (indentList/outdentList with indentMore/indentLes
 
     expect(view.state.doc.toString()).toBe("1. a\n   1. b\n");
     expect(core.getText()).toBe(view.state.doc.toString());
+    view.destroy();
+  });
+});
+
+describe("Enter keymap (construct-aware continue/exit with default-newline fallback)", () => {
+  const enterKey = () =>
+    new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true });
+
+  function makeViewWithDefaults(doc: string, core: MockCore) {
+    // Mirror the documented host setup: oxidown() BEFORE defaultKeymap, so
+    // the core-driven Enter wins where it applies and CM6's own
+    // insertNewline* handles the null fallback.
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    return new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        extensions: [oxidown(core, { verifyMirror: true }), keymap.of(defaultKeymap)],
+      }),
+    });
+  }
+
+  it("falls back to the default newline in a plain paragraph", async () => {
+    const core = new MockCore();
+    const view = makeViewWithDefaults("plain paragraph", core);
+    view.dispatch({ selection: { anchor: 5 } });
+
+    view.contentDOM.dispatchEvent(enterKey());
+    await flush();
+
+    // CM6's own insertNewlineAndIndent ran (it eats the whitespace after
+    // the cursor while reindenting — its stock behavior): the core-driven
+    // binding declined (null) and did NOT swallow the key.
+    expect(view.state.doc.toString()).toBe("plain\nparagraph");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    view.destroy();
+  });
+
+  it("continues a list item and exits the empty one — full round trip through CM6", async () => {
+    const core = new MockCore();
+    const doc = "- buy milk\n";
+    const view = makeViewWithDefaults(doc, core);
+    view.dispatch({ selection: { anchor: doc.indexOf("milk") + 4 } });
+
+    // Press 1: continue — new "- " item, cursor after its marker.
+    view.contentDOM.dispatchEvent(enterKey());
+    await flush();
+    expect(view.state.doc.toString()).toBe("- buy milk\n- \n");
+    expect(view.state.selection.main.head).toBe("- buy milk\n- ".length);
+    expect(core.getText()).toBe(view.state.doc.toString());
+
+    // Press 2: the item is empty — single-press exit clears the marker
+    // (no newline inserted; no double-Enter quirk).
+    view.contentDOM.dispatchEvent(enterKey());
+    await flush();
+    expect(view.state.doc.toString()).toBe("- buy milk\n\n");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    view.destroy();
+  });
+
+  it("does not intercept Enter while an IME composition is active", async () => {
+    const core = new MockCore();
+    const commandSpy = vi.spyOn(core, "command");
+    const view = makeViewWithDefaults("- item\n", core);
+    view.dispatch({ selection: { anchor: 6 } });
+    // Force the composing state (jsdom cannot run a real IME session; the
+    // guard reads view.composing, so shadow the getter on the instance).
+    Object.defineProperty(view, "composing", { get: () => true });
+
+    view.contentDOM.dispatchEvent(enterKey());
+    await flush();
+
+    expect(commandSpy).not.toHaveBeenCalledWith("enter", expect.anything(), expect.anything());
     view.destroy();
   });
 });
