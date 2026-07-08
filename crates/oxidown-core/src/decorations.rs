@@ -150,6 +150,15 @@ pub enum WidgetKind {
     /// cursor sitting at the item text's first character does not reveal),
     /// so ordinary typing at the item start never flashes the raw marker.
     Bullet,
+    /// An ordered list item's marker, replacing the whole marker span
+    /// (digits + delimiter + trailing whitespace, e.g. `"1. "`) with the
+    /// VIEW-COMPUTED CommonMark sequence number (contract v0.3 amendment;
+    /// research/07 §0/§1.2: CommonMark only gives a list's `start` number
+    /// meaning, so the core computes the displayed number from position-in-
+    /// run here rather than rewriting source digits, unlike Obsidian).
+    /// Withheld as `mark:list-marker` (raw source digits) on reveal —
+    /// LINE-level, matching every other marker construct.
+    Ordered { number: u64, delim: u8 },
 }
 
 /// Closed-interval intersection: empty ranges (cursors) at a boundary count.
@@ -177,7 +186,7 @@ pub fn compute(
             .any(|&(a, b)| touches(a, b, reveal_extent.start, reveal_extent.end));
 
         match node.kind {
-            NodeKind::ListMarker { task, depth } => {
+            NodeKind::ListMarker { task, depth, number, delim } => {
                 if node.extent.end <= node.extent.start {
                     continue;
                 }
@@ -225,9 +234,30 @@ pub fn compute(
                             kind: WidgetKind::Bullet,
                         });
                     }
+                } else if revealed || in_composition {
+                    // Revealed (line-level, matching every other marker
+                    // construct): raw source digits, unchanged from today.
+                    out.push(Decoration::Mark {
+                        from,
+                        to,
+                        style: MarkStyle::ListMarker,
+                    });
+                } else if let (Some(number), Some(delim)) = (number, delim) {
+                    // Concealed: a computed-number WIDGET replacing the whole
+                    // marker span — the view-computed display number
+                    // (contract v0.3 amendment, research/07 §0/§1.2), never
+                    // the item's raw source digits. Alignment (fixed-width,
+                    // right-aligned, tabular numerals) is the view's job, the
+                    // same box `mark:list-marker` used before.
+                    out.push(Decoration::Widget {
+                        from,
+                        to,
+                        kind: WidgetKind::Ordered { number, delim },
+                    });
                 } else {
-                    // Ordered markers stay visible text, always (alignment is
-                    // the view's job via styling).
+                    // Defensive: an ordered marker (is_bullet == false) always
+                    // carries number+delim from the parser; never silently
+                    // drop the marker if that invariant is somehow violated.
                     out.push(Decoration::Mark {
                         from,
                         to,

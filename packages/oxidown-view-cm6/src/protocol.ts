@@ -67,6 +67,12 @@ export interface DecorationLine {
  * v0.2 addition: a replace-range island. `from`/`to` is the source range the
  * widget visually REPLACES ("[ ]" / "[x]"); the view renders `widget` in its
  * place. Views MUST ignore widget kinds they don't recognize.
+ *
+ * v0.3 addition: "ordered" — see boundary-v0.md's v0.3 amendment
+ * ("view-computed ordered-list numbering", research/07 §0/§1.2). `number`/
+ * `delim` are optional on the wire (forward-compat with v0.2 views, and
+ * defensive for any future widget kind that doesn't need them), but are
+ * always present together when `widget === "ordered"`.
  */
 export interface DecorationWidget {
   kind: "widget";
@@ -77,9 +83,20 @@ export interface DecorationWidget {
    * "bullet": replaces an unordered item's whole marker span (`"- "`); reveal
    * is STRICT interior overlap, so the cursor at the item text's first
    * character never flashes the raw marker.
+   * "ordered": replaces an ordered item's whole marker span (`"1. "`) with
+   * the VIEW-COMPUTED CommonMark sequence number (carried in `number`) plus
+   * its delimiter (`delim`, `"."` or `")"`) — the core NEVER rewrites source
+   * digits (research/07: Obsidian's renumber-by-rewriting-the-file approach,
+   * avoided). Reveal is LINE-level, matching every other marker construct: a
+   * cursor anywhere on the item's line withholds the widget in favor of the
+   * raw source digits as `mark:list-marker`.
    */
-  widget: "task" | "bullet";
+  widget: "task" | "bullet" | "ordered";
   checked?: boolean;
+  /** "ordered" only: the view-computed display number. */
+  number?: number;
+  /** "ordered" only: the marker's delimiter character, `"."` or `")"`. */
+  delim?: string;
 }
 export type Decoration = DecorationMark | DecorationConceal | DecorationLine | DecorationWidget;
 

@@ -451,6 +451,73 @@ describe("v0.2 additions (M1)", () => {
     view.destroy();
   });
 
+  it("ordered marker widget renders the computed number, replaced by raw digits when the line is revealed", async () => {
+    // Contract v0.3 amendment (research/07 §0/§1.2): a concealed ordered
+    // marker is a widget rendering the VIEW-COMPUTED number, never raw
+    // source digits.
+    const core = new MockCore();
+    const doc = "1. one\n2. two\nelsewhere";
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        // Cursor on a DIFFERENT line (reveal is line-level) so both markers
+        // start concealed (widgets rendered) rather than revealed.
+        selection: { anchor: doc.length },
+        extensions: [oxidown(core, { verifyMirror: true })],
+      }),
+    });
+    await flush();
+
+    // .trim() strips the widget's trailing NBSP (the required marker
+    // whitespace, rendered as a non-collapsing space — see extension.ts):
+    // the assertion cares about the displayed digits+delim, not that detail.
+    const markerText = () =>
+      Array.from(view.contentDOM.querySelectorAll(".ox-ordered-marker")).map(
+        (el) => el.textContent?.trim(),
+      );
+    expect(markerText()).toEqual(["1.", "2."]);
+
+    // Move the cursor onto the FIRST item's line: its widget is replaced by
+    // raw source digits (mark:list-marker, plain text in the DOM); the
+    // second item's widget is untouched.
+    view.dispatch({ selection: { anchor: 3 } });
+    await flush();
+    expect(markerText()).toEqual(["2."]);
+    expect(view.contentDOM.textContent).toContain("1. one");
+    view.destroy();
+  });
+
+  it("ordered marker widgets display the view-computed sequence, not raw digits", async () => {
+    // "1./1./3." must DISPLAY 1,2,3 (research/07 §0: CommonMark only fixes
+    // the list's start number; sibling digits are cosmetic).
+    const core = new MockCore();
+    const doc = "1. a\n1. b\n3. c\nelsewhere";
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        selection: { anchor: doc.length },
+        extensions: [oxidown(core, { verifyMirror: true })],
+      }),
+    });
+    await flush();
+
+    // .trim() strips the widget's trailing NBSP (the required marker
+    // whitespace, rendered as a non-collapsing space — see extension.ts):
+    // the assertion cares about the displayed digits+delim, not that detail.
+    const markerText = () =>
+      Array.from(view.contentDOM.querySelectorAll(".ox-ordered-marker")).map(
+        (el) => el.textContent?.trim(),
+      );
+    expect(markerText()).toEqual(["1.", "2.", "3."]);
+    view.destroy();
+  });
+
   it("an unknown decoration style/widget kind from the core is ignored without crashing", async () => {
     const core = new MockCore();
     const view = makeView("hello world", core);

@@ -74,16 +74,52 @@ export const oxidownTheme = EditorView.baseTheme({
   "&dark .ox-link": { color: "#7db2ff" },
   ".ox-url": { opacity: "0.6", fontStyle: "italic" },
 
-  // List markers. Ordered markers stay text ("1. ") and get a fixed-width,
-  // right-aligned box with tabular numerals so single/double-digit items
-  // align; the bullet widget (below) shares the same box metrics so
-  // conceal↔reveal never shifts the item text.
+  // List markers. REVEALED ordered markers are raw digits styled as text
+  // ("1. ") in a fixed-width, right-aligned box with tabular numerals so
+  // single/double-digit items align; the ordered-marker widget and the
+  // bullet widget (below) share the same box metrics so conceal<->reveal
+  // never shifts the item text.
   ".ox-list-marker": {
     opacity: "0.7",
     fontVariantNumeric: "tabular-nums",
     display: "inline-block",
     minWidth: "1.5em",
     textAlign: "right",
+  },
+  // CONCEALED ordered-marker widget (contract v0.3 amendment, research/07
+  // §0/§1.2): replaces the whole "1. "/"2) " span with the VIEW-COMPUTED
+  // display number. Same column metrics as `.ox-list-marker` above (a
+  // separate rule, not a shared class, mirroring `.ox-bullet` below) so
+  // nothing shifts visually for well-numbered lists.
+  ".ox-ordered-marker": {
+    display: "inline-block",
+    minWidth: "1.5em",
+    textAlign: "right",
+    opacity: "0.7",
+    fontVariantNumeric: "tabular-nums",
+    // Same caret-height fix as `.ox-bullet` below: an uncapped inline-block
+    // widget box inflates the adjacent caret (and coordsAtPos rect) to the
+    // full line height. UNLIKE the bullet's `::before` dot, this box's
+    // content is real TEXT, which already carries its own baseline — an
+    // inline-block's CSS baseline is the baseline of its own last in-flow
+    // line box, which capping `height` below that line box's natural height
+    // does not move (the box's content still lays out at its inherited
+    // 1.5 line-height and simply overflows the capped box invisibly, since
+    // the surrounding `.cm-line` already reserves that height). So
+    // `vertical-align: baseline` (the default; stated explicitly here) is
+    // the right call — NOT `.ox-bullet`'s `text-bottom`, which would shift
+    // real digit glyphs off the line's text baseline.
+    //
+    // MEASURED (not just reasoned about): rendered the demo's "2. ordered
+    // two" line and compared, via Range.getBoundingClientRect() on the
+    // digit glyph inside the widget vs. the "o" glyph of the following
+    // plain text, their screen rects — topDiff/bottomDiff both 0px (exact
+    // pixel match). Separately confirmed the ELEMENT's own bounding rect
+    // (what coordsAtPos/caret sizing sees) reports the capped 19.2px
+    // (1.2em @ 16px font), not the line's natural 24px (1.5 line-height) —
+    // i.e. the cap only shrinks the reported box, never the glyph position.
+    height: "1.2em",
+    verticalAlign: "baseline",
   },
   // Unordered bullet widget (replaces the raw "- " span when concealed).
   // The dot is a pure-CSS circle (`::before`), NOT a text glyph — so its

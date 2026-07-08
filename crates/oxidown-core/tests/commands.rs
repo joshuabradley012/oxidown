@@ -4,7 +4,7 @@
 //! splice coordinates (every returned CoreChange's splices are applied to a
 //! plain String mirror exactly as the view would apply them).
 
-use oxidown_core::{Command, CoreChange, EditOrigin, Editor, Splice};
+use oxidown_core::{Command, CoreChange, Decoration, EditOrigin, Editor, Splice, WidgetKind};
 
 fn utf16_to_byte_str(s: &str, cu: usize) -> usize {
     let mut count = 0;
@@ -813,6 +813,42 @@ fn chained_indent_then_outdent_on_the_flagship_repro() {
     assert_list_item_line(&ed, "1. ordered two");
     assert_list_item_line(&ed, "1. nested ordered item");
     assert_list_item_line(&ed, "- a bullet nested under an ordered item");
+}
+
+#[test]
+fn chained_indent_repro_end_state_has_correctly_sequenced_widgets() {
+    // Same doc/first step as `chained_indent_then_outdent_on_the_flagship_repro`
+    // (research/07 view-computed numbering, boundary-v0.md v0.3 amendment):
+    // the command's digit rewrite (1./1./1./.../3.) is STRUCTURAL only — the
+    // DISPLAYED sequence must still read 1,2,3 per list, regardless of the
+    // raw digits the command left behind.
+    let doc = "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n3. ordered three\n";
+    let mut ed = Editor::new(1);
+    ed.load(doc);
+    run(&mut ed, Command::IndentList { from: 21, to: 21 }).unwrap();
+    assert_eq!(
+        ed.get_text(),
+        "1. ordered one\n   1. ordered two\n      1. nested ordered item\n      - a bullet nested under an ordered item\n3. ordered three\n",
+    );
+
+    let rev = ed.revision();
+    let decos = ed.decorations(rev, 0, ed.doc_len_utf16(), &[]).unwrap();
+    let numbers: Vec<u64> = decos
+        .iter()
+        .filter_map(|d| match d {
+            Decoration::Widget {
+                kind: WidgetKind::Ordered { number, .. },
+                ..
+            } => Some(*number),
+            _ => None,
+        })
+        .collect();
+    // Document order: "ordered one" (top-level list, #1), "ordered two"
+    // (its own single-item nested list, #1), "nested ordered item" (a
+    // further-nested single-item list, #1), "ordered three" (back at
+    // top-level, second item of the SAME list as "ordered one" -> #2, even
+    // though its raw digit is still "3").
+    assert_eq!(numbers, vec![1, 1, 1, 2]);
 }
 
 #[test]

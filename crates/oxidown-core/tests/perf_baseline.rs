@@ -525,6 +525,14 @@ fn decoration_to_json(d: &Decoration) -> serde_json::Value {
                 "to": to,
                 "widget": "bullet",
             }),
+            WidgetKind::Ordered { number, delim } => json!({
+                "kind": "widget",
+                "from": from,
+                "to": to,
+                "widget": "ordered",
+                "number": number,
+                "delim": (*delim as char).to_string(),
+            }),
         },
     }
 }
@@ -607,6 +615,13 @@ fn decorations_json_string(decos: &[Decoration]) -> String {
                     let _ = write!(
                         s,
                         "{{\"from\":{from},\"kind\":\"widget\",\"to\":{to},\"widget\":\"bullet\"}}"
+                    );
+                }
+                WidgetKind::Ordered { number, delim } => {
+                    let _ = write!(
+                        s,
+                        "{{\"delim\":\"{}\",\"from\":{from},\"kind\":\"widget\",\"number\":{number},\"to\":{to},\"widget\":\"ordered\"}}",
+                        *delim as char
                     );
                 }
             },

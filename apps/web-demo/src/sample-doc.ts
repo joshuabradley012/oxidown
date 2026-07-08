@@ -92,6 +92,12 @@ Escapes and traps: \\*not italic\\*, \\\`not code\\\`, a_snake_case_word, 2*3*4 
   - back to a bullet after the weird fence attempt
 1. ordered with ***bold italic*** and \`\${template}\` chars
 2. > a quote nested under an ordered item?
+
+### View-computed numbering (start != 1, raw digits ignored)
+
+4. starts at four — displays 4, 5, 6 (CommonMark: only the list's start number is meaningful)
+5. five
+9. six — raw source digit is cosmetic; the view computes the sequence
 `;
 
 export const SAMPLE_DOC = `# Oxidown demo

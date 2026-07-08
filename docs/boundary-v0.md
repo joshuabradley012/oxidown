@@ -176,7 +176,8 @@ widget kinds they don't recognize (forward compatibility).
 // mark styles (added): "strike" | "link" | "url" | "list-marker"
 //   link  = the visible text of a link
 //   url   = the destination part, emitted only when the link node is revealed
-//   list-marker = bullet/number markers ("- ", "1. ") — always visible, styled, never concealed
+//   list-marker = bullet/number markers ("- ", "1. ") — the REVEALED-state style; concealed
+//                 markers use widget:bullet / widget:ordered instead (v0.3 amendment, below)
 // line styles (added): "blockquote" (with depth) | "code-block" | "code-fence" | "hr"
 export interface DecorationLineV2 {
   kind: "line";
@@ -189,8 +190,12 @@ export interface DecorationWidget {
   kind: "widget";
   from: number;
   to: number;                 // source range the widget REPLACES visually
-  widget: "task" | "bullet";  // task: "[ ]"/"[x]" (carries checked); bullet: the whole "- " marker (LINE-level reveal)
+  // v0.3 amendment: "ordered" — see "Ordered-list numbering is a computed-value
+  // WIDGET" below. number/delim are present together iff widget === "ordered".
+  widget: "task" | "bullet" | "ordered";
   checked?: boolean;
+  number?: number;  // "ordered" only: the VIEW-COMPUTED display number
+  delim?: string;   // "ordered" only: the marker's delimiter, "." or ")"
 }
 ```
 
@@ -203,11 +208,12 @@ M1 emission scope (parser may understand more than it decorates):
   `mark:code` on body content. The raw fence text (``` + info string) conceals; reveal is
   **BLOCK-level**: a cursor/selection anywhere inside the fenced block (either fence or the
   body) reveals BOTH raw fences as `mark:delim`, so they are editable whenever the block is.
-- Lists — ordered markers emit `mark:list-marker` (always visible; alignment is view styling:
-  fixed-width right-aligned box + tabular numerals). **Unordered markers emit `widget:bullet`
-  replacing the whole marker span (`"- "`)**, revealed as `mark:list-marker`. Task markers
-  conceal (the checkbox widget represents the item) and reveal as `mark:delim`, dash and
-  brackets in lockstep.
+- Lists — CONCEALED ordered markers emit `widget:ordered` (v0.3 amendment — see below), replacing
+  the whole marker span with a VIEW-COMPUTED display number; revealed they show as
+  `mark:list-marker` (alignment is view styling: fixed-width right-aligned box + tabular
+  numerals). **Unordered markers emit `widget:bullet` replacing the whole marker span (`"- "`)**,
+  revealed as `mark:list-marker`. Task markers conceal (the checkbox widget represents the item)
+  and reveal as `mark:delim`, dash and brackets in lockstep.
 - **Every list item line** emits `{kind:"line", style:"list-item", depth, revealed?}` (1-based
   depth) at the marker position — the view uses it for hanging indent (wrapped item text aligns
   with the first line's text). Nested items (depth ≥ 2) additionally emit a `conceal` over the
@@ -226,6 +232,41 @@ M1 emission scope (parser may understand more than it decorates):
   full source geometry (the view drops decorative padding/bars/indent and neutralizes marker
   boxes — `ox-src`). Fenced-code reveal stays BLOCK-level; inline marks (strong/em/code/strike/
   link) keep per-node reveal.
+- **Ordered-list numbering is a computed-value WIDGET (v0.3 amendment — research/07 §0/§1.2).**
+  CommonMark only gives an ordered list's `start` number semantic meaning — display of the
+  sibling items is a renderer choice, not something the raw digits are required to spell out
+  correctly. Obsidian (v1.8.3) chose to fix this by literally rewriting every sibling's digit in
+  the saved source text on every insert/delete, which research/07 documents as the direct cause
+  of a year-long tail of renumbering/cross-list-bleed/Tab-interaction bugs — exactly the kind of
+  unsolicited byte-level rewrite `plan.md` principle #1 and this document's model rule #2
+  ("the core never mutates text on its own initiative") rule out. Oxidown instead computes the
+  DISPLAY number in the decoration pipeline and leaves the source untouched:
+  - `number` is `start + position-in-run`: the enclosing list's `start` (its first item's own
+    literal digits, or 1 if absent) plus a zero-based count of items seen so far in that SAME
+    list. `"4." / "5." / "9."` therefore displays `4, 5, 6` (start honored, then strictly
+    sequential) and `"1." / "1." / "3."` displays `1, 2, 3` — raw sibling digits are cosmetic.
+  - `delim` is the marker's literal delimiter byte, `"."` or `")"`. Per CommonMark, changing
+    delimiter (or switching between ordered and bullet) ends the enclosing list and starts a new
+    one, so a `)`-flavored run's sequence is independent of any preceding `.`-flavored run at the
+    same nesting position — its own counter restarts from ITS OWN first item's literal digits.
+  - Nested ordered lists restart their own sequence (their own counter), under bullets, under
+    tasks, and inside blockquotes alike — matching the parser's existing per-list-item depth
+    tracking, not a new structural concept.
+  - Reveal behavior is UNCHANGED from the rest of this section: LINE-level, matching every other
+    marker construct. A cursor/selection touching any part of the item's line withholds the
+    widget and shows the RAW source digits instead, as `mark:list-marker` — exactly the literal
+    bytes on disk, never the computed number. Editing therefore always operates on true source.
+  - **Rationale, restated plainly: display numbering is a VIEW computation. The core never
+    rewrites source digits** — `indentList`/`outdentList`'s own minimal structural digit rewrites
+    (only where CommonMark would otherwise fail to parse the result as list items at all) are the
+    one narrow, already-documented exception, and are orthogonal to this cosmetic-numbering
+    concern.
+  - **Compatibility note:** this is additive to the wire schema (a new `widget` tag), but a view
+    that doesn't recognize `"ordered"` and falls back to "ignore unknown widget kinds" per the
+    v0.2 forward-compatibility rule above will render NOTHING for a concealed ordered marker
+    (not stale/wrong text — an empty gap), since the raw digits are only ever emitted when the
+    line is revealed. Every view MUST adopt this widget kind to render ordered lists at all.
+    Breaking-in-practice, but accepted pre-1.0 with a single first-party view (`oxidown-view-cm6`).
 - Thematic break — `line:hr` on the line, plus `conceal` over the raw dashes (revealed as
   `mark:delim` when the cursor is on the line). The view draws the actual rule on the hr line;
   nested blockquote bars are likewise the view's job (one bar per depth level).

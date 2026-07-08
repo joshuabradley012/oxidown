@@ -127,6 +127,15 @@ interface ParsedNode {
    * at the item text's first character does not reveal).
    */
   bullet?: { from: number; to: number };
+  /**
+   * Present for ordered-list marker nodes: the whole "1. "/"2) " span,
+   * replaced by a widget:ordered (carrying the VIEW-COMPUTED `number` and
+   * `delim`) when concealed, or a mark:list-marker (raw source digits) when
+   * this LINE-level node's extent is revealed — contract v0.3 amendment,
+   * research/07 §0/§1.2. `number` is never the item's raw source digits;
+   * see `nextOrderedNumber` below.
+   */
+  ordered?: { from: number; to: number; number: number; delim: string };
 }
 
 function runLength(src: string, i: number, ch: string): number {
@@ -326,6 +335,85 @@ function matchListMarker(line: string): ListMarkerMatch | null {
 }
 
 // ---------------------------------------------------------------------------
+// View-computed ordered-list numbering (contract v0.3 amendment, research/07
+// §0/§1.2): a direct-parity transcription of the Rust core's per-open-list
+// `list_seq` counter stack (crates/oxidown-core/src/parser.rs), adapted to
+// this mock's much simpler LINE-based (not block-tree-based) model. The core
+// tracks one counter per currently-OPEN `Tag::List`, pushed/popped at
+// Start/End; this mock has no such tree, so it approximates "currently open
+// list" with a slot keyed by (quote depth, marker column) — the same
+// start+increment semantics, just addressed differently. Persisted across
+// `parseLineContent` calls for one `parseDoc` pass (document order).
+// ---------------------------------------------------------------------------
+
+interface OrderedSlot {
+  delim: string;
+  /** Next number to assign to the following sibling at this slot. */
+  next: number;
+}
+
+/** Per-(quote depth, marker column) running sequence, for one `parseDoc` pass. */
+type OrderedSeq = Map<string, OrderedSlot>;
+
+function slotKey(quoteDepth: number, column: number): string {
+  return `${quoteDepth}:${column}`;
+}
+
+/**
+ * A marker (bullet or ordered) just appeared at `column` (quote depth
+ * `quoteDepth`): any DEEPER slot (a nested list under whatever was here
+ * before) has closed — mirrors the real parser's `End(List)` popping a
+ * nested frame once its container line is behind us.
+ */
+function closeDeeperOrderedSlots(seq: OrderedSeq, quoteDepth: number, column: number): void {
+  for (const key of seq.keys()) {
+    const sep = key.indexOf(":");
+    const d = Number(key.slice(0, sep));
+    const c = Number(key.slice(sep + 1));
+    if (d === quoteDepth && c > column) seq.delete(key);
+  }
+}
+
+/**
+ * View-computed display number for an ordered marker at (quoteDepth, column)
+ * whose raw source digits are `rawDigits` and whose delimiter is `delim`.
+ * CONTINUES the slot's running sequence when one is already open there with
+ * the SAME delimiter flavor (a `.`/`)` change — or no open sequence at all —
+ * STARTS a fresh one at the marker's OWN literal digits, matching
+ * CommonMark's "a list's start is its first item's own number", verified
+ * directly against pulldown-cmark's behavior for a delimiter/kind change).
+ */
+function nextOrderedNumber(
+  seq: OrderedSeq,
+  quoteDepth: number,
+  column: number,
+  delim: string,
+  rawDigits: number,
+): number {
+  const key = slotKey(quoteDepth, column);
+  const existing = seq.get(key);
+  if (existing && existing.delim === delim) {
+    seq.set(key, { delim, next: existing.next + 1 });
+    return existing.next;
+  }
+  seq.set(key, { delim, next: rawDigits + 1 });
+  return rawDigits;
+}
+
+/** A bullet marker occupies (quoteDepth, column): any ordered sequence that
+ * was open there has ended (marker-kind change starts a new list). */
+function closeOrderedSlotForBullet(seq: OrderedSeq, quoteDepth: number, column: number): void {
+  seq.delete(slotKey(quoteDepth, column));
+}
+
+/** The ordered-marker parts of a matched marker glyph run, read directly
+ * from source: raw literal digits (as a number) and the delimiter char. */
+function rawOrderedParts(content: string, markerFrom: number): { rawDigits: number; delim: string } {
+  const m = /^(\d+)([.)])/.exec(content.slice(markerFrom));
+  return m ? { rawDigits: parseInt(m[1], 10), delim: m[2] } : { rawDigits: 1, delim: "." };
+}
+
+// ---------------------------------------------------------------------------
 // indentList / outdentList (boundary v0.2: marker-width-aware Tab nesting).
 // A direct transcription of the Rust core's algorithm (crates/oxidown-core/
 // src/commands.rs `plan_list_nesting`) over plain-string line scanning
@@ -456,9 +544,18 @@ function orderedMarkerParts(glyphs: string): { digits: string; delim: string; is
 /**
  * Parse one "logical line" of content (heading / list item / plain paragraph
  * text) at document offset `base`, pushing nodes into `nodes`. Shared by the
- * top-level line loop and by blockquote line remainders.
+ * top-level line loop and by blockquote line remainders. `quoteDepth` (0
+ * outside any blockquote) and `seq` (the running ordered-sequence state for
+ * this `parseDoc` pass) address the view-computed ordered numbering slot —
+ * see `nextOrderedNumber`.
  */
-function parseLineContent(content: string, base: number, nodes: ParsedNode[]): void {
+function parseLineContent(
+  content: string,
+  base: number,
+  nodes: ParsedNode[],
+  quoteDepth: number,
+  seq: OrderedSeq,
+): void {
   const headingM = HEADING_RE.exec(content);
   if (headingM) {
     const level = headingM[1].length;
@@ -470,6 +567,8 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
       line: { kind: "line", at: base, style: `h${level}` as DecorationLine["style"] },
     });
     parseInline(content.slice(level + 1), base + level + 1, nodes);
+    // A heading interrupts any open list run at this quote depth.
+    seq.clear();
     return;
   }
 
@@ -493,26 +592,55 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
       marks: [],
       line: { kind: "line", at: base, style: "list-item", depth },
     });
+    // Any list nested DEEPER than this marker's own column (at this quote
+    // depth) has closed, regardless of this marker's own kind.
+    closeDeeperOrderedSlots(seq, quoteDepth, markerFrom);
     const afterMarker = content.slice(contentFrom);
     const taskM = TASK_RE.exec(afterMarker);
     if (taskM) {
-      // Task items: the `- ` marker conceals (no bullet widget) and reveals
-      // in lockstep with the checkbox — both on the same line-spanning node.
       const checkboxFrom = base + contentFrom;
       const checkboxTo = checkboxFrom + 3; // "[ ]" / "[x]"
       const itemContentFrom = contentFrom + taskM[0].length;
-      nodes.push({
-        start: base,
-        end: lineTo,
-        conceals: [[base + markerFrom, base + contentFrom]],
-        marks: [],
-        widget: { from: checkboxFrom, to: checkboxTo, checked: taskM[1] !== " " },
-      });
+      if (isBullet) {
+        // Bullet task items: the `- ` marker conceals (no bullet widget) and
+        // reveals in lockstep with the checkbox — both on the same
+        // line-spanning node (matches the Rust core: task marker conceals
+        // only when is_bullet && task).
+        closeOrderedSlotForBullet(seq, quoteDepth, markerFrom);
+        nodes.push({
+          start: base,
+          end: lineTo,
+          conceals: [[base + markerFrom, base + contentFrom]],
+          marks: [],
+          widget: { from: checkboxFrom, to: checkboxTo, checked: taskM[1] !== " " },
+        });
+      } else {
+        // Ordered task items: the marker is independent of the checkbox —
+        // it still takes the computed-number ordered path (Rust core:
+        // is_bullet == false always does, task or not), while the checkbox
+        // is its own separate widget.
+        const { rawDigits, delim } = rawOrderedParts(content, markerFrom);
+        const number = nextOrderedNumber(seq, quoteDepth, markerFrom, delim, rawDigits);
+        nodes.push({
+          start: base,
+          end: lineTo,
+          conceals: [],
+          marks: [],
+          ordered: { from: base + markerFrom, to: base + contentFrom, number, delim },
+        });
+        nodes.push({
+          start: base,
+          end: lineTo,
+          conceals: [],
+          marks: [],
+          widget: { from: checkboxFrom, to: checkboxTo, checked: taskM[1] !== " " },
+        });
+      }
       parseInline(content.slice(itemContentFrom), base + itemContentFrom, nodes);
       return;
     }
-    const marks: InlineMark[] = [];
     if (isBullet) {
+      closeOrderedSlotForBullet(seq, quoteDepth, markerFrom);
       nodes.push({
         start: base,
         end: lineTo,
@@ -521,19 +649,32 @@ function parseLineContent(content: string, base: number, nodes: ParsedNode[]): v
         bullet: { from: base + markerFrom, to: base + contentFrom },
       });
     } else {
-      marks.push({ from: base + markerFrom, to: base + contentFrom, style: "list-marker" });
+      const { rawDigits, delim } = rawOrderedParts(content, markerFrom);
+      const number = nextOrderedNumber(seq, quoteDepth, markerFrom, delim, rawDigits);
+      nodes.push({
+        start: base,
+        end: lineTo,
+        conceals: [],
+        marks: [],
+        ordered: { from: base + markerFrom, to: base + contentFrom, number, delim },
+      });
     }
-    nodes.push({ start: base + markerFrom, end: base + contentFrom, conceals: [], marks });
     parseInline(content.slice(contentFrom), base + contentFrom, nodes);
     return;
   }
 
   parseInline(content, base, nodes);
+  // A plain paragraph line interrupts any open list run (the mock does not
+  // model loose-list/lazy-continuation paragraph absorption).
+  seq.clear();
 }
 
 /** Parse the full document into formatted/line/widget nodes. */
 export function parseDoc(doc: string): ParsedNode[] {
   const nodes: ParsedNode[] = [];
+  // View-computed ordered-list sequence state for this pass (contract v0.3
+  // amendment, research/07 §0/§1.2) — see `nextOrderedNumber`.
+  const seq: OrderedSeq = new Map();
   let lineStart = 0;
   while (lineStart <= doc.length) {
     let lineEnd = doc.indexOf("\n", lineStart);
@@ -544,6 +685,7 @@ export function parseDoc(doc: string): ParsedNode[] {
     // Never concealed; body content is marked `code` but not inline-parsed.
     const fenceM = FENCE_RE.exec(line);
     if (fenceM) {
+      seq.clear(); // a fenced block interrupts any open list run
       const fenceChar = fenceM[1][0];
       const fenceLen = fenceM[1].length;
       // BLOCK-level reveal: fence nodes span the whole fenced block, so a
@@ -593,6 +735,7 @@ export function parseDoc(doc: string): ParsedNode[] {
     // Thematic break: hr line style + the raw dashes concealed (revealed as
     // delim when the cursor is on the line); the view draws the rule.
     if (HR_RE.test(line)) {
+      seq.clear(); // a thematic break interrupts any open list run
       nodes.push({
         start: lineStart,
         end: lineEnd,
@@ -625,13 +768,13 @@ export function parseDoc(doc: string): ParsedNode[] {
         marks: [],
         line: { kind: "line", at: lineStart, style: "blockquote", depth },
       });
-      parseLineContent(rest, offset, nodes);
+      parseLineContent(rest, offset, nodes, depth, seq);
       if (lineEnd === doc.length) break;
       lineStart = lineEnd + 1;
       continue;
     }
 
-    parseLineContent(line, lineStart, nodes);
+    parseLineContent(line, lineStart, nodes, 0, seq);
     if (lineEnd === doc.length) break;
     lineStart = lineEnd + 1;
   }
@@ -860,6 +1003,26 @@ export class MockCore implements OxidownCore {
           out.push({ kind: "mark", from: node.bullet.from, to: node.bullet.to, style: "list-marker" });
         } else {
           out.push({ kind: "widget", from: node.bullet.from, to: node.bullet.to, widget: "bullet" });
+        }
+        continue;
+      }
+
+      if (node.ordered) {
+        // Contract v0.3 amendment (research/07 §0/§1.2): concealed ordered
+        // markers are a computed-number WIDGET, never the raw source
+        // digits; LINE-level reveal (same node-extent discipline as bullet)
+        // shows the raw digits as mark:list-marker.
+        if (revealed) {
+          out.push({ kind: "mark", from: node.ordered.from, to: node.ordered.to, style: "list-marker" });
+        } else {
+          out.push({
+            kind: "widget",
+            from: node.ordered.from,
+            to: node.ordered.to,
+            widget: "ordered",
+            number: node.ordered.number,
+            delim: node.ordered.delim,
+          });
         }
         continue;
       }

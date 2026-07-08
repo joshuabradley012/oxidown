@@ -536,10 +536,14 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     expect(conceals(revealed)).toEqual([]);
   });
 
-  it("bullets are widgets with LINE-level reveal; ordered markers stay marks", () => {
+  it("bullets AND ordered markers are both widgets with LINE-level reveal", () => {
+    // Contract v0.3 amendment (research/07 §0/§1.2): concealed ordered
+    // markers are a computed-number widget too, not a plain mark — the core
+    // never rewrites source digits.
     const doc = "- item\n1. other";
     const { core } = makeCore(doc);
-    // Cursor on the SECOND line: the first item's bullet stays a widget.
+    // Cursor on the SECOND line: the first item's bullet stays a widget, and
+    // the second item's ordered marker reveals (raw digits, mark:list-marker).
     const ds = core.decorations(core.revision(), 0, doc.length, cursor(12));
     expect(ds.filter((d) => d.kind === "widget")).toEqual([
       { kind: "widget", from: 0, to: 2, widget: "bullet" },
@@ -554,13 +558,15 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
       { kind: "line", at: 7, style: "list-item", depth: 1, revealed: true },
     ]);
     // Caret anywhere on the bullet line — marker, text, or line end —
-    // reveals the raw marker and flags the line.
+    // reveals the raw bullet marker and flags the line; the ordered marker
+    // (untouched line) now renders as its computed-number widget instead.
     for (const pos of [0, 1, 2, 4, 6]) {
       const revealed = core.decorations(core.revision(), 0, doc.length, cursor(pos));
-      expect(revealed.filter((d) => d.kind === "widget")).toEqual([]);
+      expect(revealed.filter((d) => d.kind === "widget")).toEqual([
+        { kind: "widget", from: 7, to: 10, widget: "ordered", number: 1, delim: "." },
+      ]);
       expect(marks(revealed, "list-marker")).toEqual([
         { kind: "mark", from: 0, to: 2, style: "list-marker" },
-        { kind: "mark", from: 7, to: 10, style: "list-marker" },
       ]);
       expect(lines(revealed)[0]).toEqual({
         kind: "line",
@@ -571,6 +577,52 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
       });
     }
     expect(conceals(ds)).toEqual([]);
+  });
+
+  it("ordered markers display sequential numbers ignoring raw digits (mock parity)", () => {
+    // "1./1./3." must DISPLAY 1,2,3 — research/07 §0: CommonMark only fixes
+    // the list's start number; sibling digits are cosmetic.
+    const { core } = makeCore("1. a\n1. b\n3. c\n");
+    const ds = core.decorations(core.revision(), 0, core.docLength(), []);
+    const widgets = ds.filter(
+      (d): d is Extract<Decoration, { kind: "widget"; widget: "ordered" }> =>
+        d.kind === "widget" && d.widget === "ordered",
+    );
+    expect(widgets.map((w) => w.number)).toEqual([1, 2, 3]);
+  });
+
+  it("ordered list start number is honored (mock parity)", () => {
+    // "4./5./9." displays 4,5,6.
+    const { core } = makeCore("4. a\n5. b\n9. c\n");
+    const ds = core.decorations(core.revision(), 0, core.docLength(), []);
+    const widgets = ds.filter(
+      (d): d is Extract<Decoration, { kind: "widget"; widget: "ordered" }> =>
+        d.kind === "widget" && d.widget === "ordered",
+    );
+    expect(widgets.map((w) => w.number)).toEqual([4, 5, 6]);
+  });
+
+  it("a delimiter change starts a new, sequence-independent ordered list (mock parity)", () => {
+    const { core } = makeCore("1. a\n2) b\n");
+    const ds = core.decorations(core.revision(), 0, core.docLength(), []);
+    const widgets = ds.filter(
+      (d): d is Extract<Decoration, { kind: "widget"; widget: "ordered" }> =>
+        d.kind === "widget" && d.widget === "ordered",
+    );
+    expect(widgets.map((w) => [w.number, w.delim])).toEqual([
+      [1, "."],
+      [2, ")"],
+    ]);
+  });
+
+  it("a nested ordered list restarts its own sequence (mock parity)", () => {
+    const { core } = makeCore("1. a\n   1. nested\n   2. nested2\n2. b\n");
+    const ds = core.decorations(core.revision(), 0, core.docLength(), []);
+    const widgets = ds.filter(
+      (d): d is Extract<Decoration, { kind: "widget"; widget: "ordered" }> =>
+        d.kind === "widget" && d.widget === "ordered",
+    );
+    expect(widgets.map((w) => w.number)).toEqual([1, 1, 2, 2]);
   });
 
   it("task list item: widget:task (concealed) or delims (LINE-level reveal)", () => {

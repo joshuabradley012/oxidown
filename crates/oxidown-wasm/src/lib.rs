@@ -161,6 +161,13 @@ fn decorations_json_string(decos: &[Decoration]) -> String {
                         "{{\"from\":{from},\"kind\":\"widget\",\"to\":{to},\"widget\":\"bullet\"}}"
                     );
                 }
+                oxidown_core::WidgetKind::Ordered { number, delim } => {
+                    let _ = write!(
+                        s,
+                        "{{\"delim\":\"{}\",\"from\":{from},\"kind\":\"widget\",\"number\":{number},\"to\":{to},\"widget\":\"ordered\"}}",
+                        *delim as char
+                    );
+                }
             },
         }
     }
@@ -217,6 +224,14 @@ fn decoration_json(d: &Decoration) -> serde_json::Value {
                 "from": from,
                 "to": to,
                 "widget": "bullet",
+            }),
+            oxidown_core::WidgetKind::Ordered { number, delim } => json!({
+                "kind": "widget",
+                "from": from,
+                "to": to,
+                "widget": "ordered",
+                "number": number,
+                "delim": (*delim as char).to_string(),
             }),
         },
     }
@@ -495,6 +510,9 @@ mod wire_format {
             v.push(Decoration::Widget { from: 9, to: 14, kind: WidgetKind::Task { checked } });
         }
         v.push(Decoration::Widget { from: 0, to: 2, kind: WidgetKind::Bullet });
+        for (number, delim) in [(1u64, b'.'), (12u64, b')')] {
+            v.push(Decoration::Widget { from: 0, to: 4, kind: WidgetKind::Ordered { number, delim } });
+        }
         v
     }
 

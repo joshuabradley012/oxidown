@@ -245,6 +245,51 @@ class BulletWidget extends WidgetType {
 }
 
 /**
+ * Ordered-list marker: replaces the raw "1. "/"2) " marker span with the
+ * VIEW-COMPUTED display number (contract v0.3 amendment, research/07
+ * §0/§1.2) — CommonMark only gives a list's `start` number meaning, so the
+ * core computes each item's position-in-run and the view renders THAT,
+ * never the item's raw source digits (which stay untouched on disk; the
+ * source is only shown when the line is revealed, as raw `mark:list-marker`
+ * text). Not interactive — `ignoreEvent` returns false so clicks fall
+ * through to the editor and place the cursor normally (matching
+ * BulletWidget).
+ */
+class OrderedMarkerWidget extends WidgetType {
+  constructor(
+    private readonly number: number,
+    private readonly delim: string,
+  ) {
+    super();
+  }
+
+  eq(other: OrderedMarkerWidget): boolean {
+    return other.number === this.number && other.delim === this.delim;
+  }
+
+  toDOM(): HTMLElement {
+    // Unlike the bullet's pseudo-element dot, this box's content IS text —
+    // see theme.ts's `.ox-ordered-marker` for the measured height/baseline
+    // treatment (a text baseline behaves differently from a centered dot).
+    // The widget replaces the WHOLE marker span, required trailing space
+    // included (boundary-v0.md clarification 3: "list-marker spans include
+    // the required trailing whitespace") — rendered as a trailing NBSP
+    // (never collapsed/trimmed by the whitespace algorithm, unlike a plain
+    // space at an inline-block's own trailing edge) so it participates in
+    // `text-align: right` exactly like the revealed raw-text mark does,
+    // reliably reproducing the gap before the item text.
+    const span = document.createElement("span");
+    span.className = "ox-ordered-marker";
+    span.textContent = `${this.number}${this.delim} `;
+    return span;
+  }
+
+  ignoreEvent(): boolean {
+    return false;
+  }
+}
+
+/**
  * Field-wise equality over two decoration payloads (same order, same items).
  * Used to skip rebuilds when a cursor-only invalidation produced an identical
  * payload. Unknown future kinds compare unequal — that only costs a rebuild,
@@ -276,7 +321,14 @@ function payloadsEqual(a: CoreDecoration[], b: CoreDecoration[]): boolean {
       }
       case "widget": {
         const w = y as typeof x;
-        if (x.from !== w.from || x.to !== w.to || x.widget !== w.widget || x.checked !== w.checked) {
+        if (
+          x.from !== w.from ||
+          x.to !== w.to ||
+          x.widget !== w.widget ||
+          x.checked !== w.checked ||
+          x.number !== w.number ||
+          x.delim !== w.delim
+        ) {
           return false;
         }
         break;
@@ -581,6 +633,12 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
               } else if (d.widget === "bullet" && d.to > d.from) {
                 ranges.push(
                   Decoration.replace({ widget: new BulletWidget() }).range(d.from, d.to),
+                );
+              } else if (d.widget === "ordered" && d.to > d.from && d.number !== undefined && d.delim) {
+                ranges.push(
+                  Decoration.replace({
+                    widget: new OrderedMarkerWidget(d.number, d.delim),
+                  }).range(d.from, d.to),
                 );
               }
               // unrecognized widget kinds: ignore

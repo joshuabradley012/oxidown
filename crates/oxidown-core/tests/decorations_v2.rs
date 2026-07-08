@@ -63,6 +63,14 @@ fn bullet(from: usize, to: usize) -> Decoration {
     }
 }
 
+fn ordered(from: usize, to: usize, number: u64, delim: u8) -> Decoration {
+    Decoration::Widget {
+        from,
+        to,
+        kind: oxidown_core::WidgetKind::Ordered { number, delim },
+    }
+}
+
 // --------------------------------------------------------- strikethrough --
 
 #[test]
@@ -306,16 +314,143 @@ fn unordered_list_marker_bullet_widget_and_adjacency_reveal() {
 
 #[test]
 fn ordered_list_marker() {
+    // Concealed: ordered markers render as a computed-number WIDGET
+    // (contract v0.3 amendment, research/07 §0/§1.2) replacing the whole
+    // marker span — never a plain mark over the raw source digits.
     let d = decos("1. one\n2. two\n", &[]);
     assert_eq!(
         d,
         vec![
             li(0, 1),
-            mark(0, 3, MarkStyle::ListMarker),
+            ordered(0, 3, 1, b'.'),
             li(7, 1),
-            mark(7, 10, MarkStyle::ListMarker),
+            ordered(7, 10, 2, b'.'),
         ]
     );
+}
+
+#[test]
+fn ordered_list_marker_reveals_raw_digits_on_the_line() {
+    // LINE-level reveal (matching every other marker construct): a cursor
+    // anywhere on the item's line withholds the widget in favor of the raw
+    // source digits as `mark:list-marker`.
+    for pos in [0, 1, 2, 4, 5] {
+        let d = decos("1. one\n2. two\n", &[(pos, pos)]);
+        assert_eq!(
+            d,
+            vec![
+                li_rev(0, 1),
+                mark(0, 3, MarkStyle::ListMarker),
+                li(7, 1),
+                ordered(7, 10, 2, b'.'),
+            ],
+            "pos {pos}"
+        );
+    }
+    // Composition touching the marker reveals it too (stability rule),
+    // mirroring the bullet/composition test above.
+    let mut ed = Editor::new(1);
+    let rev = ed.load("1. one\n");
+    ed.composition_begin(1, 1).unwrap();
+    let d = ed.decorations(rev, 0, ed.doc_len_utf16(), &[]).unwrap();
+    assert_eq!(d[1], mark(0, 3, MarkStyle::ListMarker));
+}
+
+#[test]
+fn ordered_markers_display_sequential_numbers_ignoring_raw_digits() {
+    // "1./1./3." must DISPLAY 1,2,3 (research/07 §0: CommonMark only fixes
+    // the list's start number; sibling digits are cosmetic).
+    let d = decos("1. a\n1. b\n3. c\n", &[]);
+    let numbers: Vec<u64> = d
+        .iter()
+        .filter_map(|dec| match dec {
+            Decoration::Widget { kind: oxidown_core::WidgetKind::Ordered { number, .. }, .. } => {
+                Some(*number)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(numbers, vec![1, 2, 3]);
+}
+
+#[test]
+fn ordered_list_start_number_is_honored_in_decorations() {
+    // "4./5./9." displays 4,5,6.
+    let d = decos("4. a\n5. b\n9. c\n", &[]);
+    let numbers: Vec<u64> = d
+        .iter()
+        .filter_map(|dec| match dec {
+            Decoration::Widget { kind: oxidown_core::WidgetKind::Ordered { number, .. }, .. } => {
+                Some(*number)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(numbers, vec![4, 5, 6]);
+}
+
+#[test]
+fn ordered_list_paren_delimiter_is_sequence_independent_from_dot() {
+    // A delimiter change starts a NEW list per CommonMark: the second list's
+    // own counter is independent of (and does not continue) the first's.
+    let d = decos("1. a\n2) b\n", &[]);
+    let widgets: Vec<(u64, u8)> = d
+        .iter()
+        .filter_map(|dec| match dec {
+            Decoration::Widget { kind: oxidown_core::WidgetKind::Ordered { number, delim }, .. } => {
+                Some((*number, *delim))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(widgets, vec![(1, b'.'), (2, b')')]);
+}
+
+#[test]
+fn nested_ordered_list_restarts_sequence_in_decorations() {
+    let d = decos("1. a\n   1. nested\n   2. nested2\n2. b\n", &[]);
+    let numbers: Vec<u64> = d
+        .iter()
+        .filter_map(|dec| match dec {
+            Decoration::Widget { kind: oxidown_core::WidgetKind::Ordered { number, .. }, .. } => {
+                Some(*number)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(numbers, vec![1, 1, 2, 2]);
+}
+
+#[test]
+fn nested_ordered_list_under_a_bullet_restarts_sequence() {
+    let d = decos("- a\n  1. one\n  2. two\n- b\n", &[]);
+    let numbers: Vec<u64> = d
+        .iter()
+        .filter_map(|dec| match dec {
+            Decoration::Widget { kind: oxidown_core::WidgetKind::Ordered { number, .. }, .. } => {
+                Some(*number)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(numbers, vec![1, 2]);
+    // The two bullets stay bullet widgets, unaffected.
+    assert!(d.iter().filter(|dec| matches!(dec, Decoration::Widget { kind: oxidown_core::WidgetKind::Bullet, .. })).count() == 2);
+}
+
+#[test]
+fn nested_ordered_list_inside_a_quote_restarts_sequence() {
+    let d = decos("> 1. a\n>    1. nested\n>    2. nested2\n> 2. b\n", &[]);
+    let numbers: Vec<u64> = d
+        .iter()
+        .filter_map(|dec| match dec {
+            Decoration::Widget { kind: oxidown_core::WidgetKind::Ordered { number, .. }, .. } => {
+                Some(*number)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(numbers, vec![1, 1, 2, 2]);
 }
 
 #[test]

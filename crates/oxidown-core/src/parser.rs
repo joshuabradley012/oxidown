@@ -50,7 +50,20 @@ pub enum NodeKind {
     /// extent is the item's whole first line, so a caret anywhere on the
     /// line reveals every marker construct on it. `depth` is the 1-based
     /// list nesting depth (drives the view's hanging-indent line decoration).
-    ListMarker { task: bool, depth: u8 },
+    ///
+    /// `number`/`delim` are present iff this is an ORDERED marker (`"1. "`,
+    /// `"2) "`, …): `number` is the VIEW-COMPUTED CommonMark sequence
+    /// position (the enclosing list's `start` plus this item's position in
+    /// the run — never the item's raw source digits) and `delim` is the
+    /// marker's delimiter byte (`b'.'` or `b')'`). Contract v0.3 amendment
+    /// (research/07 §0/§1.2): CommonMark only gives a list's `start` number
+    /// meaning, so the display number is computed here in the decoration
+    /// pipeline — the core never rewrites source digits (unlike Obsidian's
+    /// renumber-by-rewriting-the-file, and unlike this crate's own
+    /// `indentList`/`outdentList`, which only ever rewrites a marker's
+    /// digits when CommonMark parsing itself would otherwise fail). Both
+    /// `None` for unordered (bullet/plus/asterisk) markers.
+    ListMarker { task: bool, depth: u8, number: Option<u64>, delim: Option<u8> },
     /// The leading indentation whitespace of a NESTED list item (depth >= 2).
     /// Emits a `line:list-item` decoration carrying the depth (the view
     /// provides exact per-depth padding) and conceals the raw spaces.
@@ -238,9 +251,21 @@ pub fn parse_document(src: &str) -> ParseResult {
     // (whatever it is): the marker's width follows CommonMark's
     // content-indentation rules, which pulldown has already computed for us
     // by locating where the item's real content begins. The full item range
-    // is kept alongside so task widgets can record their item's extent.
-    let mut pending_item: Option<(Range<usize>, u8)> = None;
+    // is kept alongside so task widgets can record their item's extent. The
+    // third element is this item's VIEW-COMPUTED ordered sequence number
+    // (`None` for bullet-list items), captured at `Start(Tag::Item)` — see
+    // `list_seq` below.
+    let mut pending_item: Option<(Range<usize>, u8, Option<u64>)> = None;
     let mut list_depth: u8 = 0;
+    // Per-open-list running sequence counter, parallel to `list_depth`'s
+    // push/pop (one frame per currently-open `List`, nested lists push their
+    // own on top): `Some(n)` for an ordered list (`Tag::List(Some(start))`),
+    // holding the NEXT number to assign; `None` for a bullet list, where
+    // there is nothing to compute. Popped at `End(List)`. This is what turns
+    // "1./1./3." into a displayed "1,2,3" (research/07 §0/§1.2): CommonMark
+    // only gives a list's `start` meaning, so the sequence is derived purely
+    // from position-in-run, never from the item's own literal digits.
+    let mut list_seq: Vec<Option<u64>> = Vec::new();
 
     for (event, range) in Parser::new_ext(src, options()).into_offset_iter() {
         // Top-level block collection (kind + full span at `Start`).
@@ -262,7 +287,7 @@ pub fn parse_document(src: &str) -> ParseResult {
             _ => {}
         }
 
-        if let Some((item, item_depth)) = pending_item.take() {
+        if let Some((item, item_depth, item_number)) = pending_item.take() {
             let item_start = item.start;
             // Nested items (depth >= 2): the run of spaces/tabs immediately
             // before the marker is its own node — a `line:list-item` line
@@ -297,7 +322,14 @@ pub fn parse_document(src: &str) -> ParseResult {
             }
             if let Event::TaskListMarker(checked) = &event {
                 if range.start > item_start {
-                    let mut marker = leaf(NodeKind::ListMarker { task: true, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
+                    let delim = ordered_marker_delim(bytes, item_start, range.start);
+                    let number = delim.and(item_number);
+                    let mut marker = leaf(
+                        NodeKind::ListMarker { task: true, depth: item_depth, number, delim },
+                        item_start..range.start,
+                        range.end..range.end,
+                        vec![],
+                    );
                     marker.reveal_extent = Some(line.clone());
                     nodes.push(marker);
                 }
@@ -306,7 +338,14 @@ pub fn parse_document(src: &str) -> ParseResult {
                 task.item_extent = Some(item);
                 nodes.push(task);
             } else if range.start > item_start {
-                let mut marker = leaf(NodeKind::ListMarker { task: false, depth: item_depth }, item_start..range.start, range.end..range.end, vec![]);
+                let delim = ordered_marker_delim(bytes, item_start, range.start);
+                let number = delim.and(item_number);
+                let mut marker = leaf(
+                    NodeKind::ListMarker { task: false, depth: item_depth, number, delim },
+                    item_start..range.start,
+                    range.end..range.end,
+                    vec![],
+                );
                 marker.reveal_extent = Some(line);
                 nodes.push(marker);
             }
@@ -346,14 +385,35 @@ pub fn parse_document(src: &str) -> ParseResult {
             Event::Rule => {
                 nodes.extend(thematic_break_node(bytes, range.clone()));
             }
-            Event::Start(Tag::List(_)) => {
+            Event::Start(Tag::List(start)) => {
                 list_depth = list_depth.saturating_add(1);
+                // CommonMark: the list's displayed sequence begins at its
+                // `start` (pulldown reports the first item's literal digits
+                // here for an ordered list; `None` for a bullet list, carried
+                // through unused). A delimiter change (`.` vs `)`) or a
+                // marker-kind change ends the enclosing list and opens a NEW
+                // one per CommonMark (verified against this pulldown-cmark
+                // version), so this push always starts a fresh, correctly-
+                // seeded counter.
+                list_seq.push(*start);
             }
             Event::End(TagEnd::List(_)) => {
                 list_depth = list_depth.saturating_sub(1);
+                list_seq.pop();
             }
             Event::Start(Tag::Item) => {
-                pending_item = Some((range.clone(), list_depth));
+                // Consume this list's next number (ordered lists only) and
+                // advance the counter for the following sibling — the
+                // per-open-list running sequence `list_seq` tracks.
+                let number = match list_seq.last_mut() {
+                    Some(slot @ Some(_)) => {
+                        let n = slot.unwrap();
+                        *slot = Some(n + 1);
+                        Some(n)
+                    }
+                    _ => None,
+                };
+                pending_item = Some((range.clone(), list_depth, number));
             }
             _ => {}
         }
@@ -614,6 +674,26 @@ fn thematic_break_node(bytes: &[u8], range: Range<usize>) -> Option<Node> {
         return None;
     }
     Some(leaf(NodeKind::ThematicBreak, start..end, end..end, vec![]))
+}
+
+/// The delimiter byte (`.` or `)`) of an ORDERED marker occupying
+/// `start..end` (the marker glyphs plus its required trailing space, e.g.
+/// `"1. "`/`"10) "`), or `None` if `start` doesn't begin with an ASCII-digit
+/// run followed by one of those two bytes (i.e. this is a bullet marker, or
+/// malformed). Read directly from source bytes — the parser's own lookahead
+/// already located the marker span; this just classifies it.
+fn ordered_marker_delim(bytes: &[u8], start: usize, end: usize) -> Option<u8> {
+    if !bytes.get(start).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut i = start;
+    while i < end && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(&b) if b == b'.' || b == b')' => Some(b),
+        _ => None,
+    }
 }
 
 /// Split a byte range into per-source-line sub-ranges, each excluding its
@@ -912,6 +992,119 @@ mod tests {
         let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
         assert_eq!(markers[0].extent, 0..3);
         assert_eq!(markers[1].extent, 7..10);
+    }
+
+    fn ordered_number_delim(n: &Node) -> (Option<u64>, Option<u8>) {
+        match n.kind {
+            NodeKind::ListMarker { number, delim, .. } => (number, delim),
+            _ => panic!("not a ListMarker: {n:?}"),
+        }
+    }
+
+    #[test]
+    fn bullet_markers_carry_no_ordered_info() {
+        let nodes = parse("- one\n- two\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        for m in markers {
+            assert_eq!(ordered_number_delim(m), (None, None));
+        }
+    }
+
+    #[test]
+    fn ordered_markers_get_sequential_view_computed_numbers() {
+        let nodes = parse("1. a\n2. b\n3. c\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 3);
+        assert_eq!(ordered_number_delim(markers[0]), (Some(1), Some(b'.')));
+        assert_eq!(ordered_number_delim(markers[1]), (Some(2), Some(b'.')));
+        assert_eq!(ordered_number_delim(markers[2]), (Some(3), Some(b'.')));
+    }
+
+    #[test]
+    fn ordered_markers_ignore_raw_digits_and_display_sequential_numbers() {
+        // "1./1./3." must DISPLAY 1,2,3 — CommonMark only fixes the list's
+        // start number; sibling digits are cosmetic (research/07 §0).
+        let nodes = parse("1. a\n1. b\n3. c\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(
+            markers.iter().map(|m| ordered_number_delim(m).0).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)]
+        );
+    }
+
+    #[test]
+    fn ordered_list_start_number_is_honored() {
+        // "4./5./9." displays 4,5,6 (start=4, then strictly sequential).
+        let nodes = parse("4. a\n5. b\n9. c\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(
+            markers.iter().map(|m| ordered_number_delim(m).0).collect::<Vec<_>>(),
+            vec![Some(4), Some(5), Some(6)]
+        );
+    }
+
+    #[test]
+    fn ordered_delimiter_change_starts_a_new_list_and_resets_the_sequence() {
+        // Per CommonMark, a delimiter change (`.` vs `)`) ends the enclosing
+        // list and starts a new one — verified directly against this
+        // pulldown-cmark version. The new list's own `start` (its own first
+        // item's literal digits) seeds a fresh counter.
+        let nodes = parse("1. a\n2) b\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(ordered_number_delim(markers[0]), (Some(1), Some(b'.')));
+        assert_eq!(ordered_number_delim(markers[1]), (Some(2), Some(b')')));
+    }
+
+    #[test]
+    fn nested_ordered_list_restarts_its_own_sequence() {
+        let nodes = parse("1. a\n   1. nested\n   2. nested2\n2. b\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        // Document order: "a" (depth1,#1), "nested" (depth2,#1),
+        // "nested2" (depth2,#2), "b" (depth1,#2) — the nested list's own
+        // counter is independent of (and restarts relative to) its parent's.
+        assert_eq!(
+            markers.iter().map(|m| ordered_number_delim(m).0).collect::<Vec<_>>(),
+            vec![Some(1), Some(1), Some(2), Some(2)]
+        );
+    }
+
+    #[test]
+    fn nested_ordered_list_under_a_bullet_gets_its_own_sequence() {
+        let doc = "- a\n  1. one\n  2. two\n- b\n";
+        let nodes = parse(doc);
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        // "a" and "b" are bullets (no ordered info); the nested ordered pair
+        // gets 1, 2.
+        assert_eq!(
+            markers.iter().map(|m| ordered_number_delim(m).0).collect::<Vec<_>>(),
+            vec![None, Some(1), Some(2), None]
+        );
+    }
+
+    #[test]
+    fn ordered_list_inside_a_blockquote_computes_numbers_too() {
+        let nodes = parse("> 1. a\n> 2. b\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(
+            markers.iter().map(|m| ordered_number_delim(m).0).collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn ordered_task_item_still_gets_a_computed_number() {
+        // GFM allows ordered task items ("1. [ ] x"); the marker node is
+        // still emitted (task: true) and still carries ordered info.
+        let nodes = parse("1. [ ] a\n2. [x] b\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 2);
+        for m in &markers {
+            assert!(matches!(m.kind, NodeKind::ListMarker { task: true, .. }));
+        }
+        assert_eq!(
+            markers.iter().map(|m| ordered_number_delim(m).0).collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
+        );
     }
 
     #[test]
