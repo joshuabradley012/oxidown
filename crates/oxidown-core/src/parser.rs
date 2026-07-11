@@ -697,12 +697,75 @@ fn thematic_break_node(bytes: &[u8], range: Range<usize>) -> Option<Node> {
     Some(leaf(NodeKind::ThematicBreak, start..end, end..end, vec![]))
 }
 
-/// The delimiter byte (`.` or `)`) of an ORDERED marker occupying
-/// `start..end` (the marker glyphs plus its required trailing space, e.g.
-/// `"1. "`/`"10) "`), or `None` if `start` doesn't begin with an ASCII-digit
-/// run followed by one of those two bytes (i.e. this is a bullet marker, or
-/// malformed). Read directly from source bytes — the parser's own lookahead
-/// already located the marker span; this just classifies it.
+/// Structured shape of a list marker's glyph run, scanned directly from
+/// source bytes starting at `item_start` (assumed to already be past any
+/// leading whitespace the caller cares to skip — some callers pre-skip
+/// fold-in indentation, others don't; that's a caller concern, not this
+/// lexer's). This is the ONE marker lexer in the crate: `commands.rs`'s
+/// `marker_token_width`/`ordered_marker_value` and this module's own
+/// `empty_item_marker_end`/`ordered_marker_delim` all used to hand-roll
+/// their own near-identical byte scans (four subtly divergent copies —
+/// verified divergences: trailing-space handling unconditional vs
+/// only-if-present, delimiter required vs optional, no shared digit-run
+/// parsing); they are now thin wrappers over this one, each preserving its
+/// own pre-existing call-site quirk explicitly (documented at each site)
+/// rather than silently changing behavior.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MarkerShape {
+    /// Byte offset just past the marker glyphs (bullet char, or digit run
+    /// + delimiter byte if one follows) — NOT including any trailing space.
+    pub glyph_end: usize,
+    /// The delimiter byte (`.` or `)`) for an ordered marker; `None` for a
+    /// bullet marker, or for a digit run with no delimiter byte right after
+    /// it (incomplete/malformed — callers decide how to treat this).
+    pub delim: Option<u8>,
+    /// The digit run's literal numeric value, `Some` iff at least one digit
+    /// was scanned — regardless of whether a delimiter followed. CommonMark
+    /// caps ordered markers at 9 digits; pulldown-cmark's own parse already
+    /// enforces that cap before any position fed to this lexer is derived
+    /// from it (a >9-digit run simply isn't recognized as a list item
+    /// upstream), so this lexer does not re-check it — it only ever reads
+    /// bytes pulldown has already validated as a marker.
+    pub number: Option<u64>,
+    /// Whether a single space/tab immediately follows the glyph run.
+    pub has_trailing_space: bool,
+}
+
+/// Scan one marker's glyph run at `item_start`: a bullet char (`-`/`+`/`*`)
+/// or an ASCII-digit run (optionally followed by a `.`/`)` delimiter).
+/// `None` when `item_start` begins with neither.
+pub(crate) fn scan_marker(at: impl Fn(usize) -> Option<u8>, item_start: usize) -> Option<MarkerShape> {
+    let mut i = item_start;
+    let number = match at(i) {
+        Some(b'-' | b'+' | b'*') => {
+            i += 1;
+            None
+        }
+        Some(b) if b.is_ascii_digit() => {
+            let mut value: u64 = 0;
+            while let Some(d) = at(i).filter(u8::is_ascii_digit) {
+                value = value * 10 + u64::from(d - b'0');
+                i += 1;
+            }
+            Some(value)
+        }
+        _ => return None,
+    };
+    let delim = number
+        .is_some()
+        .then(|| match at(i) {
+            Some(b @ (b'.' | b')')) => {
+                i += 1;
+                Some(b)
+            }
+            _ => None,
+        })
+        .flatten();
+    let glyph_end = i;
+    let has_trailing_space = matches!(at(glyph_end), Some(b' ' | b'\t'));
+    Some(MarkerShape { glyph_end, delim, number, has_trailing_space })
+}
+
 /// Marker-token end for an EMPTY list item, synthesized directly from the
 /// source bytes because pulldown emits no content event whose start would
 /// otherwise locate it: leading fold-in whitespace (pulldown can fold a few
@@ -711,81 +774,82 @@ fn thematic_break_node(bytes: &[u8], range: Range<usize>) -> Option<Node> {
 /// space/tab IF PRESENT (a bare `"-"` with no trailing space is still an
 /// empty item per CommonMark/pulldown — its marker is just the glyph).
 /// Returns `item_start` (an empty span — no marker emitted) if no marker
-/// shape is found; unreachable for spans pulldown reported as items, but
-/// never worth corrupting spans over.
+/// shape is found, OR if a digit run has no delimiter after it (this
+/// call site, unlike `commands.rs`'s `marker_token_width`, treats a bare
+/// digit run as not a marker at all — preserved quirk); unreachable for
+/// spans pulldown reported as items, but never worth corrupting spans over.
 fn empty_item_marker_end(bytes: &[u8], item_start: usize) -> usize {
     let mut i = item_start;
     while matches!(bytes.get(i), Some(b' ' | b'\t')) {
         i += 1;
     }
-    match bytes.get(i) {
-        Some(b'-' | b'+' | b'*') => i += 1,
-        Some(b) if b.is_ascii_digit() => {
-            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-                i += 1;
-            }
-            match bytes.get(i) {
-                Some(b'.' | b')') => i += 1,
-                _ => return item_start,
-            }
-        }
-        _ => return item_start,
+    let Some(m) = scan_marker(|j| bytes.get(j).copied(), i) else {
+        return item_start;
+    };
+    if m.number.is_some() && m.delim.is_none() {
+        return item_start; // digit run with no delimiter: not a marker
     }
-    if matches!(bytes.get(i), Some(b' ' | b'\t')) {
-        i += 1;
-    }
-    i
+    m.glyph_end + usize::from(m.has_trailing_space)
 }
 
+/// The delimiter byte (`.` or `)`) of an ORDERED marker occupying
+/// `start..end` (the marker glyphs plus its required trailing space, e.g.
+/// `"1. "`/`"10) "`), or `None` if `start` doesn't begin with an ASCII-digit
+/// run followed by one of those two bytes (i.e. this is a bullet marker, or
+/// malformed). Read directly from source bytes — the parser's own lookahead
+/// already located the marker span; this just classifies it. The digit scan
+/// is bounded by `end` (matching the pre-refactor behavior exactly), though
+/// in every real call site the digit run terminates well before `end`
+/// regardless.
 fn ordered_marker_delim(bytes: &[u8], start: usize, end: usize) -> Option<u8> {
-    if !bytes.get(start).is_some_and(u8::is_ascii_digit) {
-        return None;
-    }
-    let mut i = start;
-    while i < end && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    match bytes.get(i) {
-        Some(&b) if b == b'.' || b == b')' => Some(b),
-        _ => None,
-    }
+    let at = |i: usize| if i < end { bytes.get(i).copied() } else { None };
+    // A bullet glyph at `start` also yields `Some(MarkerShape)` from
+    // `scan_marker` (with `delim: None`), but that still nets out to `None`
+    // here exactly like the pre-refactor explicit digit-only guard did.
+    scan_marker(at, start)?.delim
 }
 
-/// Split a byte range into per-source-line sub-ranges, each excluding its
-/// own trailing `\n` (and a preceding `\r`, for CRLF). A final line with no
-/// trailing terminator (partial line at the range's end) is still included.
-/// The full line containing `pos`: from just after the previous `\n` through
-/// the line's end, terminator excluded (same bounds discipline as
-/// `split_lines`). Used for LINE-level reveal extents (contract v0.3).
+/// The full line containing `pos`: from just after the previous line
+/// terminator through this line's end, terminator excluded (same bounds
+/// discipline as `split_lines`). Used for LINE-level reveal extents
+/// (contract v0.3). A line terminator here is `\n`, `\r\n`, or a lone `\r` —
+/// matching pulldown-cmark, which treats a bare `\r` as a line ending too
+/// (verified: `"- a\r- b\r- c"` parses as three separate `ListMarker`
+/// items). The backward/forward scans check for `\n` OR `\r` independently
+/// (not "only `\r` if a `\n` was found"), so a lone `\r` terminator is
+/// recognized on either side without needing a paired byte.
 fn line_bounds(bytes: &[u8], pos: usize) -> Range<usize> {
     let mut start = pos;
-    while start > 0 && bytes[start - 1] != b'\n' {
+    while start > 0 && !matches!(bytes[start - 1], b'\n' | b'\r') {
         start -= 1;
     }
     let mut end = pos;
-    while end < bytes.len() && bytes[end] != b'\n' {
+    while end < bytes.len() && !matches!(bytes[end], b'\n' | b'\r') {
         end += 1;
-    }
-    if end > start && end < bytes.len() && bytes.get(end - 1) == Some(&b'\r') {
-        end -= 1;
     }
     start..end
 }
 
+/// Split a byte range into per-source-line sub-ranges, each excluding its
+/// own trailing terminator (`\n`, `\r\n`, or a lone `\r` — see `line_bounds`
+/// for why lone `\r` must count). A final line with no trailing terminator
+/// (partial line at the range's end) is still included.
 fn split_lines(bytes: &[u8], range: Range<usize>) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut pos = range.start;
     while pos < range.end {
-        let mut nl = pos;
-        while nl < range.end && bytes[nl] != b'\n' {
-            nl += 1;
+        let mut term = pos;
+        while term < range.end && !matches!(bytes[term], b'\n' | b'\r') {
+            term += 1;
         }
-        let mut line_end = nl;
-        if line_end > pos && bytes.get(line_end.wrapping_sub(1)) == Some(&b'\r') && nl < range.end {
-            line_end -= 1;
-        }
-        out.push(pos..line_end);
-        pos = if nl < range.end { nl + 1 } else { range.end };
+        out.push(pos..term);
+        pos = if term >= range.end {
+            range.end
+        } else if bytes[term] == b'\r' && term + 1 < range.end && bytes[term + 1] == b'\n' {
+            term + 2 // "\r\n": one terminator, two bytes
+        } else {
+            term + 1 // lone "\n" or lone "\r"
+        };
     }
     out
 }
@@ -1291,6 +1355,29 @@ mod tests {
     }
 
     #[test]
+    fn blockquote_lone_cr_lines_still_split_per_physical_line() {
+        // pulldown itself folds "> a\r> b\r" into ONE lazily-continued
+        // paragraph internally (its own per-line blockquote-marker
+        // rescanning does not honor a lone '\r' the way its top-level block
+        // splitter does — an orthogonal pulldown quirk), but it still
+        // reports the BlockQuote tag's own span across both raw lines
+        // (0..8), and this parser's per-line pass derives BlockQuoteLine
+        // nodes straight from `split_lines` over that span, independent of
+        // pulldown's internal paragraph/softbreak chunking — so both
+        // physical lines still get their own marker node and depth.
+        let nodes = parse("> a\r> b\r");
+        let lines: Vec<_> = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::BlockQuoteLine(_)))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].extent, 0..3);
+        assert_eq!(lines[0].delims, vec![0..2]);
+        assert_eq!(lines[1].extent, 4..7);
+        assert_eq!(lines[1].delims, vec![4..6]);
+    }
+
+    #[test]
     fn fenced_code_block_lines() {
         let nodes = parse("```rust\nfn main() {}\n```\n");
         let fences: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::CodeFenceLine).collect();
@@ -1309,6 +1396,49 @@ mod tests {
         assert_eq!(body.len(), 2);
         assert_eq!(body[0].extent, 4..9);
         assert_eq!(body[1].extent, 10..14);
+    }
+
+    #[test]
+    fn lone_cr_terminated_list_items_get_correct_per_item_reveal_extents() {
+        // pulldown-cmark treats a lone '\r' as a line ending (this doc
+        // parses as THREE separate ListMarker items, not one); the parser's
+        // own `line_bounds` must agree, or every item's LINE-level reveal
+        // extent spans the whole document instead of just its own line
+        // (the pre-fix bug: reveal_extent 0..11 for every marker).
+        let doc = "- a\r- b\r- c";
+        let nodes = parse(doc);
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 3);
+        assert_eq!(markers[0].extent, 0..2, "\"- \" of \"- a\"");
+        assert_eq!(markers[0].reveal_extent, Some(0..3));
+        assert_eq!(markers[1].extent, 4..6, "\"- \" of \"- b\"");
+        assert_eq!(markers[1].reveal_extent, Some(4..7));
+        assert_eq!(markers[2].extent, 8..10, "\"- \" of \"- c\"");
+        assert_eq!(markers[2].reveal_extent, Some(8..11));
+    }
+
+    #[test]
+    fn lone_cr_inside_a_fenced_body_still_splits_into_two_lines() {
+        // The fence itself must open/close via a real newline for
+        // pulldown-cmark to recognize it as a fence at all (verified
+        // separately: pulldown's own fence-line SCANNING, unlike its
+        // paragraph/heading/list-item line splitting, does not honor a lone
+        // '\r' as a valid fence-opening/closing terminator — an orthogonal,
+        // upstream pulldown limitation this crate does not attempt to work
+        // around). But once a fence is open, `split_lines` must still treat
+        // an embedded lone '\r' in the BODY as its own physical line
+        // (matching every other line-oriented construct in this parser, and
+        // how a real text buffer's own line model works) rather than
+        // swallowing it as ordinary content — even though pulldown's own
+        // `Text` event for the body reports it as one un-split chunk
+        // (`"plain\rtext\n"`), since this parser derives body lines from the
+        // raw source bytes directly, not from pulldown's Text chunking.
+        let doc = "```\nplain\rtext\n```\n";
+        let nodes = parse(doc);
+        let body: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::CodeBlockLine).collect();
+        assert_eq!(body.len(), 2);
+        assert_eq!(&doc[body[0].extent.clone()], "plain");
+        assert_eq!(&doc[body[1].extent.clone()], "text");
     }
 
     #[test]

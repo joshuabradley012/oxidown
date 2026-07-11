@@ -218,11 +218,16 @@
 //!    separate delete-`[from, to]` splice after the marker/prefix edit
 //!    (ascending: `from` is always at/after content start, strictly past
 //!    where the marker/prefix edit lands) — one batch, one undo unit either
-//!    way. **v1 punt**: if `to` extends past `L`'s own end (a selection
-//!    spanning into further lines) rule 3's below-line guard is skipped
-//!    rather than risk overlapping the consumed lines; this is expected to
-//!    be a vanishingly rare gesture (Enter is not usually pressed over a
-//!    multi-line selection that also needs the interruption guard).
+//!    way. When `to` extends past `L`'s own end (a selection spanning into
+//!    further lines), rule 3's below-line guard still runs: it resumes its
+//!    downward scan from past the line CONTAINING `to` (accounting for the
+//!    whole region the selection consumes, not just `L`), using post-edit
+//!    columns exactly as the collapsed-cursor case does, and lands on the
+//!    same below-context line a collapsed cursor reaching the same resulting
+//!    shape would — see `outdent_single_line`. Lines the selection deletes
+//!    outright lose itemness as a direct, explicit consequence of the user's
+//!    own selection (not a silent side effect the guard exists to prevent),
+//!    same rationale as rule 3's own line.
 //! 8. Unlike `indentList`/`outdentList`, the applies-but-no-op distinction
 //!    never arises here: every applicable case (2 through 6) produces a real
 //!    splice batch. `enter` returns either `None` (rule 1) or `Some` with a
@@ -233,7 +238,7 @@ use std::ops::Range;
 
 use crate::block_index::BlockKind;
 use crate::mapping::{self, Bias};
-use crate::parser::{Node, NodeKind};
+use crate::parser::{self, Node, NodeKind};
 use crate::text::{ByteSplice, SrcBytes};
 
 /// Typed command surface (the wasm boundary flattens this to
@@ -513,8 +518,10 @@ pub fn toggle_task(nodes: &[Node], doc_len: usize, pos_b: usize) -> Option<Comma
 // ---------------------------------------------------------------------
 
 /// One physical source line's list/quote context. Built fresh per line from
-/// the parser overlay + raw source bytes — cheap, since these commands only
-/// ever look at a handful of lines around the selection.
+/// the parser overlay + raw source bytes — cheap per line (the overlay
+/// lookups binary-search the extent-sorted node list, see `quote_context`/
+/// `line_marker`), which matters because a multi-line selection or a deep
+/// subtree walk can visit thousands of lines, not just a handful.
 #[derive(Clone, Copy)]
 struct ListLineCtx {
     start: usize,
@@ -540,19 +547,14 @@ impl ListLineCtx {
 }
 
 /// Byte range of the physical source line containing `pos` (the trailing
-/// `\n`/`\r\n` terminator excluded). Commands scan bytes through the
-/// chunk-cached [`SrcBytes`] reader — doc-absolute indices, no document
-/// materialization (unlike the old whole-`String` copy per command).
+/// terminator — `\n`, `\r\n`, or a lone `\r` — excluded). Delegates to
+/// [`SrcBytes::line_range_at`] (backed by `TextBuffer::line_range_at`/ropey's
+/// own line metric) rather than hand-scanning: the old hand-rolled backward
+/// scan here only stopped at `\n`, so a lone-`\r`-terminated line (which
+/// pulldown-cmark itself treats as its own line — verified against this
+/// pulldown-cmark version) would merge into whatever preceded it.
 fn line_containing(src: &SrcBytes, pos: usize) -> Range<usize> {
-    let mut start = pos.min(src.len());
-    while start > 0 && src.byte(start - 1) != b'\n' {
-        start -= 1;
-    }
-    let mut end = start;
-    while end < src.len() && src.byte(end) != b'\n' && src.byte(end) != b'\r' {
-        end += 1;
-    }
-    start..end
+    src.line_range_at(pos)
 }
 
 /// The physical line immediately preceding `line_start`, or `None` at the
@@ -592,44 +594,65 @@ fn next_line(src: &SrcBytes, line_end: usize) -> Option<Range<usize>> {
 /// CodeMirror's own multi-line command iteration: an empty range (cursor)
 /// always yields its containing line; a non-empty range excludes a trailing
 /// line touched only at its very start (`to_b` landing exactly on a line
-/// boundary selects none of that line).
-fn intersecting_lines(src: &SrcBytes, from_b: usize, to_b: usize) -> Vec<Range<usize>> {
-    let mut lines = Vec::new();
+/// boundary selects none of that line). LAZY — `plan_list_nesting`'s early
+/// "doesn't apply"/no-op returns must not pay to materialize every line of a
+/// huge selection (a select-all Tab that turns out to be a no-op only ever
+/// needs the lines up to the first list-item line).
+fn intersecting_lines<'s, 'a>(
+    src: &'s SrcBytes<'a>,
+    from_b: usize,
+    to_b: usize,
+) -> impl Iterator<Item = Range<usize>> + use<'s, 'a> {
     let empty = from_b == to_b;
-    let mut pos = from_b;
-    loop {
-        let line = line_containing(src, pos);
+    let mut pos: Option<usize> = Some(from_b);
+    std::iter::from_fn(move || {
+        let p = pos?;
+        let line = line_containing(src, p);
+        pos = if p >= to_b {
+            None
+        } else {
+            let mut next = line.end;
+            if src.get(next) == Some(b'\r') {
+                next += 1;
+            }
+            if src.get(next) == Some(b'\n') {
+                next += 1;
+            }
+            // `next <= p` is the defensive doc-end stop (no terminator left).
+            (next > p).then_some(next)
+        };
         if empty || to_b > line.start {
-            lines.push(line.clone());
+            Some(line)
+        } else {
+            // A trailing line touched only at its very start is excluded —
+            // and it is necessarily the LAST candidate (to_b <= line.start
+            // <= p can only coexist with the `p >= to_b` stop above), so
+            // ending the iteration here matches the eager original exactly.
+            None
         }
-        if pos >= to_b {
-            break;
-        }
-        let mut next = line.end;
-        if src.get(next) == Some(b'\r') {
-            next += 1;
-        }
-        if src.get(next) == Some(b'\n') {
-            next += 1;
-        }
-        if next <= pos {
-            break; // defensive: no terminator left (doc end)
-        }
-        pos = next;
-    }
-    lines
+    })
 }
 
 /// This line's blockquote depth (0 outside any blockquote) and the byte
 /// offset just past its `> `/`> > `/… marker run, from the parser's per-line
 /// `BlockQuoteLine` node.
+///
+/// `nodes` (the cached overlay) is sorted by `extent.start` (`parser::
+/// parse_document`'s final sort, preserved by every incremental-reparse
+/// splice — see `editor.rs`'s `reparse_incremental` step 3a) and no node's
+/// extent spans a line boundary here (a `BlockQuoteLine`'s own extent starts
+/// exactly at `line_start` when present), so binary search jumps straight to
+/// this line's small node cluster instead of a linear scan over the WHOLE
+/// overlay — the fix for `indentList`/`outdentList`/`enter` being
+/// accidentally O(lines × nodes) (verified: 40ms/103ms for a 5k/10k-item
+/// select-all Tab).
 fn quote_context(nodes: &[Node], line_start: usize) -> (u8, usize) {
-    nodes
+    let lo = nodes.partition_point(|n| n.extent.start < line_start);
+    let hi = nodes.partition_point(|n| n.extent.start <= line_start);
+    nodes[lo..hi]
         .iter()
         .find_map(|n| match n.kind {
-            NodeKind::BlockQuoteLine(depth) if n.extent.start == line_start => {
-                Some((depth, n.delims.last().map_or(line_start, |d| d.end)))
-            }
+            NodeKind::BlockQuoteLine(depth) => Some((depth, n.delims.last().map_or(line_start, |d| d.end))),
             _ => None,
         })
         .unwrap_or((0, line_start))
@@ -643,10 +666,13 @@ fn quote_context(nodes: &[Node], line_start: usize) -> (u8, usize) {
 /// (CommonMark lets a marker's real content start several spaces later;
 /// that extra whitespace is deliberately not part of this arithmetic).
 fn line_marker(nodes: &[Node], src: &SrcBytes, line: &Range<usize>) -> Option<(usize, usize)> {
-    let raw_start = nodes.iter().find_map(|n| match n.kind {
-        NodeKind::ListMarker { .. } if n.extent.start >= line.start && n.extent.start < line.end => {
-            Some(n.extent.start)
-        }
+    // Same binary-search jump as `quote_context` (see its doc comment): the
+    // overlay is sorted by `extent.start`, so this line's node cluster is a
+    // contiguous `[lo, hi)` window instead of a full linear scan.
+    let lo = nodes.partition_point(|n| n.extent.start < line.start);
+    let hi = nodes.partition_point(|n| n.extent.start < line.end);
+    let raw_start = nodes[lo..hi].iter().find_map(|n| match n.kind {
+        NodeKind::ListMarker { .. } => Some(n.extent.start),
         _ => None,
     })?;
     // The parser's `ListMarker` extent starts exactly at the glyph for a
@@ -666,22 +692,23 @@ fn line_marker(nodes: &[Node], src: &SrcBytes, line: &Range<usize>) -> Option<(u
 }
 
 /// Marker glyph run length + 1 (the required following space) — see
-/// [`line_marker`].
+/// [`line_marker`]. Built on the shared [`parser::scan_marker`] lexer;
+/// preserves this call site's own pre-existing quirks exactly:
+/// * the `+ 1` is UNCONDITIONAL (a fixed-width formula per the contract —
+///   `indentList`/`outdentList`'s column math and the clamp in `enter`
+///   depend on this NOT varying with however much whitespace actually
+///   follows the marker in the source), unlike `parser::empty_item_marker_end`,
+///   which only adds a byte when a trailing space is actually present;
+/// * a digit run with no delimiter byte after it still counts (glyph_end
+///   stops at the digit run's end rather than bailing entirely) — this
+///   never actually happens in practice since `item_start` only ever comes
+///   from a real `ListMarker` node, but preserves the original fallback;
+/// * a byte that's neither a bullet nor a digit yields width 1 (`glyph_end
+///   == item_start`), matching the original's silent `_ => {}` arm.
 fn marker_token_width(src: &SrcBytes, item_start: usize) -> usize {
-    let mut i = item_start;
-    match src.get(i) {
-        Some(b'-' | b'+' | b'*') => i += 1,
-        Some(b) if b.is_ascii_digit() => {
-            while src.get(i).is_some_and(|b| b.is_ascii_digit()) {
-                i += 1;
-            }
-            if matches!(src.get(i), Some(b'.' | b')')) {
-                i += 1;
-            }
-        }
-        _ => {}
-    }
-    (i - item_start) + 1
+    let glyph_end = parser::scan_marker(|i| src.get(i), item_start)
+        .map_or(item_start, |m| m.glyph_end);
+    (glyph_end - item_start) + 1
 }
 
 fn list_line_ctx(nodes: &[Node], src: &SrcBytes, line: Range<usize>) -> ListLineCtx {
@@ -705,14 +732,18 @@ fn plan_list_nesting(
     to_b: usize,
     indent: bool,
 ) -> Option<CommandPlan> {
-    let lines: Vec<ListLineCtx> = intersecting_lines(src, from_b, to_b)
-        .into_iter()
-        .map(|l| list_line_ctx(nodes, src, l))
-        .collect();
-
-    // Applies iff at least one intersecting line carries a marker.
-    let first_idx = lines.iter().position(|l| l.marker.is_some())?;
-    let first = &lines[first_idx];
+    // Applies iff at least one intersecting line carries a marker. Found via
+    // the cheap (O(log nodes), see `line_marker`'s doc comment) marker
+    // lookup over the LAZY line iterator — neither the remaining lines nor
+    // any line's full `ListLineCtx` (which also computes blockquote depth)
+    // is touched until past every early "doesn't apply"/"no-op" return
+    // below, so a select-all Tab that turns out to be a no-op never pays
+    // for the other 9,999 lines at all.
+    let mut line_ranges = intersecting_lines(src, from_b, to_b);
+    let first_range = line_ranges
+        .by_ref()
+        .find(|l| line_marker(nodes, src, l).is_some())?;
+    let first = list_line_ctx(nodes, src, first_range.clone());
     let first_col = first.marker_column().expect("first_idx line has a marker");
     let first_depth = first.quote_depth;
 
@@ -759,6 +790,15 @@ fn plan_list_nesting(
         first_col - target_col
     };
 
+    // Only now (past every early "doesn't apply"/no-op return above) walk
+    // the REMAINING intersecting lines and build their contexts — the first
+    // item line plus everything after it (lines before it carry no marker
+    // and the affected-set loop would skip them anyway).
+    let lines: Vec<ListLineCtx> = std::iter::once(first_range)
+        .chain(line_ranges)
+        .map(|l| list_line_ctx(nodes, src, l))
+        .collect();
+
     // Subtree-aware affected set: every intersecting item line, PLUS, for
     // each one, its whole subtree (consecutive following lines at the same
     // quote depth whose marker column is strictly greater than that line's
@@ -769,7 +809,20 @@ fn plan_list_nesting(
         let Some(root_col) = line.marker_column() else {
             continue;
         };
-        affected.entry(line.start).or_insert(*line);
+        // Already collected by an EARLIER intersecting line's subtree walk?
+        // Then this line's own subtree is a subset of that walk's coverage
+        // and re-walking it changes nothing: this line sits at a column
+        // strictly greater than that earlier root's, so (a) every line this
+        // walk would collect (consecutive, same depth, column > this line's
+        // > the root's) satisfies the root walk's own collection condition,
+        // and (b) any line that would stop THIS walk also stops (or already
+        // stopped) the root's. Skipping keeps the union identical while
+        // turning a multi-line selection over a strictly-deepening chain
+        // from O(lines²) walk visits into O(lines).
+        if affected.contains_key(&line.start) {
+            continue;
+        }
+        affected.insert(line.start, *line);
         let mut cursor_end = line.end;
         while let Some(range) = next_line(src, cursor_end) {
             let ctx = list_line_ctx(nodes, src, range.clone());
@@ -831,11 +884,16 @@ fn plan_list_nesting(
     //    touched it. Its rewrite is on a later line than every whitespace
     //    splice, so appending keeps the batch ascending.
     let new_col = if indent { first_col + delta } else { first_col - delta };
-    if let Some(rewrite) = interruption_rewrite(nodes, src, first, new_col, &affected, delta, indent) {
+    if let Some(rewrite) = interruption_rewrite(nodes, src, &first, new_col, &affected, delta, indent) {
         batch.insert(1, rewrite);
     }
+    // Below-line guard scan starts right after the affected set's own last
+    // line (no selection-consumed region to account for here — unlike
+    // `enter`'s single-line outdent, indentList/outdentList never delete
+    // extra text past the affected lines themselves).
+    let below_scan_from = affected.values().next_back().expect("affected is non-empty (batch was)").end;
     if let Some(rewrite) =
-        below_line_rewrite(nodes, src, &affected, first_depth, new_col, delta, indent)
+        below_line_rewrite(nodes, src, &affected, first_depth, new_col, delta, indent, below_scan_from)
     {
         batch.push(rewrite);
     }
@@ -854,24 +912,18 @@ fn plan_list_nesting(
 
 /// Parse a raw ordered marker's literal digit run at `item_start`:
 /// `(digit_run_len, numeric_value, delimiter_byte)`. `None` for a bullet
-/// marker. Shared by `ordered_marker` (which only needs the "is this `1`"
-/// family check for the paragraph-interruption guard) and `enter`'s CONTINUE
-/// rule (which needs the actual literal value, to increment it).
+/// marker, OR a digit run with no delimiter after it (unlike
+/// `marker_token_width`, this call site REQUIRES the delimiter — preserved
+/// quirk, matching its pre-refactor behavior exactly). Shared by
+/// `ordered_marker` (which only needs the "is this `1`" family check for the
+/// paragraph-interruption guard) and `enter`'s CONTINUE rule (which needs the
+/// actual literal value, to increment it). Built on the shared
+/// [`parser::scan_marker`] lexer.
 fn ordered_marker_value(src: &SrcBytes, item_start: usize) -> Option<(usize, u64, u8)> {
-    let mut i = item_start;
-    let mut value: u64 = 0;
-    while src.get(i).is_some_and(|b| b.is_ascii_digit()) {
-        value = value * 10 + u64::from(src.byte(i) - b'0');
-        i += 1;
-    }
-    if i == item_start {
-        return None;
-    }
-    let delim = src.get(i)?;
-    if delim != b'.' && delim != b')' {
-        return None;
-    }
-    Some((i - item_start, value, delim))
+    let m = parser::scan_marker(|i| src.get(i), item_start)?;
+    let delim = m.delim?;
+    let value = m.number?;
+    Some((m.glyph_end - item_start - 1, value, delim))
 }
 
 /// The ordered-marker shape at `item_start`: `(digit_run_len, value_is_one,
@@ -975,14 +1027,19 @@ fn interruption_rewrite(
 /// touched (e.g. outdenting a nested bullet to top level makes a following
 /// `3.` sibling — previously continuing the open outer ordered list — sit
 /// against the new bullet list instead, where a non-1 ordered marker
-/// cannot start a list). Walk down from the last affected line over
-/// consecutive same-quote-depth item lines, SKIPPING adopted descendants
-/// (post-edit column strictly greater than the moved line's new column —
-/// they nest under the moved block, whose itemness the first guard already
-/// preserves); the first item line at column <= the new column is the one
-/// whose landing the edit re-anchored — run the same landing-scan check on
-/// it at its own (unchanged) column. Stops at a non-item/blank line or
-/// quote-depth change, like every other scan here.
+/// cannot start a list). Walk down from `scan_from` (the byte position past
+/// the ENTIRE region the edit affected/consumed — the caller computes this;
+/// for `indentList`/`outdentList` it's simply the affected set's last line's
+/// own end, but `enter`'s selection path may need to skip further, past
+/// lines a multi-line selection deleted outright — see `outdent_single_line`)
+/// over consecutive same-quote-depth item lines, SKIPPING adopted
+/// descendants (post-edit column strictly greater than the moved line's new
+/// column — they nest under the moved block, whose itemness the first guard
+/// already preserves); the first item line at column <= the new column is
+/// the one whose landing the edit re-anchored — run the same landing-scan
+/// check on it at its own (unchanged) column. Stops at a non-item/blank line
+/// or quote-depth change, like every other scan here.
+#[allow(clippy::too_many_arguments)] // mirrors `interruption_rewrite`'s parameter set + the scan start
 fn below_line_rewrite(
     nodes: &[Node],
     src: &SrcBytes,
@@ -991,9 +1048,9 @@ fn below_line_rewrite(
     root_post_col: usize,
     delta: usize,
     indent: bool,
+    scan_from: usize,
 ) -> Option<ByteSplice> {
-    let last = affected.values().next_back()?;
-    let mut cursor_end = last.end;
+    let mut cursor_end = scan_from;
     loop {
         let range = next_line(src, cursor_end)?;
         let ctx = list_line_ctx(nodes, src, range.clone());
@@ -1110,14 +1167,21 @@ fn outdent_single_line(
             insert: String::new(),
         });
     }
-    // v1 punt (module doc comment, rule 7): skip the below-line guard rather
-    // than risk it overlapping a selection that consumed past this line.
-    if to_b <= line.end {
-        if let Some(rewrite) =
-            below_line_rewrite(nodes, src, &affected, line.quote_depth, new_col, delta, false)
-        {
-            batch.push(rewrite);
-        }
+    // The below-line guard scans from past the ENTIRE region the press
+    // affects — not just this line's own end. A selection (rule 7) can
+    // extend past `line`'s end, consuming further lines outright (they
+    // disappear from the post-edit document, `assert_enter_itemness`'s
+    // per-`from`-line exemption does not cover them — losing their itemness
+    // is an explicit consequence of the user's own selection, not a silent
+    // side effect); the guard must resume scanning from wherever the
+    // selection's own deletion actually ends, i.e. the line containing
+    // `to_b`, so it lands on the same below-context line the collapsed-
+    // cursor (single-line) case would.
+    let scan_from = if to_b > line.end { line_containing(src, to_b).end } else { line.end };
+    if let Some(rewrite) =
+        below_line_rewrite(nodes, src, &affected, line.quote_depth, new_col, delta, false, scan_from)
+    {
+        batch.push(rewrite);
     }
     let cursor = mapping::map_pos(content_start, &batch, Bias::After);
     Some(CommandPlan {

@@ -664,9 +664,14 @@ function parseLineContent(
   }
 
   parseInline(content, base, nodes);
-  // A plain paragraph line interrupts any open list run (the mock does not
-  // model loose-list/lazy-continuation paragraph absorption).
-  seq.clear();
+  // A genuine paragraph line interrupts any open list run (the mock does not
+  // model loose-list/lazy-continuation paragraph absorption) — but a BLANK
+  // line must NOT: per CommonMark, blank lines don't close a list (that's
+  // exactly what makes a list "loose"), so "1. a\n1. b\n\n1. c" is one list,
+  // displaying 1,2,3 — matching the Rust core, which counts straight through
+  // blank lines within a list. Only non-blank, non-item content resets the
+  // running sequence.
+  if (content.trim() !== "") seq.clear();
 }
 
 /** Parse the full document into formatted/line/widget nodes. */
@@ -1144,7 +1149,14 @@ export class MockCore implements OxidownCore {
       case "enter":
         return this.enterCmd(a, b as number);
       default:
-        return null;
+        // Parity with the wasm core (crates/oxidown-wasm/src/lib.rs): an
+        // unrecognized command name is a caller/protocol bug, not a "this
+        // command doesn't apply here" `null` — the wasm entry point
+        // validates the name BEFORE dispatch and throws `InvalidCommand`
+        // without having mutated anything. Returning `null` here (as this
+        // mock used to) would let a typo'd command name pass every mock
+        // test yet throw against wasm — the mock must fail the same way.
+        throw new Error(`InvalidCommand: ${JSON.stringify(name)}`);
     }
   }
 

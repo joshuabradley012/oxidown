@@ -80,12 +80,16 @@ fn generate_mixed_doc(target_bytes: usize) -> String {
 
 /// Adversarial insert pool: block-boundary-changing constructs (fence
 /// markers, list markers, quote markers, headings, setext underlines, blank
-/// lines, de-interrupting plain chars) plus multibyte text.
+/// lines, de-interrupting plain chars) plus multibyte text and alternate
+/// line terminators (`\r`, `\r\n` — pulldown treats a lone `\r` as a line
+/// ending, and so must every fast path).
 const INSERTS: &[&str] = &[
     "x",
     "words and more ",
     "\n",
     "\n\n",
+    "\r",
+    "\r\n",
     "```",
     "```rust\n",
     "# ",

@@ -625,6 +625,34 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     expect(widgets.map((w) => w.number)).toEqual([1, 1, 2, 2]);
   });
 
+  it("FIX 2: a blank line does NOT reset ordered numbering (loose list, parity with the Rust core)", () => {
+    // Per CommonMark a blank line doesn't close a list — that's exactly what
+    // makes it "loose" — so "1. a\n1. b\n\n1. c" is ONE list and must display
+    // 1,2,3, matching the wasm core (which counts straight through blank
+    // lines). Before the fix, the mock treated the blank line like any other
+    // non-item line and cleared the running sequence, producing [1,2,1].
+    const { core } = makeCore("1. a\n1. b\n\n1. c\n");
+    const ds = core.decorations(core.revision(), 0, core.docLength(), []);
+    const widgets = ds.filter(
+      (d): d is Extract<Decoration, { kind: "widget"; widget: "ordered" }> =>
+        d.kind === "widget" && d.widget === "ordered",
+    );
+    expect(widgets.map((w) => w.number)).toEqual([1, 2, 3]);
+  });
+
+  it("FIX 2 control: a real paragraph line (non-blank, non-item) still resets ordered numbering", () => {
+    // Unlike a blank line, actual paragraph CONTENT between list items is not
+    // modeled as loose-list continuation by this mock — it still closes the
+    // running sequence, so a fresh "1. c" starts its own list at 1.
+    const { core } = makeCore("1. a\n1. b\n\nplain paragraph\n\n1. c\n");
+    const ds = core.decorations(core.revision(), 0, core.docLength(), []);
+    const widgets = ds.filter(
+      (d): d is Extract<Decoration, { kind: "widget"; widget: "ordered" }> =>
+        d.kind === "widget" && d.widget === "ordered",
+    );
+    expect(widgets.map((w) => w.number)).toEqual([1, 2, 1]);
+  });
+
   it("task list item: widget:task (concealed) or delims (LINE-level reveal)", () => {
     const doc = "- [ ] buy milk\nsecond line";
     const { core } = makeCore(doc);
@@ -788,6 +816,21 @@ describe("MockCore command (v0.2)", () => {
   it("toggleTask returns null when not inside a task item", () => {
     const { core } = makeCore("plain paragraph");
     expect(core.command("toggleTask", 3)).toBeNull();
+  });
+
+  it("FIX 4: an unknown command name THROWS (parity with wasm's InvalidCommand), never null", () => {
+    // Before the fix, an unrecognized name fell through to `default: return
+    // null`, indistinguishable from a command that legitimately doesn't
+    // apply here — every mock test would stay green for a future typo'd
+    // command name even though the real wasm core throws `InvalidCommand`
+    // per call (validated before dispatch). The mock must fail the same way.
+    const { core } = makeCore("hello world");
+    expect(() => core.command("bogusCommand" as unknown as RangeCommandName, 0, 1)).toThrow(
+      /InvalidCommand/,
+    );
+    // And it must not have mutated anything on the way to throwing —
+    // command() is transactional (docs/boundary-v0.md "Commands").
+    expect(core.getText()).toBe("hello world");
   });
 });
 

@@ -67,6 +67,46 @@ export function applyCoreChange(view: EditorView, change: CoreChange, userEvent:
   });
 }
 
+/**
+ * Shared wrapper for every `core.command(...)` call site (Mod-b/i/Shift-x/e
+ * toggles, Tab/Shift-Tab indent/outdent, Enter, and the checkbox widget's
+ * click handler) — replaces four separately hand-rolled try/command/catch
+ * blocks (a confirmed duplication).
+ *
+ * On a thrown exception this logs and SWALLOWS it rather than treating it as
+ * a mirror-desync emergency: `command()` is transactional — planning
+ * happens entirely before any apply (the wasm entry point validates the
+ * command name BEFORE dispatch) — so it either returns null/CoreChange or
+ * throws WITHOUT having mutated the core (docs/boundary-v0.md "Commands").
+ * Calling `core.load()` here would needlessly wipe undo history/anchors even
+ * though the mirror was never actually broken. This is deliberately
+ * DIFFERENT from the applyEdit/decorations catch blocks elsewhere in this
+ * file, which still treat any exception as a desync emergency (a docChanged
+ * transaction may have partially diverged the buffers) per the contract's
+ * general "Error handling" rule — only `command()` carries the
+ * no-mutation-on-throw guarantee.
+ *
+ * Returns `{ ok: true, change }` on a normal call (`change` may itself be
+ * `null` — a legitimate "doesn't apply here" result some callers fall back
+ * from), or `{ ok: false }` when the command threw. Callers must treat that
+ * distinctly from a legitimate `null`: never fall back to a default command
+ * just because the core errored.
+ */
+function runCoreCommand(
+  name: string,
+  invoke: () => CoreChange | null,
+): { ok: true; change: CoreChange | null } | { ok: false } {
+  try {
+    return { ok: true, change: invoke() };
+  } catch (err) {
+    console.error(
+      `[oxidown] core error during command(${name}) — command() is transactional and did not mutate the core; ignoring:`,
+      err,
+    );
+    return { ok: false };
+  }
+}
+
 export interface OxidownOptions {
   /**
    * Render live-preview decorations. Set false for source mode: the document
@@ -200,18 +240,21 @@ class TaskCheckboxWidget extends WidgetType {
       // only source of truth for `checked` — the next decoration rebuild
       // reflects whatever the core returns, not the DOM's own click default.
       event.preventDefault();
-      let change: CoreChange | null;
-      try {
-        change = this.core.command("toggleTask", this.pos);
-      } catch (err) {
-        console.error(
-          "[oxidown] core error during command(toggleTask) — re-loading core from view buffer:",
-          err,
-        );
-        this.core.load(view.state.doc.toString());
-        return;
-      }
-      if (change) applyCoreChange(view, change, "oxidown.command");
+      // Resolve the CURRENT position from the DOM at click time — never
+      // `this.pos`, which was captured at CONSTRUCTION. RangeSet.map
+      // repositions this widget's decoration range on every doc change
+      // without touching this instance's own fields (and rebuilds are
+      // microtask-deferred, frozen during composition/drag), so a click
+      // that lands after an edit above this task line — especially
+      // mid-composition — could toggle the WRONG task (or silently no-op)
+      // if we used the stale constructor value. `posAtDOM` reads the
+      // widget's LIVE position from the view's current decoration set
+      // instead; toggleTask resolves leniently from "anywhere in the list
+      // item" so this doesn't need to be exact, just on the right line.
+      const live = view.posAtDOM(input);
+      const pos = Math.max(0, Math.min(live, view.state.doc.length));
+      const outcome = runCoreCommand("toggleTask", () => this.core.command("toggleTask", pos));
+      if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
     });
     return input;
   }
@@ -379,12 +422,20 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
        */
       private lastPayload: CoreDecoration[] | null = null;
       /**
-       * Positions in `lastPayload` are absolute: any doc change invalidates
-       * the comparison (a post-edit payload could coincidentally equal a
-       * pre-edit one while meaning different text). Set on docChanged,
-       * cleared when a fresh payload is cached.
+       * The core revision `lastPayload` was fetched at. Positions in
+       * `lastPayload` are absolute: any doc change invalidates the
+       * comparison (a post-edit payload could coincidentally equal a
+       * pre-edit one while meaning different text) — `core.revision()`
+       * bumps on every doc-mutating path in both cores and does NOT bump on
+       * selection changes, which is exactly the invalidation this cache
+       * skip wants. The skip-compare below is valid iff `core.revision()`
+       * still equals this value; `null` (no payload cached yet) can never
+       * match a real revision, so it starts "always stale" the same way the
+       * old hand-paired boolean did. This replaces a `payloadMaybeStale`
+       * boolean that had to be kept in lockstep by hand at several call
+       * sites — a structural invalidation key instead of a manually-set flag.
        */
-      private payloadMaybeStale = true;
+      private lastPayloadRevision: number | null = null;
 
       private readonly onWindowMouseUp = () => {
         if (this.dragging) {
@@ -413,7 +464,28 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         //    original-doc coordinates, matching ChangeSet semantics).
         for (const tr of update.transactions) {
           if (!tr.docChanged) continue;
-          if (tr.annotation(oxidownSkip)) continue; // core-driven change: already applied core-side
+          if (tr.annotation(oxidownSkip)) {
+            // Core-driven change (undo/redo/command/stream): the core
+            // already applied this edit itself before the view dispatched
+            // the transaction, so there's nothing to forward. But a host
+            // changeFilter/transactionFilter that altered the transaction in
+            // flight (the contract requires hosts not do this to
+            // oxidown-annotated transactions) would otherwise desync core
+            // and view silently until the NEXT forwarded edit happened to
+            // notice via the check below — and only then if verifyMirror is
+            // on. Run the same length check immediately instead of waiting:
+            // the core already applied the change, so lengths must match
+            // right now.
+            if (verifyMirror && core.docLength() !== tr.newDoc.length) {
+              console.error(
+                `[oxidown] mirror desync on a core-driven change (core=${core.docLength()} view=${tr.newDoc.length}) — ` +
+                  "a host changeFilter/transactionFilter may have altered an oxidown-annotated " +
+                  "transaction; re-loading core from view buffer:",
+              );
+              core.load(tr.newDoc.toString());
+            }
+            continue;
+          }
           const splices = changesToSplices(tr.changes);
           try {
             core.applyEdit(core.revision(), splices, originOf(tr, this.view));
@@ -435,9 +507,12 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         if (!renderDecorations) return;
 
         // Keep positions valid immediately; the real rebuild is coalesced.
+        // (No explicit "mark stale" step needed here: applyEdit above — or,
+        // for a skip-annotated core-driven change, the core mutation that
+        // produced it — already bumped core.revision(), which is what the
+        // skip-compare in flushRebuild checks against.)
         if (update.docChanged) {
           this.decorations = this.decorations.map(update.changes);
-          this.payloadMaybeStale = true;
           this.endVerticalMotion(); // typing ends the gesture
         }
         // 2) Recompute decorations on doc change, selection change, or
@@ -501,12 +576,14 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         if (this.view.composing || this.dragging || this.verticalMotion) return; // frozen; dirty stays set
         this.dirty = false;
         const payload = this.fetchPayload();
-        // Identical payload + unchanged doc → the current decorations are
-        // already exactly right: skip the RangeSet rebuild AND the re-render
+        const revision = core.revision();
+        // Identical payload + unchanged doc (same core revision as when
+        // `lastPayload` was cached) → the current decorations are already
+        // exactly right: skip the RangeSet rebuild AND the re-render
         // dispatch (the bulk of a cursor-move rebuild's cost).
         if (
           payload !== null &&
-          !this.payloadMaybeStale &&
+          this.lastPayloadRevision === revision &&
           this.lastPayload !== null &&
           payloadsEqual(this.lastPayload, payload)
         ) {
@@ -514,9 +591,10 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         }
         if (payload !== null) {
           this.lastPayload = payload;
-          this.payloadMaybeStale = false;
+          this.lastPayloadRevision = revision;
         } else {
           this.lastPayload = null; // resync failed: never skip off a bad cache
+          this.lastPayloadRevision = null;
         }
         const decos = payload === null ? Decoration.none : this.buildDecorationSet(payload);
         if (decos === this.decorations) return;
@@ -531,7 +609,7 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         const payload = this.fetchPayload();
         if (payload === null) return Decoration.none;
         this.lastPayload = payload;
-        this.payloadMaybeStale = false;
+        this.lastPayloadRevision = core.revision();
         return this.buildDecorationSet(payload);
       }
 
@@ -732,18 +810,8 @@ function commandKeymap(core: OxidownCore): Extension {
     (name: RangeCommandName) =>
     (view: EditorView): boolean => {
       const { from, to } = view.state.selection.main;
-      let change: CoreChange | null;
-      try {
-        change = core.command(name, from, to);
-      } catch (err) {
-        console.error(
-          `[oxidown] core error during command(${name}) — re-loading core from view buffer:`,
-          err,
-        );
-        core.load(view.state.doc.toString());
-        return true;
-      }
-      if (change) applyCoreChange(view, change, "oxidown.command");
+      const outcome = runCoreCommand(name, () => core.command(name, from, to));
+      if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
       return true;
     };
   // Tab/Shift-Tab: marker-width-aware Tab nesting (docs/boundary-v0.md
@@ -763,19 +831,14 @@ function commandKeymap(core: OxidownCore): Extension {
     (name: "indentList" | "outdentList", fallback: (view: EditorView) => boolean) =>
     (view: EditorView): boolean => {
       const { from, to } = view.state.selection.main;
-      let change: CoreChange | null;
-      try {
-        change = core.command(name, from, to);
-      } catch (err) {
-        console.error(
-          `[oxidown] core error during command(${name}) — re-loading core from view buffer:`,
-          err,
-        );
-        core.load(view.state.doc.toString());
-        return true;
-      }
-      if (change === null) return fallback(view);
-      applyCoreChange(view, change, "oxidown.command");
+      const outcome = runCoreCommand(name, () => core.command(name, from, to));
+      // An exception is NOT the same as a legitimate `null` — it must never
+      // fall back to indentMore/indentLess (that could apply an entirely
+      // unrelated edit); treat it as handled, like every other command-throw
+      // site.
+      if (!outcome.ok) return true;
+      if (outcome.change === null) return fallback(view);
+      applyCoreChange(view, outcome.change, "oxidown.command");
       return true;
     };
   // Enter: construct-aware continuation/exit (docs/boundary-v0.md "enter",
@@ -789,19 +852,13 @@ function commandKeymap(core: OxidownCore): Extension {
   const runEnter = (view: EditorView): boolean => {
     if (view.composing) return false;
     const { from, to } = view.state.selection.main;
-    let change: CoreChange | null;
-    try {
-      change = core.command("enter", from, to);
-    } catch (err) {
-      console.error(
-        "[oxidown] core error during command(enter) — re-loading core from view buffer:",
-        err,
-      );
-      core.load(view.state.doc.toString());
-      return true;
-    }
-    if (change === null) return false; // default Enter runs
-    applyCoreChange(view, change, "oxidown.command");
+    const outcome = runCoreCommand("enter", () => core.command("enter", from, to));
+    // Same distinction as runIndent: a thrown command is handled-and-ignored,
+    // never treated as "doesn't apply" (which would insert a plain newline
+    // on top of whatever state the core is actually in).
+    if (!outcome.ok) return true;
+    if (outcome.change === null) return false; // default Enter runs
+    applyCoreChange(view, outcome.change, "oxidown.command");
     return true;
   };
   return keymap.of([

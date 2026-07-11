@@ -467,6 +467,128 @@ fn command_indent_list_nested_mid_document() {
     }
 }
 
+// ---- (g) list-command planner scaling on huge lists ------------------------
+
+/// Regression gate for the planner-scan fix (commands.rs `quote_context`/
+/// `line_marker` binary-searching the extent-sorted overlay instead of
+/// linearly scanning every node per visited line, plus `plan_list_nesting`'s
+/// no-op early-out before building every intersecting line's context, plus
+/// the redundant-subtree-walk skip):
+///
+/// * select-all Tab on a flat 10k-item ordered list — a NO-OP plan (the
+///   first intersecting item line is the list's first item; nothing to nest
+///   under). Pre-fix this cost ~100ms (O(lines x nodes): every intersecting
+///   line's ctx built eagerly, each with two full linear node scans); fixed
+///   it is ~1-2us (the lazy line iterator stops at the first item line).
+///   Ceiling 20ms: enormous headroom over the fixed cost so slow CI never
+///   flakes, while the pre-fix cost (5x the ceiling) trips it instantly.
+/// * Tab on items 2..10k of the same list (the plan APPLIES: ~10k affected
+///   lines, ~10k splices, apply + reparse included — inherently O(lines)).
+///   Measured ~11-17ms fixed (M4 Pro); ceiling 150ms (~9x): pre-fix the
+///   planner alone exceeded it.
+/// * Shift-Tab on the top of a 10k-line always-deeper subtree (every line
+///   below the target stays strictly deeper, so the subtree walk visits all
+///   of them — the shape that measured ~180ms pre-fix through
+///   `Editor::command`). Measured ~8ms fixed; ceiling 100ms (~12x).
+#[test]
+#[ignore = "perf baseline; run with --release --ignored --nocapture"]
+fn command_list_planner_scaling_on_huge_lists() {
+    let n = iters(30);
+
+    // -- select-all Tab on a flat 10k-item list: no-op plan ------------------
+    let mut flat = String::with_capacity(10_000 * 14);
+    for i in 0..10_000 {
+        flat.push_str(&format!("{}. item {i}\n", i + 1));
+    }
+    let mut ed = Editor::new(1);
+    ed.load(&flat);
+    let end = ed.doc_len_utf16();
+
+    let mut samples = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t = Instant::now();
+        let change = ed
+            .command(Command::IndentList { from: 0, to: end })
+            .unwrap()
+            .expect("a list is selected: the command applies (as a no-op)");
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        assert!(change.splices.is_empty(), "first item of its list: no-op");
+        samples.push(us);
+    }
+    let noop = stats(samples);
+
+    // -- Tab on items 2..end of the same list: the plan applies --------------
+    let second_item = byte_to_utf16_offset(&flat, flat.find('\n').unwrap() + 1);
+    let mut samples = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t = Instant::now();
+        let change = ed
+            .command(Command::IndentList { from: second_item, to: end })
+            .unwrap()
+            .expect("items 2.. nest under item 1");
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        assert!(!change.splices.is_empty(), "the batch moves ~10k lines");
+        samples.push(us);
+        // Restore (untimed) so every iteration measures the same doc.
+        ed.undo().expect("the indent was a real edit");
+    }
+    let applies = stats(samples);
+
+    // -- Shift-Tab atop a 10k-line always-deeper subtree ---------------------
+    // "- root" at column 0, then "  - top" at column 2 whose walk collects
+    // every following line: columns alternate 4/6, always strictly greater
+    // than 2 (a strictly-deepening 10k-COLUMN chain would need a ~50MB doc;
+    // alternating exercises the same all-lines walk in ~200KB).
+    let mut deep = String::with_capacity(10_000 * 16);
+    deep.push_str("- root\n  - top\n");
+    for i in 0..10_000 {
+        if i % 2 == 0 {
+            deep.push_str(&format!("    - a{i}\n"));
+        } else {
+            deep.push_str(&format!("      - b{i}\n"));
+        }
+    }
+    let mut ed = Editor::new(1);
+    ed.load(&deep);
+    let pos = byte_to_utf16_offset(&deep, deep.find("top").unwrap());
+
+    let mut samples = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t = Instant::now();
+        let change = ed
+            .command(Command::OutdentList { from: pos, to: pos })
+            .unwrap()
+            .expect("\"  - top\" outdents to \"- root\"'s level");
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        assert!(!change.splices.is_empty(), "the whole subtree moves");
+        samples.push(us);
+        ed.undo().expect("the outdent was a real edit");
+    }
+    let subtree = stats(samples);
+
+    println!("\n=== list-command planner scaling, 10k-item lists (release-mode timings) ===");
+    println!("select-all Tab (no-op plan):         {noop}");
+    println!("Tab items 2.. (applies, ~10k lines): {applies}");
+    println!("Shift-Tab atop 10k-line subtree:     {subtree}");
+
+    assert!(
+        noop.p95 < 20_000.0,
+        "select-all no-op plan p95 {:.0}us — the planner's per-line node \
+         scans have regressed toward O(lines x nodes)",
+        noop.p95
+    );
+    assert!(
+        applies.p95 < 150_000.0,
+        "select-all applying plan p95 {:.0}us exceeds the 150ms ceiling",
+        applies.p95
+    );
+    assert!(
+        subtree.p95 < 100_000.0,
+        "subtree outdent p95 {:.0}us exceeds the 100ms ceiling",
+        subtree.p95
+    );
+}
+
 // ---- (f) wasm-boundary-equivalent JSON serialization, native Rust ---------
 
 /// Replicates `crates/oxidown-wasm/src/lib.rs`'s `decoration_json` mapping

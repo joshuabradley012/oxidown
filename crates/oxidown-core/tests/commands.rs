@@ -558,6 +558,26 @@ fn indent_bullet_under_bullet_is_plus_two() {
 }
 
 #[test]
+fn indent_works_on_lone_cr_terminated_lines() {
+    // pulldown-cmark treats a lone '\r' as a line ending ("- a\r- b\r- c"
+    // is THREE list items), so the command planners' own line resolution
+    // must agree. Pre-fix bug: `line_containing`'s hand-rolled backward
+    // scan only stopped at '\n', so from inside "b" it resolved a "line"
+    // spanning back through "- a", found no marker STARTING there in the
+    // mis-derived range's node lookup, and the command no-op'd/misfired.
+    let mut ed = Editor::new(1);
+    ed.load("- a\r- b\r- c");
+    let pos = "- a\r- b".len() - 1; // inside "b"'s text
+    let change = run(&mut ed, Command::IndentList { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "- a\r  - b\r- c", "\"- b\" nests under \"- a\"; \"- c\" untouched");
+    assert!(!change.splices.is_empty());
+    // And outdent reverses it, resolving the same lone-\r line shape.
+    let sel = change.selection.unwrap();
+    run(&mut ed, Command::OutdentList { from: sel.anchor, to: sel.head }).unwrap();
+    assert_eq!(ed.get_text(), "- a\r- b\r- c");
+}
+
+#[test]
 fn indent_ordered_under_ordered_is_plus_three() {
     let mut ed = Editor::new(1);
     ed.load("1. a\n2. b\n");
@@ -1257,6 +1277,78 @@ fn enter_exit_nested_item_outdents_and_rewrites_a_below_sibling_the_edit_reconte
     );
     assert_list_item_at_line(&ed.get_text(), 3);
     assert_list_item_at_line(&ed.get_text(), 4);
+}
+
+#[test]
+fn enter_exit_selection_past_line_end_still_rewrites_the_below_sibling() {
+    // Same repro shape as the collapsed-cursor control above, plus one more
+    // item line ("   - [ ] y") between the empty item and "3. c". Enter is
+    // pressed with a SELECTION from the empty item's content start through
+    // the END of the "   - [ ] y" line (consuming it outright, `to` past
+    // `L`'s own end). The below-line guard must still run — scanning from
+    // past the line CONTAINING `to`, not just past `L`'s own end — and
+    // land on the same below-context line ("3. c") the collapsed-cursor
+    // control does, producing the BYTE-IDENTICAL rewrite ("3." -> "1.").
+    // `run()` isn't used here: the consumed "   - [ ] y" line losing its own
+    // itemness is an explicit, intended consequence of the user's own
+    // selection (not the silent side effect the whole-doc invariant guards
+    // against), so `assert_enter_itemness`'s single-line exemption doesn't
+    // apply and would false-positive on this test.
+    let mut ed = Editor::new(1);
+    let doc = "1. a\n2. b\n   - [ ] x\n   - [ ] \n   - [ ] y\n3. c\n";
+    ed.load(doc);
+    let from = "1. a\n2. b\n   - [ ] x\n   - [ ] ".len();
+    let to = "1. a\n2. b\n   - [ ] x\n   - [ ] \n   - [ ] y".len();
+    let change = ed.command(Command::Enter { from, to }).unwrap().unwrap();
+    assert_eq!(
+        ed.get_text(),
+        "1. a\n2. b\n   - [ ] x\n- [ ] \n1. c\n",
+        "same rewrite as the collapsed-cursor control"
+    );
+    assert_eq!(
+        change.splices.len(),
+        3,
+        "outdent whitespace removal + the selection delete + the below-line digit rewrite"
+    );
+    let rewrite = change.splices.last().unwrap();
+    assert_eq!(
+        (rewrite.at, rewrite.delete, rewrite.insert.as_str()),
+        (doc.find("3. c").unwrap(), 1, "1"),
+        "the digit rewrite lands exactly on the below sibling's marker digits"
+    );
+    assert_list_item_at_line(&ed.get_text(), 3);
+    assert_list_item_at_line(&ed.get_text(), 4);
+}
+
+#[test]
+fn enter_exit_selection_past_line_end_below_line_untouched_when_no_hazard() {
+    // Same selection shape as the test above, but the below line is either a
+    // bullet (always safe to interrupt) or an already-"1."-numbered ordered
+    // item (also always safe): the below-line guard still runs (scanning
+    // from past the consumed "   - [ ] y" line) but finds nothing to
+    // rewrite, same as the collapsed-cursor no-hazard control.
+    let from = "1. a\n2. b\n   - [ ] x\n   - [ ] ".len();
+    let to = "1. a\n2. b\n   - [ ] x\n   - [ ] \n   - [ ] y".len();
+
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n2. b\n   - [ ] x\n   - [ ] \n   - [ ] y\n- c\n");
+    let change = ed.command(Command::Enter { from, to }).unwrap().unwrap();
+    assert_eq!(
+        ed.get_text(),
+        "1. a\n2. b\n   - [ ] x\n- [ ] \n- c\n",
+        "bullet below stays byte-identical"
+    );
+    assert_eq!(change.splices.len(), 2, "no below-line rewrite needed");
+
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n2. b\n   - [ ] x\n   - [ ] \n   - [ ] y\n1. c\n");
+    let change = ed.command(Command::Enter { from, to }).unwrap().unwrap();
+    assert_eq!(
+        ed.get_text(),
+        "1. a\n2. b\n   - [ ] x\n- [ ] \n1. c\n",
+        "'1.' below stays byte-identical"
+    );
+    assert_eq!(change.splices.len(), 2, "no below-line rewrite needed");
 }
 
 #[test]

@@ -129,7 +129,15 @@ impl TextBuffer {
     }
 
     /// Byte range of the line containing `byte` (char-boundary aligned),
-    /// excluding the trailing line terminator (`\n` or `\r\n`).
+    /// excluding the trailing line terminator (`\n`, `\r\n`, or a lone `\r`).
+    /// Ropey's line metric here is `unicode_lines` (this crate's default
+    /// features, which imply `cr_lines`), so a bare `\r` already counts as a
+    /// line break to `byte_to_line`/`line_to_byte` — matching pulldown-cmark,
+    /// which treats a lone `\r` as a line ending too (verified by
+    /// `lone_cr_is_a_line_break` below). The trailing-terminator strip below
+    /// checks for `\n` and `\r` independently (not "only if `\n` was found
+    /// first"), so it correctly strips a lone `\r` even though the `\n`
+    /// check doesn't match.
     pub fn line_range_at(&self, byte: usize) -> Range<usize> {
         let line = self.rope.byte_to_line(byte.min(self.rope.len_bytes()));
         let start = self.rope.line_to_byte(line);
@@ -220,6 +228,15 @@ impl<'a> SrcBytes<'a> {
     pub fn slice_eq(&self, range: Range<usize>, s: &str) -> bool {
         self.text.rope.byte_slice(range) == s
     }
+
+    /// Byte range of the physical source line containing `pos` (terminator
+    /// excluded) — thin delegate to [`TextBuffer::line_range_at`], so the
+    /// command planners share the ONE place that knows how to split lines
+    /// (`\n`, `\r\n`, and lone `\r` alike) rather than hand-rolling their own
+    /// scan (see `commands.rs`'s former `line_containing`).
+    pub fn line_range_at(&self, pos: usize) -> Range<usize> {
+        self.text.line_range_at(pos)
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +307,30 @@ mod tests {
             t.utf16_to_byte(3),
             Err(CoreError::OutOfBounds { pos: 3, len: 2 })
         );
+    }
+
+    #[test]
+    fn lone_cr_is_a_line_break() {
+        // "cr_lines" (implied by the default "unicode_lines" feature) makes
+        // ropey's own line metric treat a bare '\r' as a line ending, same as
+        // pulldown-cmark — `line_range_at` must resolve each of these three
+        // items to its own line, not merge them (the bug `line_containing`'s
+        // old hand-rolled `\n`-only scan had).
+        let t = TextBuffer::from_text("- a\r- b\r- c");
+        assert_eq!(t.line_range_at(0), 0..3, "\"- a\"");
+        assert_eq!(t.line_range_at(5), 4..7, "\"- b\", queried mid-line");
+        assert_eq!(t.line_range_at(6), 4..7, "\"- b\", queried at its last byte");
+        assert_eq!(t.line_range_at(8), 8..11, "\"- c\"");
+        assert_eq!(t.line_range_at(11), 8..11, "querying just past the doc end");
+    }
+
+    #[test]
+    fn crlf_and_mixed_line_endings_still_split_correctly() {
+        let t = TextBuffer::from_text("a\r\nb\nc\rd");
+        assert_eq!(t.line_range_at(0), 0..1, "\"a\" (CRLF)");
+        assert_eq!(t.line_range_at(3), 3..4, "\"b\" (LF)");
+        assert_eq!(t.line_range_at(5), 5..6, "\"c\" (lone CR)");
+        assert_eq!(t.line_range_at(7), 7..8, "\"d\" (no terminator, doc end)");
     }
 
     #[test]

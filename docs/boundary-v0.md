@@ -121,6 +121,10 @@ Nesting (`**bold *italic***`) must work; reveal applies per-node, not per-line.
   composition end. Pair with `compositionBegin`/`compositionEnd` calls into the core.
 - Apply `undo`/`redo` splices with an annotation the change-forwarding path recognizes, so they
   are not echoed back into `applyEdit`.
+- Hosts must not filter or alter oxidown-annotated transactions (CM6 `changeFilter`/
+  `transactionFilter`) — those carry core-driven changes (undo/redo/command/stream) the core has
+  already applied; the dev-mode mirror check (`verifyMirror`) verifies these transactions
+  immediately (not only on the next forwarded edit), so a host that violates this is caught early.
 
 ## Performance budget (M0 gate)
 
@@ -315,6 +319,10 @@ Commands are text transforms computed against the overlay (plan §5.8): they emi
 splices (toggle = add or remove delimiters), enter the op log with origin `"command"`, and are
 single undo units (never coalesce). Returns null when the command doesn't apply at the target —
 `indentList`/`outdentList` are the one exception to "null when nothing happens"; see below.
+**`command()` either returns `null`/`CoreChange` or throws WITHOUT mutating the core** — planning
+happens entirely before any apply, so a thrown command is not a mirror-desync signal; views must
+not resync (`load()`) in response to one (contrast with `applyEdit`/`decorations`, where any
+exception IS still a desync emergency per "Error handling" below).
 
 ### `indentList` / `outdentList`
 
@@ -498,9 +506,14 @@ still an empty item per CommonMark).
    quote prefix intact in the continuation/outdent; an empty top-level item inside a quote
    clears just the marker and keeps `> ` (rule 5 then applies on the next press).
 7. **Selection** (`from != to`): context comes from the pre-edit parse at `from`; the
-   replacement covers the selection (delete + continue in one batch, one undo unit). **v1
-   punt:** a selection extending past L's own end skips rule 3's below-line guard (the guard's
-   scan could otherwise overlap lines the selection consumed).
+   replacement covers the selection (delete + continue in one batch, one undo unit). A
+   selection extending past L's own end does NOT skip rule 3's below-line guard: the guard's
+   downward scan starts past the line containing `to` (accounting for the whole region the
+   selection consumes), uses post-edit columns like every other landing scan, and lands on the
+   same below-context line a collapsed cursor reaching the byte-identical shape would — the two
+   paths emit the same rewrite. Lines the selection deletes outright lose their itemness as a
+   direct consequence of the user's own gesture (the same rationale as rule 3 de-listing the
+   pressed line itself); the itemness invariant protects every line the press does NOT consume.
 8. **Composition:** the view keymap must not intercept Enter while `view.composing` (return
    false — the key belongs to the IME).
 
@@ -551,6 +564,15 @@ Rules:
 3. **`list-marker` spans include the required trailing whitespace** (`"- "`, `"1. "`).
 4. **Link conceal spans** are two spans (`[` and `](url)`); on reveal they are emitted as
    delim/url/delim pieces.
+5. **Line terminators**: wherever this contract says "physical source line" (line-level reveal
+   extents, per-line marker/quote constructs, the line vocabulary of `indentList`/
+   `outdentList`/`enter`), a line is terminated by `\n`, `\r\n`, or a **lone `\r`** — matching
+   the underlying markdown parser, which treats a bare `\r` as a line ending (a
+   `"- a\r- b\r- c"` document is three list items, and each command/reveal computation must
+   resolve each item to its own line). Known, accepted upstream quirk: pulldown-cmark's fence
+   and blockquote-marker *scanning* does not itself honor a lone `\r` (a fence must open/close
+   via `\n` to parse as a fence at all), so those constructs simply cannot arise on
+   lone-`\r`-only lines — the core's own line splitting still treats `\r` uniformly.
 
 ## Error handling
 

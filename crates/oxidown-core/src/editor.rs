@@ -213,7 +213,7 @@ impl Editor {
         let splices = self.to_utf16_splices(&unit.inverse);
         let redo_inverse = self.apply_bytes(&unit.inverse, EditOrigin::Undo);
         let selection = self.change_cursor(&redo_inverse);
-        self.history.push_redo(redo_inverse);
+        self.history.push_redo(redo_inverse, unit.stream_id);
         self.history.set_break();
         self.reparse_incremental(&unit.inverse);
         self.revision += 1;
@@ -230,7 +230,7 @@ impl Editor {
         let splices = self.to_utf16_splices(&unit.inverse);
         let undo_inverse = self.apply_bytes(&unit.inverse, EditOrigin::Redo);
         let selection = self.change_cursor(&undo_inverse);
-        self.history.push_undo_unit(undo_inverse);
+        self.history.push_undo_unit(undo_inverse, unit.stream_id);
         self.history.set_break();
         self.reparse_incremental(&unit.inverse);
         self.revision += 1;
@@ -632,7 +632,17 @@ impl Editor {
             return None;
         }
         let region_start = last.span.start;
-        if region_start == 0 || self.text.byte_at(region_start - 1) == Some(b'\n') {
+        // A block start is "at a line boundary" when the byte right before
+        // it ends a line terminator: `\n` (lone, or the second byte of
+        // `\r\n`) or a lone `\r` (pulldown-cmark treats a bare `\r` as a
+        // line ending too — verified against this pulldown-cmark version;
+        // see `parser.rs`'s `line_bounds`/`split_lines`). Without the `\r`
+        // arm this probe would wrongly refuse the fast path for every block
+        // that starts right after a lone-`\r`-terminated line — always
+        // SAFE (it only forces the slower fallback), just needlessly so.
+        if region_start == 0
+            || matches!(self.text.byte_at(region_start - 1), Some(b'\n') | Some(b'\r'))
+        {
             Some(region_start)
         } else {
             None
@@ -681,12 +691,16 @@ impl Editor {
         if splice.at > first_line.end {
             return Some(region_start);
         }
-        // Insulation: a blank line (or document start) directly above.
-        // `region_start == 1` means byte 0 is the preceding `'\n'` (already
-        // verified by `tail_fast_path_region`), i.e. an empty first line.
-        let insulated = region_start <= 1
-            || (self.text.byte_at(region_start - 1) == Some(b'\n')
-                && self.text.byte_at(region_start - 2) == Some(b'\n'));
+        // Insulation: a blank line (or document start) directly above —
+        // i.e. the line CONTAINING `region_start - 1` (a terminator byte,
+        // already verified by `tail_fast_path_region`) has empty content.
+        // Resolved through the rope's own line metric rather than a raw
+        // two-byte `\n\n` probe so every terminator flavor is handled
+        // (`\n\n`, `\r\r`, `\r\n\r\n`, mixes — a naive `\n|\r` byte pair
+        // would misread ONE `\r\n` terminator as two, claiming insulation
+        // that isn't there).
+        let insulated =
+            region_start == 0 || self.text.line_range_at(region_start - 1).is_empty();
         if !insulated {
             return None;
         }
@@ -848,7 +862,9 @@ impl Editor {
         let mut idx = containing as isize - 2; // one block before the containing one
         while idx >= 0 {
             let s = blocks[idx as usize].span.start;
-            if s == 0 || self.text.byte_at(s - 1) == Some(b'\n') {
+            // See `tail_fast_path_region`'s doc comment: a lone `\r` ends a
+            // line here too, not just `\n`.
+            if s == 0 || matches!(self.text.byte_at(s - 1), Some(b'\n') | Some(b'\r')) {
                 region_start = s;
                 break;
             }

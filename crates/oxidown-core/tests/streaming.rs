@@ -363,10 +363,14 @@ fn anchors_map_through_stream_appends() {
 
 #[test]
 fn undo_mid_stream_then_more_appends_starts_fresh_unit() {
-    // Documented edge: undoing the stream's unit while the stream is open
-    // moves it to redo; the next append starts a fresh unit (and clears
-    // redo). Everything stays consistent, just with two units for this
-    // stream's lifetime.
+    // Undoing the stream's unit while the stream is open moves it to redo;
+    // a NEW append WITHOUT first redoing clears the redo stack (normal
+    // "any edit clears redo" rule — the undone unit, stream tag included,
+    // is gone for good) and starts a fresh unit. Correct per the contract:
+    // the guarantee is one unit per stream session, not immunity from the
+    // user unwinding the stream mid-flight and then diverging. Contrast
+    // with `undo_then_redo_mid_stream_keeps_one_unit`, where redoing FIRST
+    // resurrects the same unit and later appends keep merging into it.
     let mut ed = Editor::new(1);
     ed.load("");
     let mut mirror = ed.get_text();
@@ -375,10 +379,135 @@ fn undo_mid_stream_then_more_appends_starts_fresh_unit() {
     let u = ed.undo().unwrap();
     apply_to_mirror(&mut mirror, &u.splices);
     assert_eq!(ed.get_text(), "");
+    assert_eq!(ed.history_depths(), (0, 1), "stream unit moved to redo");
     append(&mut ed, &mut mirror, id, "two ");
+    assert_eq!(ed.history_depths(), (1, 0), "fresh unit; redo cleared by the new append");
     ed.stream_close(id);
     assert_eq!(ed.get_text(), "two ");
-    assert_eq!(ed.history_depths(), (1, 0), "fresh unit; redo cleared");
     ed.undo().unwrap();
     assert_eq!(ed.get_text(), "");
+}
+
+#[test]
+fn undo_then_redo_mid_stream_keeps_one_unit() {
+    // The undo->redo round trip must preserve the unit's stream tag
+    // (boundary v0.2: an ENTIRE stream session is exactly ONE undo unit —
+    // no undo/redo carve-out): after open -> append -> undo -> redo,
+    // further appends of the still-open stream merge into the SAME
+    // resurrected unit, and one undo reverts everything the stream wrote.
+    // (Pre-fix bug: the redo path re-pushed the unit with stream_id: None,
+    // so the post-redo append started a SECOND unit and two undos were
+    // needed.)
+    let mut ed = Editor::new(1);
+    ed.load("");
+    let mut mirror = ed.get_text();
+    let id = ed.stream_open(0).unwrap();
+    append(&mut ed, &mut mirror, id, "one ");
+
+    let u = ed.undo().unwrap();
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "");
+    let r = ed.redo().unwrap();
+    apply_to_mirror(&mut mirror, &r.splices);
+    assert_eq!(ed.get_text(), "one ");
+
+    append(&mut ed, &mut mirror, id, "two ");
+    ed.stream_close(id);
+    assert_eq!(ed.get_text(), "one two ");
+    assert_eq!(
+        ed.history_depths(),
+        (1, 0),
+        "post-redo appends merged into the resurrected stream unit"
+    );
+
+    let u = ed.undo().unwrap();
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "", "ONE undo reverts the whole stream session");
+    assert_eq!(mirror, ed.get_text());
+    assert!(ed.undo().is_none());
+}
+
+#[test]
+fn undo_redo_after_close_still_one_unit() {
+    // Same round trip but AFTER the stream closed: the tag rides along
+    // harmlessly (no more appends can arrive for a closed id — stream ids
+    // are never reused), and the session stays one unit through arbitrary
+    // undo/redo cycling.
+    let mut ed = Editor::new(1);
+    ed.load("base ");
+    let mut mirror = ed.get_text();
+    let id = ed.stream_open(5).unwrap();
+    append(&mut ed, &mut mirror, id, "one ");
+    append(&mut ed, &mut mirror, id, "two");
+    ed.stream_close(id);
+    assert_eq!(ed.get_text(), "base one two");
+    assert_eq!(ed.history_depths(), (1, 0));
+
+    for _ in 0..3 {
+        let u = ed.undo().unwrap();
+        apply_to_mirror(&mut mirror, &u.splices);
+        assert_eq!(ed.get_text(), "base ");
+        assert_eq!(mirror, ed.get_text());
+        assert_eq!(ed.history_depths(), (0, 1));
+
+        let r = ed.redo().unwrap();
+        apply_to_mirror(&mut mirror, &r.splices);
+        assert_eq!(ed.get_text(), "base one two");
+        assert_eq!(mirror, ed.get_text());
+        assert_eq!(ed.history_depths(), (1, 0), "still exactly one unit");
+    }
+}
+
+#[test]
+fn undo_redo_round_trip_with_interleaved_user_edit_mid_stream() {
+    // v0.2 clarification 2 under the round trip: a user edit made
+    // mid-stream keeps its own unit in creation order (LIFO pops it before
+    // the stream's unit), and undoing/redoing BOTH units mid-stream still
+    // leaves the stream's unit tagged — post-redo appends merge into it,
+    // and the final undo order is user edit first, then the whole stream.
+    let mut ed = Editor::new(1);
+    ed.load("base ");
+    let mut mirror = ed.get_text();
+    let id = ed.stream_open(5).unwrap();
+    append(&mut ed, &mut mirror, id, "one ");
+    // User edit at the top while the stream is open: its own unit, above
+    // the stream's in the stack.
+    let batch = vec![Splice { at: 0, delete: 0, insert: "# ".into() }];
+    ed.apply_edit(ed.revision(), &batch, EditOrigin::User, 0.0).unwrap();
+    apply_to_mirror(&mut mirror, &batch);
+    assert_eq!(ed.get_text(), "# base one ");
+    assert_eq!(ed.history_depths(), (2, 0));
+
+    // Unwind both units, then redo both (stream unit last on undo, first
+    // on redo — creation order).
+    let u = ed.undo().unwrap(); // pops the user edit
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "base one ");
+    let u = ed.undo().unwrap(); // pops the stream unit
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "base ");
+    let r = ed.redo().unwrap(); // restores the stream unit (tag preserved)
+    apply_to_mirror(&mut mirror, &r.splices);
+    assert_eq!(ed.get_text(), "base one ");
+    let r = ed.redo().unwrap(); // restores the user edit
+    apply_to_mirror(&mut mirror, &r.splices);
+    assert_eq!(ed.get_text(), "# base one ");
+    assert_eq!(ed.history_depths(), (2, 0));
+
+    // The stream keeps flowing: this append must merge into the restored
+    // stream unit (below the user edit's unit), not start a third unit.
+    append(&mut ed, &mut mirror, id, "two");
+    ed.stream_close(id);
+    assert_eq!(ed.get_text(), "# base one two");
+    assert_eq!(ed.history_depths(), (2, 0), "stream unit + user unit, nothing extra");
+
+    // LIFO: the user edit pops first, then ONE undo reverts both chunks.
+    let u = ed.undo().unwrap();
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "base one two");
+    let u = ed.undo().unwrap();
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "base ");
+    assert_eq!(mirror, ed.get_text());
+    assert!(ed.undo().is_none());
 }

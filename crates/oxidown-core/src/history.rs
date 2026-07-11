@@ -43,8 +43,13 @@ pub struct UndoUnit {
     /// made outside a composition session).
     coalesce_last_ms: Option<f64>,
     /// Set when this unit is an AI stream's single unit — appends of that
-    /// stream merge here instead of pushing new units.
-    stream_id: Option<u64>,
+    /// stream merge here instead of pushing new units. `pub(crate)` so
+    /// `Editor::undo`/`redo` can carry it across the undo<->redo round trip
+    /// (see `push_redo`/`push_undo_unit`) — a stream session must stay
+    /// exactly ONE undo unit even after being undone and redone (boundary
+    /// v0.2: "An ENTIRE stream session (open→close) is exactly ONE undo
+    /// unit," no undo/redo carve-out).
+    pub(crate) stream_id: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -201,27 +206,37 @@ impl History {
         self.redo.pop()
     }
 
-    pub fn push_redo(&mut self, inverse: Vec<ByteSplice>) {
+    /// Push a unit popped from the undo stack onto the redo stack (`undo()`'s
+    /// counterpart of [`Self::push_undo_unit`]). `stream_id` must be the
+    /// popped unit's own (see `Editor::undo`) — preserving it across the
+    /// round trip is what makes undo→redo of an open stream's unit still
+    /// count as the SAME stream unit, so later appends keep merging into it
+    /// instead of starting a second unit (boundary v0.2: one stream session
+    /// is exactly one undo unit, with no undo/redo carve-out).
+    pub fn push_redo(&mut self, inverse: Vec<ByteSplice>, stream_id: Option<u64>) {
         self.redo.push(UndoUnit {
             inverse,
             coalesce_last_ms: None,
-            stream_id: None,
+            stream_id,
         });
     }
 
     /// Push a unit produced by `redo()` back onto the undo stack. Never
-    /// coalescible: redo restores a completed unit. Deliberately untagged
-    /// even if the redone unit was a stream unit: once a stream unit has
-    /// been undone and redone, later appends of a still-open stream start a
-    /// fresh unit rather than merging into a resurrected one (documented
-    /// edge — the "one unit per stream" guarantee holds for the normal
-    /// open→append*→close life cycle, not across the user unwinding the
-    /// stream mid-flight).
-    pub fn push_undo_unit(&mut self, inverse: Vec<ByteSplice>) {
+    /// coalescible: redo restores a completed unit. `stream_id` must be the
+    /// redone unit's own (see `Editor::redo`) — same reasoning as
+    /// `push_redo`. Note this only re-establishes the unit as the stream's
+    /// MERGE TARGET if the stream is still open and appends again; undoing
+    /// mid-stream and then making a NEW append WITHOUT first redoing still
+    /// starts a fresh unit (the redo stack — including this unit, before it
+    /// is ever pushed here — is cleared by that new edit per the normal
+    /// "any edit clears redo" rule), which is correct: the guarantee is one
+    /// unit per stream session, not immunity from the user unwinding the
+    /// stream mid-flight and then diverging.
+    pub fn push_undo_unit(&mut self, inverse: Vec<ByteSplice>, stream_id: Option<u64>) {
         self.undo.push(UndoUnit {
             inverse,
             coalesce_last_ms: None,
-            stream_id: None,
+            stream_id,
         });
     }
 }

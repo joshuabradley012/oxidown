@@ -641,3 +641,296 @@ describe("hr rule suppression while editing", () => {
     view.destroy();
   });
 });
+
+describe("FIX 1: TaskCheckboxWidget resolves its target from the DOM at click time", () => {
+  function makeTaskView(doc: string) {
+    const core = new MockCore();
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        // Cursor away from the task line (reveal is line-level) so the task
+        // starts concealed (widget rendered) rather than revealed.
+        selection: { anchor: doc.length },
+        extensions: [oxidown(core, { verifyMirror: true })],
+      }),
+    });
+    return { core, view };
+  }
+
+  it("toggles the correct task after an edit ABOVE it, clicked before any decoration rebuild flushes", async () => {
+    const doc = "line one\n- [ ] task\n";
+    const { core, view } = makeTaskView(doc);
+    await flush();
+
+    const checkbox = view.contentDOM.querySelector(
+      "input.ox-task-checkbox",
+    ) as HTMLInputElement | null;
+    expect(checkbox).not.toBeNull();
+
+    // Insert text ABOVE the task line — shifts its position in the doc.
+    // Deliberately do NOT await flush(): the decoration rebuild (which would
+    // reconstruct the widget with an up-to-date constructor `pos`) is
+    // microtask-deferred, so the SAME widget instance — carrying the `pos`
+    // captured before this insertion — is still mounted; only RangeSet.map
+    // has repositioned its range. A click right now must still resolve to
+    // the CURRENT task position (via the DOM), not the stale one.
+    view.dispatch({ changes: { from: 0, to: 0, insert: "more text\n" } });
+
+    checkbox!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+
+    expect(core.getText()).toBe("more text\nline one\n- [x] task\n");
+    expect(view.state.doc.toString()).toBe(core.getText());
+    await flush();
+    view.destroy();
+  });
+
+  it("still resolves correctly mid-composition, when rebuilds are frozen", async () => {
+    const doc = "line one\n- [ ] task\n";
+    const { core, view } = makeTaskView(doc);
+    await flush();
+
+    const checkbox = view.contentDOM.querySelector(
+      "input.ox-task-checkbox",
+    ) as HTMLInputElement | null;
+    expect(checkbox).not.toBeNull();
+
+    // Shadow the composing state (jsdom cannot run a real IME session; same
+    // technique as the "does not intercept Enter while composing" test
+    // above) — rebuilds are frozen for the duration, exactly like the
+    // anti-flicker rule requires.
+    Object.defineProperty(view, "composing", { get: () => true });
+
+    view.dispatch({ changes: { from: 0, to: 0, insert: "more text\n" } });
+    // No flush: even if a rebuild were scheduled, `composing` freezes it.
+
+    checkbox!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+
+    expect(core.getText()).toBe("more text\nline one\n- [x] task\n");
+    view.destroy();
+  });
+});
+
+describe("FIX 4: a thrown command() is logged and swallowed, never a mirror-desync resync", () => {
+  it("Mod-b (runToggle): swallowed without re-loading the core or touching the doc", async () => {
+    const core = new MockCore();
+    const view = makeView("hello world", core);
+    view.dispatch({ selection: { anchor: 0, head: 5 } });
+
+    const loadSpy = vi.spyOn(core, "load");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cmdSpy = vi.spyOn(core, "command").mockImplementation(() => {
+      throw new Error("boom");
+    });
+
+    const boldKey = new KeyboardEvent("keydown", {
+      key: "b",
+      code: "KeyB",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    view.contentDOM.dispatchEvent(boldKey);
+    await flush();
+
+    expect(errSpy).toHaveBeenCalled();
+    // command() is transactional (never mutates before throwing): a throw is
+    // NOT a mirror-desync emergency, so no re-load.
+    expect(loadSpy).not.toHaveBeenCalled();
+    expect(view.state.doc.toString()).toBe("hello world");
+    cmdSpy.mockRestore();
+    errSpy.mockRestore();
+    view.destroy();
+  });
+
+  it("checkbox click: swallowed without re-loading the core", async () => {
+    const core = new MockCore();
+    const doc = "- [ ] buy milk\nelsewhere";
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        selection: { anchor: doc.length },
+        extensions: [oxidown(core, { verifyMirror: true })],
+      }),
+    });
+    await flush();
+    const checkbox = view.contentDOM.querySelector(
+      "input.ox-task-checkbox",
+    ) as HTMLInputElement | null;
+    expect(checkbox).not.toBeNull();
+
+    const loadSpy = vi.spyOn(core, "load");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cmdSpy = vi.spyOn(core, "command").mockImplementation(() => {
+      throw new Error("boom");
+    });
+
+    checkbox!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    await flush();
+
+    expect(errSpy).toHaveBeenCalled();
+    expect(loadSpy).not.toHaveBeenCalled();
+    expect(view.state.doc.toString()).toBe(doc);
+    cmdSpy.mockRestore();
+    errSpy.mockRestore();
+    view.destroy();
+  });
+
+  it("Tab (runIndent): swallowed WITHOUT falling back to indentMore (an error is not `null`)", async () => {
+    const core = new MockCore();
+    const doc = "- a\n- b\n";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: doc.indexOf("b") } });
+
+    const loadSpy = vi.spyOn(core, "load");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cmdSpy = vi.spyOn(core, "command").mockImplementation(() => {
+      throw new Error("boom");
+    });
+
+    const tabKey = new KeyboardEvent("keydown", {
+      key: "Tab",
+      code: "Tab",
+      bubbles: true,
+      cancelable: true,
+    });
+    view.contentDOM.dispatchEvent(tabKey);
+    await flush();
+
+    expect(errSpy).toHaveBeenCalled();
+    expect(loadSpy).not.toHaveBeenCalled();
+    // Must NOT have fallen back to indentMore's fixed 2-space indent: an
+    // exception is handled-and-ignored, not "doesn't apply here".
+    expect(view.state.doc.toString()).toBe(doc);
+    cmdSpy.mockRestore();
+    errSpy.mockRestore();
+    view.destroy();
+  });
+
+  it("Enter (runEnter): swallowed WITHOUT falling back to the default newline", async () => {
+    const core = new MockCore();
+    const doc = "- item\n";
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        extensions: [oxidown(core, { verifyMirror: true }), keymap.of(defaultKeymap)],
+      }),
+    });
+    view.dispatch({ selection: { anchor: 6 } });
+
+    const loadSpy = vi.spyOn(core, "load");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cmdSpy = vi.spyOn(core, "command").mockImplementation(() => {
+      throw new Error("boom");
+    });
+
+    const enterKey = new KeyboardEvent("keydown", {
+      key: "Enter",
+      code: "Enter",
+      bubbles: true,
+      cancelable: true,
+    });
+    view.contentDOM.dispatchEvent(enterKey);
+    await flush();
+
+    expect(errSpy).toHaveBeenCalled();
+    expect(loadSpy).not.toHaveBeenCalled();
+    // Must NOT have fallen back to a plain newline: an exception is
+    // handled-and-ignored, not "no list/quote context here".
+    expect(view.state.doc.toString()).toBe(doc);
+    cmdSpy.mockRestore();
+    errSpy.mockRestore();
+    view.destroy();
+  });
+});
+
+describe("FIX 6: skip-annotated dispatches are mirror-verified immediately", () => {
+  it("detects and recovers when a host changeFilter alters a core-driven (skip-annotated) change", async () => {
+    const core = new MockCore();
+    const initial = "0123456789";
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc: initial,
+        extensions: [
+          oxidown(core, { verifyMirror: true }),
+          // Misbehaving host (contract violation: "hosts must not filter/
+          // alter oxidown-annotated transactions"): silently drops PART of
+          // any transaction's changes. Verified empirically against
+          // @codemirror/state's ChangeSet.filter: with this range, a splice
+          // at position 2 is dropped while one at position 9 survives —
+          // `changeFilter` (unlike `transactionFilter`) preserves the
+          // transaction's annotations, so the oxidownSkip tag survives too,
+          // exactly like a real changeFilter would.
+          EditorState.changeFilter.of(() => [0, 5]),
+        ],
+      }),
+    });
+    await flush();
+    expect(core.getText()).toBe(initial);
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const loadSpy = vi.spyOn(core, "load");
+
+    // Simulate a core-driven change with two splices (standing in for
+    // whatever real command/undo/stream produced a multi-splice batch) — the
+    // core has ALREADY applied both, so we set its buffer directly.
+    const fullyApplied = "01X2345678Y9"; // both splices applied
+    core.load(fullyApplied);
+    applyCoreChange(
+      view,
+      {
+        revision: core.revision(),
+        splices: [
+          { at: 2, delete: 0, insert: "X" },
+          { at: 9, delete: 0, insert: "Y" },
+        ],
+      },
+      "oxidown.test",
+    );
+
+    // The changeFilter dropped the FIRST splice: the view's doc only got
+    // "Y" ("012345678Y9", 11 chars), while the core has both ("01X...Y9",
+    // 12 chars) — a length mismatch. Before FIX 6, nothing checks this until
+    // the NEXT forwarded (non-skip) edit; now it's caught immediately.
+    expect(view.state.doc.toString()).toBe("012345678Y9");
+    expect(errSpy).toHaveBeenCalled();
+    expect(loadSpy).toHaveBeenCalledWith(view.state.doc.toString());
+    // Recovery: re-loading the core from the view buffer makes the mirror
+    // agree again (on the view's surviving text).
+    expect(core.getText()).toBe(view.state.doc.toString());
+    errSpy.mockRestore();
+    view.destroy();
+  });
+
+  it("does NOT re-check (or false-positive) on an ordinary, unaltered core-driven change", async () => {
+    const core = new MockCore();
+    const view = makeView("hello world", core);
+    await flush();
+
+    const loadSpy = vi.spyOn(core, "load");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const change = core.command("toggleStrong", 6, 11);
+    expect(change).not.toBeNull();
+    applyCoreChange(view, change!, "oxidown.command");
+    await flush();
+
+    expect(view.state.doc.toString()).toBe("hello **world**");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    expect(errSpy).not.toHaveBeenCalled();
+    expect(loadSpy).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+    view.destroy();
+  });
+});
