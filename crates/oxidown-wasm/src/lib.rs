@@ -23,7 +23,12 @@
 //!
 //! Errors: every core `Err` becomes a thrown JS exception whose message
 //! starts with the error name (e.g. "StaleRevision: ..."), per the contract's
-//! mirror-desync-emergency handling.
+//! mirror-desync-emergency handling. Every `f64` position/level/id argument
+//! is validated (finite, integral, non-negative) before conversion; anything
+//! else throws "InvalidArgs: ..." — `as usize` would otherwise silently
+//! saturate negatives to 0 and NaN to 0. The constructor installs
+//! `console_error_panic_hook` so any core panic surfaces its message on the
+//! JS console instead of an opaque `RuntimeError: unreachable`.
 //!
 //! No `rand`/`getrandom`: `replica_id` is a constructor parameter
 //! (default 1).
@@ -51,6 +56,25 @@ struct SelectionIn {
 fn core_err(e: CoreError) -> JsError {
     // Display output starts with the error name, e.g. "StaleRevision: ...".
     JsError::new(&e.to_string())
+}
+
+/// Validate an `f64` boundary argument (position/level/id): it must be
+/// finite, integral, and non-negative — `as` casts would otherwise silently
+/// saturate NaN/negatives to 0 and quietly truncate fractions. Returns the
+/// "InvalidArgs: ..." message on failure (a plain `String` so native unit
+/// tests can exercise it without constructing a `JsError` off-wasm).
+fn check_arg(v: f64, what: &str) -> Result<u64, String> {
+    if !v.is_finite() || v.fract() != 0.0 || v < 0.0 {
+        return Err(format!(
+            "InvalidArgs: {what} must be a non-negative integer, got {v}"
+        ));
+    }
+    Ok(v as u64)
+}
+
+/// `check_arg`, boundary-flavored: failures become thrown JS exceptions.
+fn arg(v: f64, what: &str) -> Result<u64, JsError> {
+    check_arg(v, what).map_err(|msg| JsError::new(&msg))
 }
 
 /// Parse a JsValue (array of objects) by stringifying once and deserializing.
@@ -247,6 +271,9 @@ impl OxidownCore {
     /// `replica_id` defaults to 1 (no entropy source in the core by design).
     #[wasm_bindgen(constructor)]
     pub fn new(replica_id: Option<u16>) -> OxidownCore {
+        // Panics surface with a message on the JS console instead of an
+        // opaque `RuntimeError: unreachable` (idempotent; stderr on native).
+        console_error_panic_hook::set_once();
         OxidownCore {
             inner: Editor::new(replica_id.unwrap_or(1)),
         }
@@ -277,9 +304,10 @@ impl OxidownCore {
                 insert: s.insert,
             })
             .collect();
+        let base_revision = arg(base_revision, "baseRevision")?;
         let now_ms = js_sys::Date::now();
         self.inner
-            .apply_edit(base_revision as u64, &core_splices, origin, now_ms)
+            .apply_edit(base_revision, &core_splices, origin, now_ms)
             .map(|rev| rev as f64)
             .map_err(core_err)
     }
@@ -313,9 +341,10 @@ impl OxidownCore {
                 head: s.head as usize,
             })
             .collect();
+        let revision = arg(revision, "revision")?;
         let decos = self
             .inner
-            .decorations(revision as u64, from as usize, to as usize, &sels)
+            .decorations(revision, from as usize, to as usize, &sels)
             .map_err(core_err)?;
         js_sys::JSON::parse(&decorations_json_string(&decos))
             .map_err(|_| JsError::new("InternalError: produced invalid JSON"))
@@ -353,16 +382,17 @@ impl OxidownCore {
     /// Current position of the anchor, or `null` if unresolvable
     /// (unknown/dropped id, or the document was replaced by `load`).
     #[wasm_bindgen(js_name = resolveAnchor)]
-    pub fn resolve_anchor(&self, id: f64) -> JsValue {
-        match self.inner.resolve_anchor(id as u64) {
+    pub fn resolve_anchor(&self, id: f64) -> Result<JsValue, JsError> {
+        Ok(match self.inner.resolve_anchor(arg(id, "id")?) {
             Some(pos) => JsValue::from_f64(pos as f64),
             None => JsValue::NULL,
-        }
+        })
     }
 
     #[wasm_bindgen(js_name = dropAnchor)]
-    pub fn drop_anchor(&mut self, id: f64) {
-        self.inner.drop_anchor(id as u64);
+    pub fn drop_anchor(&mut self, id: f64) -> Result<(), JsError> {
+        self.inner.drop_anchor(arg(id, "id")?);
+        Ok(())
     }
 
     // ---- commands (v0.2) -------------------------------------------------
@@ -385,8 +415,8 @@ impl OxidownCore {
         };
         let cmd = match name {
             "toggleStrong" | "toggleEm" | "toggleStrike" | "toggleCode" => {
-                let from = a as usize;
-                let to = need_b("a `to` position")? as usize;
+                let from = arg(a, "from")? as usize;
+                let to = arg(need_b("a `to` position")?, "to")? as usize;
                 match name {
                     "toggleStrong" => Command::ToggleStrong { from, to },
                     "toggleEm" => Command::ToggleEm { from, to },
@@ -395,8 +425,8 @@ impl OxidownCore {
                 }
             }
             "indentList" | "outdentList" => {
-                let from = a as usize;
-                let to = need_b("a `to` position")? as usize;
+                let from = arg(a, "from")? as usize;
+                let to = arg(need_b("a `to` position")?, "to")? as usize;
                 if name == "indentList" {
                     Command::IndentList { from, to }
                 } else {
@@ -404,23 +434,26 @@ impl OxidownCore {
                 }
             }
             "enter" => {
-                let from = a as usize;
-                let to = need_b("a `to` position")? as usize;
+                let from = arg(a, "from")? as usize;
+                let to = arg(need_b("a `to` position")?, "to")? as usize;
                 Command::Enter { from, to }
             }
             "setHeading" => {
-                let level = need_b("a heading level")?;
-                if !(0.0..=6.0).contains(&level) || level.fract() != 0.0 {
+                let pos = arg(a, "pos")? as usize;
+                let level = arg(need_b("a heading level")?, "level")?;
+                if level > 6 {
                     return Err(JsError::new(&format!(
                         "InvalidArgs: setHeading level must be an integer 0..=6, got {level}"
                     )));
                 }
                 Command::SetHeading {
-                    pos: a as usize,
+                    pos,
                     level: level as u8,
                 }
             }
-            "toggleTask" => Command::ToggleTask { pos: a as usize },
+            "toggleTask" => Command::ToggleTask {
+                pos: arg(a, "pos")? as usize,
+            },
             other => return Err(JsError::new(&format!("InvalidCommand: {other:?}"))),
         };
         change_to_js(self.inner.command(cmd).map_err(core_err)?)
@@ -443,14 +476,18 @@ impl OxidownCore {
     /// closed ids.
     #[wasm_bindgen(js_name = streamAppend)]
     pub fn stream_append(&mut self, id: f64, chunk: &str) -> Result<JsValue, JsError> {
-        let change = self.inner.stream_append(id as u64, chunk).map_err(core_err)?;
+        let change = self
+            .inner
+            .stream_append(arg(id, "id")?, chunk)
+            .map_err(core_err)?;
         change_to_js(Some(change))
     }
 
     /// Close a stream. No-op on unknown/already-closed ids.
     #[wasm_bindgen(js_name = streamClose)]
-    pub fn stream_close(&mut self, id: f64) {
-        self.inner.stream_close(id as u64);
+    pub fn stream_close(&mut self, id: f64) -> Result<(), JsError> {
+        self.inner.stream_close(arg(id, "id")?);
+        Ok(())
     }
 
     // ---- debug/verification ----------------------------------------------
@@ -534,5 +571,60 @@ mod wire_format {
     #[test]
     fn empty_batch_is_an_empty_array() {
         assert_eq!(decorations_json_string(&[]), "[]");
+    }
+}
+
+#[cfg(test)]
+mod arg_validation {
+    //! `check_arg` guards every f64 position/level/id crossing the boundary:
+    //! finite, integral, non-negative — or an "InvalidArgs: ..." message
+    //! (previously `as usize` silently saturated negatives/NaN to 0).
+
+    use super::check_arg;
+
+    #[test]
+    fn accepts_non_negative_integers() {
+        assert_eq!(check_arg(0.0, "pos"), Ok(0));
+        assert_eq!(check_arg(1.0, "pos"), Ok(1));
+        assert_eq!(check_arg(4096.0, "pos"), Ok(4096));
+        // Largest exactly-representable f64 integer round-trips.
+        assert_eq!(check_arg(9007199254740992.0, "pos"), Ok(1 << 53));
+        // Negative zero is still zero.
+        assert_eq!(check_arg(-0.0, "pos"), Ok(0));
+    }
+
+    #[test]
+    fn rejects_negatives() {
+        for v in [-1.0, -0.5, -4096.0, f64::MIN] {
+            let err = check_arg(v, "pos").unwrap_err();
+            assert!(err.starts_with("InvalidArgs: "), "got {err:?}");
+            assert!(err.contains("pos"), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_integral() {
+        for v in [0.5, 1.25, 4096.999] {
+            let err = check_arg(v, "level").unwrap_err();
+            assert!(err.starts_with("InvalidArgs: "), "got {err:?}");
+            assert!(err.contains("level"), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite() {
+        for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = check_arg(v, "id").unwrap_err();
+            assert!(err.starts_with("InvalidArgs: "), "got {err:?}");
+            assert!(err.contains("id"), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn message_names_the_argument_and_value() {
+        assert_eq!(
+            check_arg(-3.0, "baseRevision").unwrap_err(),
+            "InvalidArgs: baseRevision must be a non-negative integer, got -3"
+        );
     }
 }

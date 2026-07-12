@@ -1,9 +1,10 @@
 /**
- * Oxidown boundary protocol — v0 (M0 spike).
+ * Oxidown boundary protocol — v0 through v0.3 (M0 base + M1 additions).
  *
  * Transcribed EXACTLY from docs/boundary-v0.md ("TypeScript interface
- * (authoritative shape)"). If this file and that document disagree, the
- * document wins; fix this file in the same PR.
+ * (authoritative shape)", plus the v0.2 additions and v0.3 amendments). If
+ * this file and that document disagree, the document wins; fix this file in
+ * the same PR.
  *
  * Web-boundary flavor: all positions in this protocol are UTF-16 code units
  * (CodeMirror's unit). The wasm crate converts to core-internal UTF-8 byte
@@ -35,13 +36,13 @@ export interface DecorationMark {
 export interface DecorationConceal {
   kind: "conceal";
   from: number;
-  to: number; // delimiter chars to visually collapse — views must NOT remove them from the DOM
+  to: number; // delimiter chars to conceal — they stay in the DOCUMENT (see the contract's "Rules for the view")
 }
 export interface DecorationLine {
   kind: "line";
   /** Position anywhere on the target line (view resolves to the line). */
   at: number;
-  // v0.2 additions: "blockquote" | "code-block" | "code-fence" | "hr".
+  // v0.2 additions: "blockquote" | "code-block" | "code-fence" | "hr" | "list-item".
   style:
     | "h1"
     | "h2"
@@ -57,9 +58,11 @@ export interface DecorationLine {
   /** Nesting depth (1-based); present for styles "blockquote" and "list-item". */
   depth?: number;
   /**
-   * For "blockquote"/"list-item": the line's marker region is being edited
-   * (caret adjacent), so the view drops the line's decorative padding/bars
-   * and renders default source geometry.
+   * For "blockquote"/"list-item": the line is revealed — reveal is
+   * LINE-level (v0.3), so a cursor/selection touching ANY part of the line
+   * reveals all of its marker constructs together, and the view drops the
+   * line's decorative padding/bars and renders default source geometry.
+   * Omitted from the wire when false.
    */
   revealed?: boolean;
 }
@@ -79,10 +82,13 @@ export interface DecorationWidget {
   from: number;
   to: number;
   /**
-   * "task": replaces the `[ ]`/`[x]` span (carries `checked`).
-   * "bullet": replaces an unordered item's whole marker span (`"- "`); reveal
-   * is STRICT interior overlap, so the cursor at the item text's first
-   * character never flashes the raw marker.
+   * "task": replaces the `[ ]`/`[x]` span (carries `checked`); withheld as
+   * `mark:delim` on reveal, with the item's `- ` run in lockstep.
+   * "bullet": replaces an unordered item's whole marker span (glyph +
+   * trailing whitespace, e.g. `"- "`); withheld as `mark:list-marker` on
+   * reveal. Reveal is LINE-level (contract v0.3, matching every other
+   * marker construct): a cursor/selection touching any part of the item's
+   * line shows the raw marker instead.
    * "ordered": replaces an ordered item's whole marker span (`"1. "`) with
    * the VIEW-COMPUTED CommonMark sequence number (carried in `number`) plus
    * its delimiter (`delim`, `"."` or `")"`) — the core NEVER rewrites source
@@ -218,4 +224,11 @@ export interface OxidownCore {
   streamOpen(pos: number): number; // stream id; insertion point becomes an internal anchor
   streamAppend(id: number, chunk: string): CoreChange; // splices for the view to apply (skip annotation)
   streamClose(id: number): void;
+
+  /**
+   * Optional teardown. Releases resources held outside the JS heap (the wasm
+   * adapter frees its wasm-bindgen instance); idempotent. The core is
+   * unusable afterwards. Implementations with nothing to free may omit it.
+   */
+  destroy?(): void;
 }

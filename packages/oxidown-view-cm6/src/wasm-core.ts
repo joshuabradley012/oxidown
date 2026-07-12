@@ -39,8 +39,26 @@
  *       streamAppend(id: number, chunk: string): CoreChange
  *       streamClose(id: number): void
  *
- *   splices/selections/decorations cross the boundary as plain JS values
- *   (serde-wasm-bindgen style); errors surface as thrown JS exceptions.
+ *   splices/selections/decorations cross the boundary as one JSON string per
+ *   call (`serde_json` Rust-side, `js_sys::JSON` JS-side — see the crate doc
+ *   in crates/oxidown-wasm/src/lib.rs), so callers still see plain JS values;
+ *   errors surface as thrown JS exceptions whose messages start with the
+ *   error name ("StaleRevision: ...", "OutOfBounds: ...", "InvalidArgs: ...").
+ *
+ * Adapter responsibilities beyond forwarding:
+ *   - Unpaired-surrogate policy, enforced JS-SIDE before crossing the
+ *     boundary (wasm-bindgen's &str conversion silently corrupts lone
+ *     surrogates to U+FFFD — the core document must never contain one):
+ *     `load` and `applyEdit` insert texts containing an unpaired surrogate
+ *     throw "InvalidPayload: ...". `streamAppend` buffers a TRAILING lone
+ *     high surrogate per stream (a producer chunking at fixed UTF-16 lengths
+ *     can split a surrogate pair across chunks); the withheld code unit is
+ *     prepended to the next chunk, and `streamClose` flushes a still-pending
+ *     one as U+FFFD before closing. A lone surrogate anywhere else in a
+ *     chunk throws "InvalidPayload: ..."; the stream's buffer is cleared
+ *     whenever an append throws.
+ *   - `destroy()`: frees the underlying wasm-bindgen instance (its `free()`
+ *     releases the Rust-side allocation); idempotent, guards double-free.
  */
 
 import type {
@@ -52,8 +70,117 @@ import type {
   Splice,
 } from "./protocol.js";
 
+// ---------------------------------------------------------------------------
+// Unpaired-surrogate guards — pure functions (exported for unit tests; see
+// test/wasm-core-boundary.test.ts). Positions/lengths are UTF-16 code units,
+// so "well-formed" here means: every 0xD800–0xDBFF unit is immediately
+// followed by a 0xDC00–0xDFFF unit, and no 0xDC00–0xDFFF unit stands alone.
+// ---------------------------------------------------------------------------
+
+const isHighSurrogate = (unit: number): boolean => unit >= 0xd800 && unit <= 0xdbff;
+const isLowSurrogate = (unit: number): boolean => unit >= 0xdc00 && unit <= 0xdfff;
+
+/** True if `text` contains a lone (unpaired) surrogate code unit. */
+export function hasUnpairedSurrogate(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const unit = text.charCodeAt(i);
+    if (isHighSurrogate(unit)) {
+      if (i + 1 < text.length && isLowSurrogate(text.charCodeAt(i + 1))) {
+        i++; // valid pair — skip the low half
+      } else {
+        return true;
+      }
+    } else if (isLowSurrogate(unit)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Throw `InvalidPayload: ${what} contains an unpaired surrogate` if `text`
+ * is not well-formed UTF-16. Called BEFORE any text crosses the wasm
+ * boundary, where lone surrogates would silently become U+FFFD.
+ */
+export function assertNoUnpairedSurrogates(text: string, what: string): void {
+  if (hasUnpairedSurrogate(text)) {
+    throw new Error(`InvalidPayload: ${what} contains an unpaired surrogate`);
+  }
+}
+
+/**
+ * Split a stream chunk into the part safe to send now and a withheld
+ * TRAILING lone high surrogate (at most one code unit) that may pair with
+ * the start of the next chunk. Any other lone surrogate throws
+ * "InvalidPayload: ..." — only a trailing high surrogate can still be
+ * completed by future input.
+ */
+export function splitTrailingHighSurrogate(chunk: string): { send: string; pending: string } {
+  let send = chunk;
+  let pending = "";
+  // A high surrogate as the final unit is unpaired by construction.
+  if (chunk.length > 0 && isHighSurrogate(chunk.charCodeAt(chunk.length - 1))) {
+    send = chunk.slice(0, -1);
+    pending = chunk.slice(-1);
+  }
+  assertNoUnpairedSurrogates(send, "chunk");
+  return { send, pending };
+}
+
+/**
+ * Per-stream reassembly buffer for surrogate pairs split across
+ * `streamAppend` chunks (a producer chunking at fixed UTF-16 lengths splits
+ * emoji). Keyed by stream id; holds at most one pending high surrogate per
+ * stream. Exported for unit tests.
+ */
+export class StreamSurrogateBuffer {
+  private pending = new Map<number, string>();
+
+  /**
+   * Absorb `chunk` and return the text to forward to the core right now
+   * (possibly `""`, which the core treats as a no-op append). Throws
+   * "InvalidPayload: ..." on a lone surrogate anywhere but the chunk's tail;
+   * the stream's buffer is cleared before the throw propagates.
+   */
+  push(id: number, chunk: string): string {
+    const combined = (this.pending.get(id) ?? "") + chunk;
+    let send: string;
+    let pending: string;
+    try {
+      ({ send, pending } = splitTrailingHighSurrogate(combined));
+    } catch (err) {
+      this.pending.delete(id);
+      throw err;
+    }
+    if (pending) {
+      this.pending.set(id, pending);
+    } else {
+      this.pending.delete(id);
+    }
+    return send;
+  }
+
+  /**
+   * Drain the stream's buffer for `streamClose`: returns `"\uFFFD"` if a
+   * high surrogate was still pending (it can never be completed now), else
+   * `""`. Always clears the buffer.
+   */
+  takeFlush(id: number): string {
+    const pending = this.pending.get(id) ?? "";
+    this.pending.delete(id);
+    return pending ? "\uFFFD" : "";
+  }
+
+  /** Drop any pending unit for `id` (stream errored). */
+  clear(id: number): void {
+    this.pending.delete(id);
+  }
+}
+
 /** Method surface we expect on the wasm-bindgen class instance. */
 interface WasmCoreInstance {
+  /** wasm-bindgen's per-instance deallocator. */
+  free(): void;
   load(text: string): number;
   applyEdit(baseRevision: number, splices: unknown, origin: string): number;
   undo(): CoreChange | null | undefined;
@@ -75,12 +202,26 @@ interface WasmCoreInstance {
   streamClose(id: number): void;
 }
 
-/** Thin adapter: normalizes null/undefined and keeps payloads as plain values. */
-function adaptWasmCore(inner: WasmCoreInstance): OxidownCore {
+/**
+ * Thin adapter: normalizes null/undefined, keeps payloads as plain values,
+ * and enforces the unpaired-surrogate policy JS-side (see header). Exported
+ * for unit tests (which pass a fake `WasmCoreInstance`); production callers
+ * use `loadWasmCore`.
+ */
+export function adaptWasmCore(inner: WasmCoreInstance): OxidownCore {
+  const streamBuffer = new StreamSurrogateBuffer();
+  let destroyed = false;
   return {
-    load: (text: string) => inner.load(text),
-    applyEdit: (baseRevision: number, splices: Splice[], origin: EditOrigin) =>
-      inner.applyEdit(baseRevision, splices, origin),
+    load: (text: string) => {
+      assertNoUnpairedSurrogates(text, "text");
+      return inner.load(text);
+    },
+    applyEdit: (baseRevision: number, splices: Splice[], origin: EditOrigin) => {
+      for (const splice of splices) {
+        assertNoUnpairedSurrogates(splice.insert, "splice insert");
+      }
+      return inner.applyEdit(baseRevision, splices, origin);
+    },
     undo: () => inner.undo() ?? null,
     redo: () => inner.redo() ?? null,
     decorations: (revision: number, from: number, to: number, selections: SelectionRange[]) =>
@@ -100,8 +241,35 @@ function adaptWasmCore(inner: WasmCoreInstance): OxidownCore {
       inner.command(name, a, b) ?? null) as OxidownCore["command"],
 
     streamOpen: (pos: number) => inner.streamOpen(pos),
-    streamAppend: (id: number, chunk: string) => inner.streamAppend(id, chunk),
-    streamClose: (id: number) => inner.streamClose(id),
+    streamAppend: (id: number, chunk: string) => {
+      // `push` withholds a trailing lone high surrogate (and prepends one
+      // withheld earlier); `send` may be "" — the core no-ops on it and
+      // returns an unchanged CoreChange. Any error (validation or core)
+      // drops the stream's pending unit.
+      const send = streamBuffer.push(id, chunk); // clears its buffer on throw
+      try {
+        return inner.streamAppend(id, send);
+      } catch (err) {
+        streamBuffer.clear(id);
+        throw err;
+      }
+    },
+    streamClose: (id: number) => {
+      // A still-pending high surrogate can never be completed: flush it as
+      // U+FFFD (one final append) before closing. Close even if that throws.
+      const flush = streamBuffer.takeFlush(id);
+      try {
+        if (flush) inner.streamAppend(id, flush);
+      } finally {
+        inner.streamClose(id);
+      }
+    },
+
+    destroy: () => {
+      if (destroyed) return; // guard double-free
+      destroyed = true;
+      inner.free();
+    },
   };
 }
 

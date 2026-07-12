@@ -50,9 +50,63 @@ export function applySplices(doc: string, splices: Splice[]): string {
   return parts.join("");
 }
 
+// ---------------------------------------------------------------------------
+// Surrogate helpers (contract clarification 7 + the lone-surrogate document
+// invariant): splice positions may never split a surrogate pair, and no text
+// payload may carry an unpaired surrogate into the document.
+// ---------------------------------------------------------------------------
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+/** True when `pos` falls between the two code units of a surrogate pair. */
+function splitsSurrogatePair(doc: string, pos: number): boolean {
+  return (
+    pos > 0 &&
+    pos < doc.length &&
+    isHighSurrogate(doc.charCodeAt(pos - 1)) &&
+    isLowSurrogate(doc.charCodeAt(pos))
+  );
+}
+
+/** Index of the first unpaired surrogate code unit in `text`, or -1. */
+function findLoneSurrogate(text: string): number {
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (isHighSurrogate(code)) {
+      if (i + 1 < text.length && isLowSurrogate(text.charCodeAt(i + 1))) {
+        i++; // well-formed pair
+        continue;
+      }
+      return i;
+    }
+    if (isLowSurrogate(code)) return i;
+  }
+  return -1;
+}
+
+/** Throw the wasm boundary's InvalidArgs for a bad numeric argument. */
+function checkNonNegInt(what: string, v: number): void {
+  if (!Number.isInteger(v) || v < 0) {
+    throw new Error(`InvalidArgs: ${what} must be a non-negative integer, got ${v}`);
+  }
+}
+
+function surrogateSplitError(pos: number): Error {
+  return new Error(`SurrogateSplit: position ${pos} falls inside a surrogate pair`);
+}
+
 /**
  * Minimal single-splice diff between two documents (common prefix/suffix trim).
- * Returns [] when the texts are identical.
+ * Returns [] when the texts are identical. Trimming never leaves a splice
+ * boundary inside a surrogate pair (contract clarification 7 — a pair-splitting
+ * splice would be invalid for the view to apply): when a trim boundary would
+ * split a pair, it backs off one code unit so the whole pair is replaced.
  */
 export function diffSplices(from: string, to: string): Splice[] {
   if (from === to) return [];
@@ -68,6 +122,14 @@ export function diffSplices(from: string, to: string): Splice[] {
   ) {
     endFrom--;
     endTo--;
+  }
+  // Never split a surrogate pair: the prefix boundary splits a pair in `from`
+  // iff it splits one in `to` too (the prefixes are identical), so one
+  // back-off fixes both sides; same for the suffix boundary.
+  if (splitsSurrogatePair(from, start)) start--;
+  if (splitsSurrogatePair(from, endFrom)) {
+    endFrom++;
+    endTo++;
   }
   return [{ at: start, delete: endFrom - start, insert: to.slice(start, endTo) }];
 }
@@ -444,18 +506,45 @@ interface ListLineInfo {
   marker: { col: number; width: number; glyphs: string } | null;
 }
 
+// ---------------------------------------------------------------------------
+// Physical-line splitting. Contract v0.2 clarification 5: a line is terminated
+// by "\n", "\r\n", or a lone "\r" — every command/reveal line computation must
+// treat all three uniformly (matching the Rust core's line splitting).
+// ---------------------------------------------------------------------------
+
+/** Length of the line terminator at `pos`: 2 for "\r\n", 1 for "\r"/"\n", 0 otherwise. */
+function terminatorLength(doc: string, pos: number): number {
+  const ch = doc[pos];
+  if (ch === "\r") return doc[pos + 1] === "\n" ? 2 : 1;
+  return ch === "\n" ? 1 : 0;
+}
+
+function isTerminatorChar(ch: string | undefined): boolean {
+  return ch === "\n" || ch === "\r";
+}
+
+/** End (exclusive, terminator excluded) of the line beginning at/continuing through `pos`. */
+function lineEndFrom(doc: string, pos: number): number {
+  let end = pos;
+  while (end < doc.length && !isTerminatorChar(doc[end])) end++;
+  return end;
+}
+
 /** Code-unit range of the physical line containing `pos` (terminator excluded). */
 function lineRangeContaining(doc: string, pos: number): { start: number; end: number } {
-  const start = doc.lastIndexOf("\n", Math.max(0, pos - 1)) + 1;
-  let end = doc.indexOf("\n", pos);
-  if (end === -1) end = doc.length;
-  return { start, end };
+  let p = Math.max(0, Math.min(pos, doc.length));
+  // A position between the "\r" and "\n" of one "\r\n" terminator belongs to
+  // the line that terminator ends.
+  if (p > 0 && doc[p] === "\n" && doc[p - 1] === "\r") p--;
+  let start = p;
+  while (start > 0 && !isTerminatorChar(doc[start - 1])) start--;
+  return { start, end: lineEndFrom(doc, p) };
 }
 
 /** The physical line immediately before `lineStart`, or null at the document start. */
 function prevLineRange(doc: string, lineStart: number): { start: number; end: number } | null {
   if (lineStart === 0) return null;
-  return lineRangeContaining(doc, lineStart - 1); // lineStart-1 is the preceding "\n"
+  return lineRangeContaining(doc, lineStart - 1); // lineStart-1 is inside the preceding terminator
 }
 
 /**
@@ -464,8 +553,9 @@ function prevLineRange(doc: string, lineStart: number): { start: number; end: nu
  * terminator (the document's last line).
  */
 function nextLineRange(doc: string, lineEnd: number): { start: number; end: number } | null {
-  if (doc[lineEnd] !== "\n") return null; // mock: LF only, no terminator = doc end
-  return lineRangeContaining(doc, lineEnd + 1);
+  const tl = terminatorLength(doc, lineEnd);
+  if (tl === 0) return null; // no terminator = doc end
+  return lineRangeContaining(doc, lineEnd + tl);
 }
 
 /**
@@ -487,7 +577,9 @@ function intersectingLines(
     const line = lineRangeContaining(doc, pos);
     if (empty || to > line.start) lines.push(line);
     if (pos >= to) break;
-    const next = line.end + 1; // skip the single "\n" (mock: LF only)
+    const tl = terminatorLength(doc, line.end); // skip "\n" / "\r" / "\r\n"
+    if (tl === 0) break; // unterminated last line
+    const next = line.end + tl;
     if (next <= pos || next > doc.length) break;
     pos = next;
   }
@@ -682,8 +774,7 @@ export function parseDoc(doc: string): ParsedNode[] {
   const seq: OrderedSeq = new Map();
   let lineStart = 0;
   while (lineStart <= doc.length) {
-    let lineEnd = doc.indexOf("\n", lineStart);
-    if (lineEnd === -1) lineEnd = doc.length;
+    const lineEnd = lineEndFrom(doc, lineStart); // "\n" / "\r" / "\r\n" all terminate
     const line = doc.slice(lineStart, lineEnd);
 
     // Fenced code blocks: consume lines until the matching close fence (or EOF).
@@ -705,10 +796,11 @@ export function parseDoc(doc: string): ParsedNode[] {
         line: { kind: "line", at: lineStart, style: "code-fence" },
       });
       let cursor = lineEnd;
-      while (cursor < doc.length) {
-        const bLineStart = cursor + 1;
-        let bLineEnd = doc.indexOf("\n", bLineStart);
-        if (bLineEnd === -1) bLineEnd = doc.length;
+      for (;;) {
+        const tl = terminatorLength(doc, cursor);
+        if (tl === 0) break; // unterminated: the fence runs to EOF
+        const bLineStart = cursor + tl;
+        const bLineEnd = lineEndFrom(doc, bLineStart);
         const bLine = doc.slice(bLineStart, bLineEnd);
         const closeM = CLOSE_FENCE_RE.exec(bLine);
         if (closeM && closeM[1][0] === fenceChar && closeM[1].length >= fenceLen) {
@@ -732,8 +824,9 @@ export function parseDoc(doc: string): ParsedNode[] {
         });
         cursor = bLineEnd;
       }
-      if (cursor >= doc.length) break;
-      lineStart = cursor + 1;
+      const tl = terminatorLength(doc, cursor);
+      if (tl === 0) break;
+      lineStart = cursor + tl;
       continue;
     }
 
@@ -748,8 +841,9 @@ export function parseDoc(doc: string): ParsedNode[] {
         marks: [],
         line: { kind: "line", at: lineStart, style: "hr" },
       });
-      if (lineEnd === doc.length) break;
-      lineStart = lineEnd + 1;
+      const tl = terminatorLength(doc, lineEnd);
+      if (tl === 0) break;
+      lineStart = lineEnd + tl;
       continue;
     }
 
@@ -774,14 +868,16 @@ export function parseDoc(doc: string): ParsedNode[] {
         line: { kind: "line", at: lineStart, style: "blockquote", depth },
       });
       parseLineContent(rest, offset, nodes, depth, seq);
-      if (lineEnd === doc.length) break;
-      lineStart = lineEnd + 1;
+      const tl = terminatorLength(doc, lineEnd);
+      if (tl === 0) break;
+      lineStart = lineEnd + tl;
       continue;
     }
 
     parseLineContent(line, lineStart, nodes, 0, seq);
-    if (lineEnd === doc.length) break;
-    lineStart = lineEnd + 1;
+    const tl = terminatorLength(doc, lineEnd);
+    if (tl === 0) break;
+    lineStart = lineEnd + tl;
   }
   return nodes;
 }
@@ -793,10 +889,41 @@ export function parseDoc(doc: string): ParsedNode[] {
 interface AnchorState {
   pos: number;
   bias: "before" | "after";
+  /**
+   * Stream insertion points are core-INTERNAL anchors: invisible to the
+   * public anchor API (resolveAnchor reads them as unknown, dropAnchor
+   * no-ops on them), so no boundary caller can disturb an open stream —
+   * mirrors the Rust core's AnchorSet public/internal split (anchor.rs).
+   */
+  internal: boolean;
 }
 
 interface StreamSession {
   anchorId: number;
+  /**
+   * A trailing high surrogate withheld from the last chunk (a chunk boundary
+   * may split an astral code point): prepended to the next chunk, or flushed
+   * as one U+FFFD by streamClose. The document itself never holds a lone
+   * surrogate.
+   */
+  pending: string;
+}
+
+/**
+ * Undo units store the full text before the unit (mock simplicity). A stream
+ * session's single unit carries its stream id, so later appends of the same
+ * stream merge into that unit wherever it sits in the stack (exactly like
+ * history.rs `record_stream_append`), and the tag survives the undo↔redo
+ * round trip.
+ */
+interface UndoUnit {
+  before: string;
+  streamId?: number;
+}
+
+interface RedoUnit {
+  after: string;
+  streamId?: number;
 }
 
 export class MockCore implements OxidownCore {
@@ -804,17 +931,14 @@ export class MockCore implements OxidownCore {
   private rev = 0;
   private readonly now: () => number;
 
-  /** Undo units store the full text before the unit (mock simplicity). */
-  private undoStack: Array<{ before: string }> = [];
-  private redoStack: Array<{ after: string }> = [];
+  private undoStack: UndoUnit[] = [];
+  private redoStack: RedoUnit[] = [];
   /** True while the top of undoStack is an open (coalescable) unit. */
   private hasOpenUnit = false;
   private lastEditTime = -Infinity;
   /** End of the last single-splice edit, in current-doc coordinates; -1 if unusable. */
   private lastEditEnd = -1;
   private lastOrigin: EditOrigin | null = null;
-  /** Stream id of the last streamAppend, so a later append can tell whether it continues THIS session's open unit. */
-  private lastStreamId: number | null = null;
 
   private composing = false;
   private compFrom = 0;
@@ -830,6 +954,11 @@ export class MockCore implements OxidownCore {
   }
 
   load(text: string): number {
+    // Document invariant: the mirror never holds an unpaired surrogate (the
+    // wasm boundary rejects such payloads before the core sees them).
+    if (findLoneSurrogate(text) !== -1) {
+      throw new Error("InvalidPayload: text contains an unpaired surrogate");
+    }
     this.doc = text;
     this.undoStack = [];
     this.redoStack = [];
@@ -837,7 +966,6 @@ export class MockCore implements OxidownCore {
     this.lastEditTime = -Infinity;
     this.lastEditEnd = -1;
     this.lastOrigin = null;
-    this.lastStreamId = null;
     this.composing = false;
     this.anchors.clear();
     this.streams.clear();
@@ -848,10 +976,17 @@ export class MockCore implements OxidownCore {
   }
 
   applyEdit(baseRevision: number, splices: Splice[], origin: EditOrigin): number {
+    checkNonNegInt("baseRevision", baseRevision);
     if (baseRevision !== this.rev) {
-      throw new Error(`stale revision: edit based on ${baseRevision}, current is ${this.rev}`);
+      throw new Error(
+        `StaleRevision: core is at revision ${this.rev}, caller passed ${baseRevision}`,
+      );
     }
     this.validateSplices(splices);
+    // Drop no-op splices; an entirely empty/no-op batch changes nothing —
+    // revision unchanged, no undo unit (editor.rs apply_edit's early return).
+    const batch = splices.filter((s) => s.delete > 0 || s.insert.length > 0);
+    if (batch.length === 0) return this.rev;
     const t = this.now();
 
     if (origin === "user" || origin === "ime" || origin === "paste") {
@@ -859,8 +994,8 @@ export class MockCore implements OxidownCore {
         origin !== "paste" &&
         this.hasOpenUnit &&
         (this.lastOrigin === "user" || this.lastOrigin === "ime") &&
-        splices.length === 1 &&
-        this.isAdjacent(splices[0]) &&
+        batch.length === 1 &&
+        this.isAdjacent(batch[0]) &&
         // Coalescing pauses during composition: the 500ms window does not
         // break a group while an IME session is open.
         (this.composing || t - this.lastEditTime <= COALESCE_MS);
@@ -881,29 +1016,37 @@ export class MockCore implements OxidownCore {
       this.redoStack = [];
     }
 
-    if (splices.length === 1) {
-      const s = splices[0];
+    if (batch.length === 1) {
+      const s = batch[0];
       this.lastEditEnd = s.at + s.insert.length;
     } else {
       this.lastEditEnd = -1;
     }
     this.lastEditTime = t;
     this.lastOrigin = origin;
-    this.lastStreamId = null;
 
-    this.mutateDoc(splices);
+    this.mutateDoc(batch);
 
-    if (this.composing && origin === "ime" && splices.length > 0) {
-      // Grow the session range to cover IME edits beyond a plain positional
-      // shift (keeps the session range valid across edits).
-      const first = splices[0];
-      const last = splices[splices.length - 1];
-      let shift = 0;
-      for (let k = 0; k < splices.length - 1; k++) {
-        shift += splices[k].insert.length - splices[k].delete;
+    if (this.composing && origin === "ime") {
+      // Grow the session range to union in IME-inserted regions that touch
+      // it (composition.rs `map_through` with `grow`): compare each splice's
+      // POST-edit insert range — mutateDoc already mapped compFrom/compTo
+      // into post-edit coordinates, so pre-edit `at` positions must be
+      // shifted by the preceding splices' deltas before the union.
+      let delta = 0;
+      let lo = this.compFrom;
+      let hi = this.compTo;
+      for (const s of batch) {
+        const insStart = s.at + delta;
+        const insEnd = insStart + s.insert.length;
+        if (insStart <= hi && insEnd >= lo) {
+          lo = Math.min(lo, insStart);
+          hi = Math.max(hi, insEnd);
+        }
+        delta += s.insert.length - s.delete;
       }
-      this.compFrom = Math.min(this.compFrom, first.at);
-      this.compTo = Math.max(this.compTo, last.at + shift + last.insert.length);
+      this.compFrom = lo;
+      this.compTo = Math.max(hi, lo);
     }
 
     return this.rev;
@@ -912,13 +1055,15 @@ export class MockCore implements OxidownCore {
   undo(): CoreChange | null {
     const unit = this.undoStack.pop();
     if (!unit) return null;
-    this.redoStack.push({ after: this.doc });
+    // Preserve the stream tag across the round trip: redo of a stream unit
+    // re-establishes it as the stream's single merge target (history.rs
+    // `push_redo`/`push_undo_unit`).
+    this.redoStack.push({ after: this.doc, streamId: unit.streamId });
     const splices = diffSplices(this.doc, unit.before);
     this.mutateDoc(splices);
     this.hasOpenUnit = false;
     this.lastOrigin = null;
     this.lastEditEnd = -1;
-    this.lastStreamId = null;
     const cursor = endOfLastSplice(splices);
     return {
       revision: this.rev,
@@ -930,13 +1075,12 @@ export class MockCore implements OxidownCore {
   redo(): CoreChange | null {
     const unit = this.redoStack.pop();
     if (!unit) return null;
-    this.undoStack.push({ before: this.doc });
+    this.undoStack.push({ before: this.doc, streamId: unit.streamId });
     const splices = diffSplices(this.doc, unit.after);
     this.mutateDoc(splices);
     this.hasOpenUnit = false;
     this.lastOrigin = null;
     this.lastEditEnd = -1;
-    this.lastStreamId = null;
     const cursor = endOfLastSplice(splices);
     return {
       revision: this.rev,
@@ -951,30 +1095,60 @@ export class MockCore implements OxidownCore {
     to: number,
     selections: SelectionRange[],
   ): Decoration[] {
+    checkNonNegInt("revision", revision);
     if (revision !== this.rev) {
-      throw new Error(`stale revision: decorations requested at ${revision}, current is ${this.rev}`);
+      throw new Error(
+        `StaleRevision: core is at revision ${this.rev}, caller passed ${revision}`,
+      );
     }
-    if (from < 0 || to > this.doc.length || from > to) {
-      throw new Error(`viewport out of bounds: [${from}, ${to}) in doc of length ${this.doc.length}`);
+    checkNonNegInt("from", from);
+    checkNonNegInt("to", to);
+    if (from > to) {
+      throw new Error(`InvalidRange: from ${from} > to ${to}`);
     }
+    if (to > this.doc.length) throw this.outOfBounds(to);
+    for (const sel of selections) {
+      if (
+        !Number.isInteger(sel.anchor) ||
+        sel.anchor < 0 ||
+        !Number.isInteger(sel.head) ||
+        sel.head < 0
+      ) {
+        throw new Error(
+          `InvalidPayload: malformed selections: anchor=${sel.anchor} head=${sel.head}`,
+        );
+      }
+      const hi = Math.max(sel.anchor, sel.head);
+      if (hi > this.doc.length) throw this.outOfBounds(hi);
+    }
+    // Query positions snap outward to the nearest code-point boundary rather
+    // than erroring (contract clarification 7 — range filters, not mutations).
+    const vFrom = this.snapFloor(from);
+    const vTo = this.snapCeil(to);
+    const sels = selections.map(
+      (sel) =>
+        [
+          this.snapFloor(Math.min(sel.anchor, sel.head)),
+          this.snapCeil(Math.max(sel.anchor, sel.head)),
+        ] as const,
+    );
+    // Composition stability rule, PER CONCEAL SPAN (decorations.rs): only
+    // conceal spans the composition range touches divert to `mark:delim` —
+    // sibling delimiters of the same node stay concealed.
+    const compTouch = (f: number, t: number): boolean =>
+      this.composing && this.compFrom <= t && this.compTo >= f;
+
     const nodes = parseDoc(this.doc);
     const out: Decoration[] = [];
     for (const node of nodes) {
-      // Viewport filter: skip nodes that do not intersect [from, to).
-      if (node.end < from || node.start > to) continue;
+      // Strict half-open overlap with the viewport (core parity): nodes that
+      // only touch the boundary are excluded.
+      if (node.start >= vTo || node.end <= vFrom) continue;
 
       // Reveal predicate: any selection range (cursor = empty range) that
       // intersects the node's full extent INCLUDING delimiters — touching a
-      // boundary counts. Plus the composition stability rule: while an IME
-      // session is open, every node intersecting the composition range is
-      // revealed (no conceal spans may intersect the composition range).
-      const revealed =
-        selections.some((sel) => {
-          const lo = Math.min(sel.anchor, sel.head);
-          const hi = Math.max(sel.anchor, sel.head);
-          return lo <= node.end && hi >= node.start;
-        }) ||
-        (this.composing && this.compFrom <= node.end && this.compTo >= node.start);
+      // boundary counts.
+      const revealed = sels.some(([lo, hi]) => lo <= node.end && hi >= node.start);
 
       if (node.line) {
         const flaggable = node.line.style === "blockquote" || node.line.style === "list-item";
@@ -988,13 +1162,17 @@ export class MockCore implements OxidownCore {
         // conceals[0] = "[" span; conceals[1] = "](url)" span.
         const [d1, d2] = node.conceals;
         const [urlFrom, urlTo] = node.linkUrl;
-        if (revealed) {
+        if (revealed || compTouch(d1[0], d1[1])) {
           out.push({ kind: "mark", from: d1[0], to: d1[1], style: "delim" });
+        } else {
+          out.push({ kind: "conceal", from: d1[0], to: d1[1] });
+        }
+        if (revealed || compTouch(d2[0], d2[1])) {
+          // v0.2 clarification 4: the "](url)" span reveals as delim/url/delim.
           out.push({ kind: "mark", from: d2[0], to: urlFrom, style: "delim" });
           out.push({ kind: "mark", from: urlFrom, to: urlTo, style: "url" });
           out.push({ kind: "mark", from: urlTo, to: d2[1], style: "delim" });
         } else {
-          out.push({ kind: "conceal", from: d1[0], to: d1[1] });
           out.push({ kind: "conceal", from: d2[0], to: d2[1] });
         }
         continue;
@@ -1003,8 +1181,9 @@ export class MockCore implements OxidownCore {
       if (node.bullet) {
         // LINE-level reveal: the node spans the item's line, so `revealed`
         // (closed-touch) makes the raw marker editable whenever the cursor
-        // is anywhere on the line.
-        if (revealed) {
+        // is anywhere on the line. A composition touching the marker span
+        // itself reveals it too (core parity: decorations.rs ListMarker).
+        if (revealed || compTouch(node.bullet.from, node.bullet.to)) {
           out.push({ kind: "mark", from: node.bullet.from, to: node.bullet.to, style: "list-marker" });
         } else {
           out.push({ kind: "widget", from: node.bullet.from, to: node.bullet.to, widget: "bullet" });
@@ -1017,7 +1196,7 @@ export class MockCore implements OxidownCore {
         // markers are a computed-number WIDGET, never the raw source
         // digits; LINE-level reveal (same node-extent discipline as bullet)
         // shows the raw digits as mark:list-marker.
-        if (revealed) {
+        if (revealed || compTouch(node.ordered.from, node.ordered.to)) {
           out.push({ kind: "mark", from: node.ordered.from, to: node.ordered.to, style: "list-marker" });
         } else {
           out.push({
@@ -1034,16 +1213,16 @@ export class MockCore implements OxidownCore {
 
       if (node.widget) {
         // Task-item marker (`- `): reveals IN LOCKSTEP with the checkbox —
-        // both key off the node-level `revealed` (extent = marker..checkbox),
+        // both key off the node-level `revealed` (extent = the whole line),
         // so the dash and the brackets always show together (core parity).
         for (const [cf, ct] of node.conceals) {
-          if (revealed) {
+          if (revealed || compTouch(cf, ct)) {
             out.push({ kind: "mark", from: cf, to: ct, style: "delim" });
           } else {
             out.push({ kind: "conceal", from: cf, to: ct });
           }
         }
-        if (revealed) {
+        if (revealed || compTouch(node.widget.from, node.widget.to)) {
           out.push({ kind: "mark", from: node.widget.from, to: node.widget.to, style: "delim" });
         } else {
           out.push({
@@ -1058,7 +1237,7 @@ export class MockCore implements OxidownCore {
       }
 
       for (const [cf, ct] of node.conceals) {
-        if (revealed) {
+        if (revealed || compTouch(cf, ct)) {
           out.push({ kind: "mark", from: cf, to: ct, style: "delim" });
         } else {
           out.push({ kind: "conceal", from: cf, to: ct });
@@ -1074,9 +1253,14 @@ export class MockCore implements OxidownCore {
   }
 
   compositionBegin(from: number, to: number): void {
+    checkNonNegInt("from", from);
+    checkNonNegInt("to", to);
+    if (from > to) throw new Error(`InvalidRange: from ${from} > to ${to}`);
+    if (to > this.doc.length) throw this.outOfBounds(to);
     this.composing = true;
-    this.compFrom = Math.max(0, Math.min(from, this.doc.length));
-    this.compTo = Math.max(this.compFrom, Math.min(to, this.doc.length));
+    // Query positions snap outward at surrogate pairs rather than erroring.
+    this.compFrom = this.snapFloor(from);
+    this.compTo = Math.max(this.compFrom, this.snapCeil(to));
     // A composition session forms its own undo unit: close the current group.
     // While the session is open, the 500ms window does not break the group
     // ("coalescing pauses during composition").
@@ -1107,17 +1291,42 @@ export class MockCore implements OxidownCore {
   // ---------------------------------------------------------------------------
 
   createAnchor(pos: number, bias: "before" | "after"): number {
+    if (bias !== "before" && bias !== "after") {
+      throw new Error(`InvalidBias: ${JSON.stringify(bias)}`);
+    }
+    this.checkDocPos("pos", pos);
+    // An anchor is a tracked query position: a position inside a surrogate
+    // pair snaps toward the anchor's bias (editor.rs create_anchor).
+    return this.insertAnchor(pos, bias, false);
+  }
+
+  private insertAnchor(pos: number, bias: "before" | "after", internal: boolean): number {
+    const snapped = bias === "before" ? this.snapFloor(pos) : this.snapCeil(pos);
     const id = this.nextAnchorId++;
-    this.anchors.set(id, { pos: Math.max(0, Math.min(pos, this.doc.length)), bias });
+    this.anchors.set(id, { pos: snapped, bias, internal });
     return id;
   }
 
   resolveAnchor(id: number): number | null {
+    checkNonNegInt("id", id);
+    // Public resolution: internal (stream) ids read as unknown.
+    const a = this.anchors.get(id);
+    return a && !a.internal ? a.pos : null;
+  }
+
+  /** Core-internal resolution: any live id, internal or public. */
+  private resolveInternal(id: number): number | null {
     const a = this.anchors.get(id);
     return a ? a.pos : null;
   }
 
   dropAnchor(id: number): void {
+    checkNonNegInt("id", id);
+    // No-op on unknown ids — and on core-internal anchor ids (stream
+    // insertion points), which no boundary caller may disturb: public ids
+    // and stream-internal state never collide destructively (anchor.rs).
+    const a = this.anchors.get(id);
+    if (!a || a.internal) return;
     this.anchors.delete(id);
   }
 
@@ -1129,25 +1338,43 @@ export class MockCore implements OxidownCore {
     a: number,
     b?: number,
   ): CoreChange | null {
+    // Argument validation mirrors the wasm entry point (crates/oxidown-wasm/
+    // src/lib.rs `command`): the first argument's number is checked, then a
+    // missing trailing argument is InvalidArgs — all BEFORE dispatch,
+    // without mutating anything.
+    const requireB = (what: string): number => {
+      if (b === undefined || b === null) {
+        throw new Error(`InvalidArgs: ${name} requires ${what}`);
+      }
+      return b;
+    };
+    const rangeArgs = (): [number, number] => {
+      checkNonNegInt("from", a);
+      const to = requireB("a `to` position");
+      checkNonNegInt("to", to);
+      return [a, to];
+    };
     switch (name) {
       case "toggleStrong":
-        return this.toggleWrap(a, b as number, "**");
+        return this.toggleWrap(name, ...rangeArgs(), "**");
       case "toggleEm":
-        return this.toggleWrap(a, b as number, "*");
+        return this.toggleWrap(name, ...rangeArgs(), "*");
       case "toggleStrike":
-        return this.toggleWrap(a, b as number, "~~");
+        return this.toggleWrap(name, ...rangeArgs(), "~~");
       case "toggleCode":
-        return this.toggleWrap(a, b as number, "`");
+        return this.toggleWrap(name, ...rangeArgs(), "`");
       case "setHeading":
-        return this.setHeadingCmd(a, b as 0 | 1 | 2 | 3 | 4 | 5 | 6);
+        checkNonNegInt("pos", a);
+        return this.setHeadingCmd(a, requireB("a heading level"));
       case "toggleTask":
+        checkNonNegInt("pos", a);
         return this.toggleTaskCmd(a);
       case "indentList":
-        return this.indentOutdentList(a, b as number, true);
+        return this.indentOutdentList(...rangeArgs(), true);
       case "outdentList":
-        return this.indentOutdentList(a, b as number, false);
+        return this.indentOutdentList(...rangeArgs(), false);
       case "enter":
-        return this.enterCmd(a, b as number);
+        return this.enterCmd(...rangeArgs());
       default:
         // Parity with the wasm core (crates/oxidown-wasm/src/lib.rs): an
         // unrecognized command name is a caller/protocol bug, not a "this
@@ -1161,47 +1388,119 @@ export class MockCore implements OxidownCore {
   }
 
   streamOpen(pos: number): number {
-    const clamped = Math.max(0, Math.min(pos, this.doc.length));
-    const anchorId = this.createAnchor(clamped, "after");
+    // Strict position (editor.rs stream_open): an insertion point inside a
+    // surrogate pair would corrupt text and errors; no clamping — an
+    // out-of-bounds position throws like every other mutation position.
+    this.strictDocPos(pos);
+    const anchorId = this.insertAnchor(pos, "after", true); // internal: untouchable via dropAnchor
     const id = this.nextStreamId++;
-    this.streams.set(id, { anchorId });
+    this.streams.set(id, { anchorId, pending: "" });
     return id;
   }
 
   streamAppend(id: number, chunk: string): CoreChange {
+    checkNonNegInt("id", id);
     const session = this.streams.get(id);
-    if (!session) throw new Error(`streamAppend on unknown/closed stream ${id}`);
-    const pos = this.resolveAnchor(session.anchorId);
-    if (pos === null) throw new Error(`stream anchor unresolved for stream ${id}`);
-    const splice: Splice = { at: pos, delete: 0, insert: chunk };
-
-    // The whole session is one undo unit unless something else (a user edit,
-    // a command, another stream) interrupted it since the last chunk of THIS
-    // stream — mirrors the generic adjacency-coalescing machinery but keyed
-    // on "same stream id" rather than position/time (streamed chunks are not
-    // adjacent to each other once the tail has grown).
-    const coalesce = this.hasOpenUnit && this.lastOrigin === "ai" && this.lastStreamId === id;
-    if (!coalesce) {
-      this.undoStack.push({ before: this.doc });
-      this.redoStack = [];
+    if (!session) {
+      throw new Error(`UnknownStream: stream ${id} is unknown or already closed`);
     }
-    this.hasOpenUnit = true;
-    this.lastOrigin = "ai";
-    this.lastStreamId = id;
-    this.lastEditEnd = -1;
-
-    this.mutateDoc([splice]);
-    return { revision: this.rev, splices: [splice], selection: null };
+    // Chunk boundaries may split an astral code point: prepend the pending
+    // high surrogate from the previous chunk, withhold a new trailing one
+    // (streamClose flushes it as U+FFFD). Anything else unpaired is a bad
+    // payload. The pending buffer is cleared even when the chunk is rejected
+    // (adapter parity).
+    let text = session.pending + chunk;
+    session.pending = "";
+    let withheld = "";
+    if (text.length > 0 && isHighSurrogate(text.charCodeAt(text.length - 1))) {
+      withheld = text[text.length - 1];
+      text = text.slice(0, -1);
+    }
+    if (findLoneSurrogate(text) !== -1) {
+      throw new Error("InvalidPayload: chunk contains an unpaired surrogate");
+    }
+    session.pending = withheld;
+    if (text === "") {
+      // Nothing (yet) to insert: no revision bump, no undo unit.
+      return { revision: this.rev, splices: [], selection: null };
+    }
+    return this.applyStreamText(id, session, text);
   }
 
   streamClose(id: number): void {
+    checkNonNegInt("id", id);
     const session = this.streams.get(id);
     if (!session) return; // no-op on unknown/closed id
-    this.dropAnchor(session.anchorId);
+    if (session.pending !== "") {
+      // A dangling high surrogate can never be completed: flush it as one
+      // U+FFFD so the document invariant (no lone surrogates) holds.
+      session.pending = "";
+      this.applyStreamText(id, session, "�");
+    }
+    this.anchors.delete(session.anchorId); // internal anchor: bypass dropAnchor's guard
     this.streams.delete(id);
     // Close the group so nothing after streamClose accidentally coalesces
     // into the stream's unit (mirrors compositionEnd).
     this.hasOpenUnit = false;
+  }
+
+  /**
+   * Insert `text` at the stream's (mapped) anchor, merging the edit into the
+   * stream's single undo unit wherever it sits in the stack — the snapshot
+   * counterpart of history.rs `record_stream_append`. Units created after
+   * the stream's unit (interleaved user edits) sit above it; their snapshots
+   * must gain the chunk (their undo must not delete streamed text), while
+   * the stream unit's own snapshot stays chunk-free (its undo removes the
+   * whole stream). The insertion position is cascaded down frame by frame:
+   * each unit's `before` IS the doc of the frame below it, so mapping
+   * through `diffSplices(frameDoc, before)` translates the position exactly
+   * like the Rust core's map-through-old-inverse step.
+   */
+  private applyStreamText(id: number, session: StreamSession, text: string): CoreChange {
+    const pos = this.resolveInternal(session.anchorId);
+    if (pos === null) {
+      throw new Error(`UnknownStream: stream ${id} lost its insertion anchor`);
+    }
+    const splice: Splice = { at: pos, delete: 0, insert: text };
+    this.redoStack = []; // any new edit clears redo
+    let idx = -1;
+    for (let k = this.undoStack.length - 1; k >= 0; k--) {
+      if (this.undoStack[k].streamId === id) {
+        idx = k;
+        break;
+      }
+    }
+    if (idx === -1) {
+      // First append, or the stream's unit was undone away: fresh unit,
+      // tagged so later appends merge into it. It is never coalescible by
+      // user/ime edits.
+      this.undoStack.push({ before: this.doc, streamId: id });
+      this.hasOpenUnit = false;
+      this.lastOrigin = "ai";
+      this.lastEditEnd = -1;
+    } else {
+      let p = splice.at;
+      let frameDoc = this.doc;
+      for (let k = this.undoStack.length - 1; k > idx; k--) {
+        const unit = this.undoStack[k];
+        const oldBefore = unit.before;
+        const inverse = diffSplices(frameDoc, oldBefore);
+        // Bias before: an insertion exactly at restored text stays before it,
+        // so no other unit's undo ever deletes streamed text.
+        const deeper = mapPos(p, inverse, -1);
+        unit.before = oldBefore.slice(0, deeper) + text + oldBefore.slice(deeper);
+        frameDoc = oldBefore;
+        p = deeper;
+      }
+      // The user-coalescing state tracks the TOP unit, which this append did
+      // not replace — only remap the adjacency position through the insert.
+      if (this.lastEditEnd >= 0) {
+        this.lastEditEnd = mapPos(this.lastEditEnd, [splice], -1);
+      }
+    }
+
+    this.mutateDoc([splice]);
+    return { revision: this.rev, splices: [splice], selection: null };
   }
 
   // ---------------------------------------------------------------------------
@@ -1214,12 +1513,77 @@ export class MockCore implements OxidownCore {
     this.hasOpenUnit = false;
     this.lastOrigin = "command";
     this.lastEditEnd = -1;
-    this.lastStreamId = null;
+  }
+
+  // ---- shared argument validation (wasm error-message parity) -------------
+
+  private outOfBounds(pos: number): Error {
+    return new Error(
+      `OutOfBounds: position ${pos} beyond document length ${this.doc.length} (UTF-16 code units)`,
+    );
+  }
+
+  /** InvalidArgs for malformed numbers, OutOfBounds past the document end. */
+  private checkDocPos(what: string, pos: number): void {
+    checkNonNegInt(what, pos);
+    if (pos > this.doc.length) throw this.outOfBounds(pos);
+  }
+
+  /** A MUTATION position: additionally rejects surrogate-pair interiors. */
+  private strictDocPos(pos: number, what = "pos"): number {
+    this.checkDocPos(what, pos);
+    if (splitsSurrogatePair(this.doc, pos)) throw surrogateSplitError(pos);
+    return pos;
+  }
+
+  /** QUERY positions snap outward to code-point boundaries instead of erroring. */
+  private snapFloor(pos: number): number {
+    return splitsSurrogatePair(this.doc, pos) ? pos - 1 : pos;
+  }
+
+  private snapCeil(pos: number): number {
+    return splitsSurrogatePair(this.doc, pos) ? pos + 1 : pos;
+  }
+
+  /**
+   * Inline toggles must not span multiple leaf blocks (Rust-core guard,
+   * throws InvalidArgs). The mock's line-based approximation of a leaf
+   * block: consecutive plain paragraph lines are one leaf; any blank,
+   * heading, hr, fence, quote, or list-marker line inside a multi-line
+   * range means the range crosses a leaf boundary.
+   */
+  private assertSingleLeafBlock(name: string, from: number, to: number): void {
+    const lines = intersectingLines(this.doc, from, to);
+    if (lines.length <= 1) return;
+    const oneParagraph = lines.every((r) => {
+      const text = this.doc.slice(r.start, r.end);
+      return (
+        text.trim() !== "" &&
+        !HEADING_RE.test(text) &&
+        !HR_RE.test(text) &&
+        !FENCE_RE.test(text) &&
+        !BQ_MARKER_RE.test(text) &&
+        !LIST_MARKER_ANY_INDENT_RE.test(text)
+      );
+    });
+    if (!oneParagraph) {
+      throw new Error(`InvalidArgs: ${name} range spans multiple leaf blocks`);
+    }
   }
 
   /** Toggle a symmetric delimiter pair (`**`, `*`, `~~`, `` ` ``) around [from, to). */
-  private toggleWrap(from: number, to: number, delim: string): CoreChange | null {
-    if (from < 0 || to > this.doc.length || from > to) return null;
+  private toggleWrap(
+    name: string,
+    fromArg: number,
+    toArg: number,
+    delim: string,
+  ): CoreChange | null {
+    this.checkDocPos("from", fromArg);
+    this.checkDocPos("to", toArg);
+    // Reversed ranges normalize (editor.rs command dispatch: from.min(to)).
+    const from = this.strictDocPos(Math.min(fromArg, toArg), "from");
+    const to = this.strictDocPos(Math.max(fromArg, toArg), "to");
+    this.assertSingleLeafBlock(name, from, to);
     const len = delim.length;
 
     // Case A: selection is exactly the inner content; delimiters sit outside it.
@@ -1261,11 +1625,14 @@ export class MockCore implements OxidownCore {
     return { revision: this.rev, splices, selection: { anchor: from + len, head: to + len } };
   }
 
-  private setHeadingCmd(pos: number, level: 0 | 1 | 2 | 3 | 4 | 5 | 6): CoreChange | null {
-    if (pos < 0 || pos > this.doc.length) return null;
-    const lineStart = this.doc.lastIndexOf("\n", Math.max(0, pos - 1)) + 1;
-    let lineEnd = this.doc.indexOf("\n", pos);
-    if (lineEnd === -1) lineEnd = this.doc.length;
+  private setHeadingCmd(posArg: number, level: number): CoreChange | null {
+    checkNonNegInt("level", level);
+    if (level > 6) {
+      throw new Error(`InvalidArgs: setHeading level must be an integer 0..=6, got ${level}`);
+    }
+    this.checkDocPos("pos", posArg);
+    const pos = this.snapFloor(posArg); // query position: snaps, never errors
+    const { start: lineStart, end: lineEnd } = lineRangeContaining(this.doc, pos);
     const line = this.doc.slice(lineStart, lineEnd);
     const m = HEADING_RE.exec(line);
     const currentLevel = m ? m[1].length : 0;
@@ -1281,11 +1648,10 @@ export class MockCore implements OxidownCore {
     return { revision: this.rev, splices: [splice], selection: { anchor: cursor, head: cursor } };
   }
 
-  private toggleTaskCmd(pos: number): CoreChange | null {
-    if (pos < 0 || pos > this.doc.length) return null;
-    const lineStart = this.doc.lastIndexOf("\n", Math.max(0, pos - 1)) + 1;
-    let lineEnd = this.doc.indexOf("\n", pos);
-    if (lineEnd === -1) lineEnd = this.doc.length;
+  private toggleTaskCmd(posArg: number): CoreChange | null {
+    this.checkDocPos("pos", posArg);
+    const pos = this.snapFloor(posArg); // query position: snaps, never errors
+    const { start: lineStart, end: lineEnd } = lineRangeContaining(this.doc, pos);
     const line = this.doc.slice(lineStart, lineEnd);
     const listM = matchListMarker(line);
     if (!listM) return null;
@@ -1308,8 +1674,12 @@ export class MockCore implements OxidownCore {
    * plain-string line scanning — see that module's doc comment for the full
    * spec, including the subtree-aware affected-line set.
    */
-  private indentOutdentList(from: number, to: number, indent: boolean): CoreChange | null {
-    if (from < 0 || to > this.doc.length || from > to) return null;
+  private indentOutdentList(fromArg: number, toArg: number, indent: boolean): CoreChange | null {
+    this.checkDocPos("from", fromArg);
+    this.checkDocPos("to", toArg);
+    // Reversed ranges normalize; positions are strict (mutation positions).
+    const from = this.strictDocPos(Math.min(fromArg, toArg), "from");
+    const to = this.strictDocPos(Math.max(fromArg, toArg), "to");
     const doc = this.doc;
     const lines = intersectingLines(doc, from, to).map((r) => listLineInfo(doc, r));
 
@@ -1521,9 +1891,10 @@ export class MockCore implements OxidownCore {
    * returns an empty-splice no-op: every applicable case produces an edit.
    */
   private enterCmd(fromArg: number, toArg: number): CoreChange | null {
-    if (fromArg < 0 || toArg > this.doc.length) return null;
-    const from = Math.min(fromArg, toArg);
-    const to = Math.max(fromArg, toArg);
+    this.checkDocPos("from", fromArg);
+    this.checkDocPos("to", toArg);
+    const from = this.strictDocPos(Math.min(fromArg, toArg), "from");
+    const to = this.strictDocPos(Math.max(fromArg, toArg), "to");
     const doc = this.doc;
     const line = lineRangeContaining(doc, from);
     const info = listLineInfo(doc, line);
@@ -1644,8 +2015,11 @@ export class MockCore implements OxidownCore {
     this.doc = applySplices(this.doc, splices);
     this.rev++;
     if (this.composing) {
+      // Both ends map with before-bias (composition.rs `map_through`): an
+      // insertion exactly at the range end does not extend it — IME edits
+      // grow the range explicitly in applyEdit's union step instead.
       this.compFrom = mapPos(this.compFrom, splices, -1);
-      this.compTo = mapPos(this.compTo, splices, 1);
+      this.compTo = Math.max(this.compFrom, mapPos(this.compTo, splices, -1));
     }
     for (const a of this.anchors.values()) {
       a.pos = mapPos(a.pos, splices, a.bias === "after" ? 1 : -1);
@@ -1659,17 +2033,34 @@ export class MockCore implements OxidownCore {
   }
 
   private validateSplices(splices: Splice[]): void {
-    let prevEnd = 0;
+    // Payload check first (the wasm adapter rejects the payload before the
+    // core sees it): no insert may carry an unpaired surrogate into the doc.
     for (const s of splices) {
-      if (s.at < 0 || s.delete < 0 || s.at + s.delete > this.doc.length) {
+      if (findLoneSurrogate(s.insert) !== -1) {
+        throw new Error("InvalidPayload: splice insert contains an unpaired surrogate");
+      }
+    }
+    let prevEnd = 0;
+    for (let i = 0; i < splices.length; i++) {
+      const s = splices[i];
+      if (!Number.isInteger(s.at) || s.at < 0 || !Number.isInteger(s.delete) || s.delete < 0) {
         throw new Error(
-          `splice out of bounds: at=${s.at} delete=${s.delete} docLength=${this.doc.length}`,
+          `InvalidPayload: malformed splices: splice #${i} has at=${s.at} delete=${s.delete}`,
         );
       }
-      if (s.at < prevEnd) {
-        throw new Error(`splices overlap or are not ascending at position ${s.at}`);
+      const end = s.at + s.delete;
+      if (i > 0 && s.at < prevEnd) {
+        throw new Error(
+          `InvalidSplice: splice #${i}: splices must be ascending and non-overlapping ` +
+            `(at ${s.at} < previous end ${prevEnd})`,
+        );
       }
-      prevEnd = s.at + s.delete;
+      if (end > this.doc.length) throw this.outOfBounds(end);
+      // Contract clarification 7: a splice boundary inside a surrogate pair
+      // would corrupt text — always an error, never snapped.
+      if (splitsSurrogatePair(this.doc, s.at)) throw surrogateSplitError(s.at);
+      if (splitsSurrogatePair(this.doc, end)) throw surrogateSplitError(end);
+      prevEnd = end;
     }
   }
 }

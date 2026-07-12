@@ -240,23 +240,23 @@ describe("MockCore text mirror and revisions", () => {
     }
   });
 
-  it("throws on stale revision for applyEdit and decorations", () => {
+  it("throws StaleRevision (wasm message parity) for applyEdit and decorations", () => {
     const { core } = makeCore("abc");
     const rev = core.revision();
     core.applyEdit(rev, [{ at: 0, delete: 0, insert: "x" }], "user");
     expect(() => core.applyEdit(rev, [{ at: 0, delete: 0, insert: "y" }], "user")).toThrow(
-      /stale/,
+      `StaleRevision: core is at revision ${core.revision()}, caller passed ${rev}`,
     );
-    expect(() => core.decorations(rev, 0, 1, cursor(0))).toThrow(/stale/);
+    expect(() => core.decorations(rev, 0, 1, cursor(0))).toThrow(/^StaleRevision:/);
     // current revision works
     expect(() => core.decorations(core.revision(), 0, 1, cursor(0))).not.toThrow();
   });
 
-  it("throws on out-of-bounds and overlapping splices", () => {
+  it("throws OutOfBounds / InvalidSplice (wasm message parity) on bad splices", () => {
     const { core } = makeCore("abc");
     expect(() =>
       core.applyEdit(core.revision(), [{ at: 2, delete: 5, insert: "" }], "user"),
-    ).toThrow(/bounds/);
+    ).toThrow("OutOfBounds: position 7 beyond document length 3 (UTF-16 code units)");
     expect(() =>
       core.applyEdit(
         core.revision(),
@@ -266,7 +266,44 @@ describe("MockCore text mirror and revisions", () => {
         ],
         "user",
       ),
-    ).toThrow(/overlap|ascending/);
+    ).toThrow(/^InvalidSplice: .*ascending and non-overlapping/);
+  });
+
+  it("FIX: an empty or all-no-op batch leaves the revision unchanged and creates no undo unit", () => {
+    // editor.rs apply_edit filters no-op splices and early-returns on an
+    // empty batch; the mock used to rev++ unconditionally via mutateDoc.
+    const { core } = makeCore("abc");
+    const rev = core.revision();
+    expect(core.applyEdit(rev, [], "user")).toBe(rev);
+    expect(core.applyEdit(rev, [{ at: 1, delete: 0, insert: "" }], "user")).toBe(rev);
+    expect(core.revision()).toBe(rev);
+    expect(core.undo()).toBeNull(); // no undo unit was created
+    expect(core.getText()).toBe("abc");
+  });
+
+  it("FIX: splice boundaries inside a surrogate pair throw SurrogateSplit", () => {
+    const { core } = makeCore("a😀b"); // 😀 = code units [1, 3)
+    for (const splices of [
+      [{ at: 2, delete: 0, insert: "x" }], // at splits the pair
+      [{ at: 0, delete: 2, insert: "" }], // delete end splits the pair
+    ]) {
+      expect(() => core.applyEdit(core.revision(), splices, "user")).toThrow(
+        "SurrogateSplit: position 2 falls inside a surrogate pair",
+      );
+    }
+    expect(core.getText()).toBe("a😀b");
+  });
+
+  it("FIX: lone-surrogate payloads throw InvalidPayload on load and applyEdit", () => {
+    const core = new MockCore();
+    expect(() => core.load("bad\uD800doc")).toThrow(
+      "InvalidPayload: text contains an unpaired surrogate",
+    );
+    core.load("ok");
+    expect(() =>
+      core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "\uDC00" }], "user"),
+    ).toThrow("InvalidPayload: splice insert contains an unpaired surrogate");
+    expect(core.getText()).toBe("ok");
   });
 
   it("revisions increase monotonically, including across load()", () => {
@@ -400,22 +437,39 @@ describe("MockCore undo/redo and coalescing", () => {
 });
 
 describe("MockCore composition stability rule", () => {
-  it("conceal spans intersecting the composition range are emitted as delim marks", () => {
-    const doc = "**bold** x";
+  it("conceal spans TOUCHED by the composition range are emitted as delim marks (per-span, core parity)", () => {
+    const doc = "**bold** x"; // delimiter spans [0, 2) and [6, 8)
     const { core } = makeCore(doc);
     // Selection parked away from the node; without composition it conceals.
     const before = core.decorations(core.revision(), 0, doc.length, cursor(10));
     expect(conceals(before)).toHaveLength(2);
 
-    core.compositionBegin(4, 4); // inside the strong node
+    // A composition range touching BOTH delimiter spans reveals both.
+    core.compositionBegin(2, 6);
     const during = core.decorations(core.revision(), 0, doc.length, cursor(10));
     expect(conceals(during)).toEqual([]);
     expect(marks(during, "delim")).toEqual([
       { kind: "mark", from: 0, to: 2, style: "delim" },
       { kind: "mark", from: 6, to: 8, style: "delim" },
     ]);
-
     core.compositionEnd();
+
+    // FIX (per-conceal-span, decorations.rs parity): a composition range
+    // strictly inside the CONTENT touches neither delimiter span, so both
+    // stay concealed — the mock used to over-reveal the whole node.
+    core.compositionBegin(4, 4);
+    const inside = core.decorations(core.revision(), 0, doc.length, cursor(10));
+    expect(conceals(inside)).toHaveLength(2);
+    core.compositionEnd();
+
+    // And a range touching only the OPENING span reveals just that one —
+    // sibling delimiters of the same node are not dragged along.
+    core.compositionBegin(0, 1);
+    const partial = core.decorations(core.revision(), 0, doc.length, cursor(10));
+    expect(marks(partial, "delim")).toEqual([{ kind: "mark", from: 0, to: 2, style: "delim" }]);
+    expect(conceals(partial)).toEqual([{ kind: "conceal", from: 6, to: 8 }]);
+    core.compositionEnd();
+
     const after = core.decorations(core.revision(), 0, doc.length, cursor(10));
     expect(conceals(after)).toHaveLength(2);
   });
@@ -448,16 +502,15 @@ describe("MockCore composition stability rule", () => {
   it("the composition range maps through edits earlier in the document", () => {
     const doc = "abc **bold** x";
     const { core } = makeCore(doc);
-    core.compositionBegin(8, 8); // inside the strong node [4, 12)
+    core.compositionBegin(4, 6); // over the strong node's opening delimiter [4, 6)
     // a user edit earlier in the doc shifts everything right by 3
     core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "123" }], "user");
-    const ds = core.decorations(core.revision(), 0, core.docLength(), cursor(0));
-    // strong node now at [7, 15); composition range must have shifted with it
-    expect(conceals(ds)).toEqual([]);
-    expect(marks(ds, "delim")).toEqual([
-      { kind: "mark", from: 7, to: 9, style: "delim" },
-      { kind: "mark", from: 13, to: 15, style: "delim" },
-    ]);
+    const ds = core.decorations(core.revision(), 0, core.docLength(), cursor(2));
+    // strong node now at [7, 15); the composition range shifted to [7, 9)
+    // with it, still revealing exactly the opening delimiter span (per-span
+    // composition reveal) while the closing span stays concealed.
+    expect(marks(ds, "delim")).toEqual([{ kind: "mark", from: 7, to: 9, style: "delim" }]);
+    expect(conceals(ds)).toEqual([{ kind: "conceal", from: 13, to: 15 }]);
     core.compositionEnd();
   });
 });
@@ -1348,7 +1401,14 @@ describe("MockCore streaming (v0.2)", () => {
     expect(core.getText()).toBe("X");
   });
 
-  it("a user edit interleaved between appends gets its own unit; each still undoes cleanly", () => {
+  it("FIX: an interleaved user edit gets its own unit; the STREAM stays one unit (creation-order undo)", () => {
+    // Boundary v0.2 clarification 2 (history.rs `record_stream_append`): an
+    // entire stream (open→close) is ONE undo unit even with user edits
+    // interleaved, and undo order is unit-CREATION order (LIFO by creation).
+    // The user edit's unit was created AFTER the stream's unit began, so it
+    // pops first; the second undo then reverts the whole stream (A+B
+    // together). The mock used to split the stream into one unit per
+    // interruption, popping B / USER / A.
     const { core, clock } = makeCore("head\n\ntail");
     const id = core.streamOpen(core.docLength());
     core.streamAppend(id, "A");
@@ -1358,15 +1418,35 @@ describe("MockCore streaming (v0.2)", () => {
     core.streamClose(id);
     expect(core.getText()).toBe("USERhead\n\ntailAB");
 
-    // undo unwinds in strict temporal order: last stream chunk, then the
-    // interleaved user edit, then the first stream chunk — the user's edit is
-    // never corrupted by, or merged into, the stream's own unit(s).
-    core.undo();
-    expect(core.getText()).toBe("USERhead\n\ntailA");
-    core.undo();
-    expect(core.getText()).toBe("head\n\ntailA");
-    core.undo();
+    core.undo(); // the user edit's unit (created mid-stream) pops first
+    expect(core.getText()).toBe("head\n\ntailAB");
+    core.undo(); // the stream's single unit reverts BOTH chunks at once
     expect(core.getText()).toBe("head\n\ntail");
+    expect(core.undo()).toBeNull();
+
+    // Redo round trip restores the same units in reverse.
+    core.redo();
+    expect(core.getText()).toBe("head\n\ntailAB");
+    core.redo();
+    expect(core.getText()).toBe("USERhead\n\ntailAB");
+    expect(core.redo()).toBeNull();
+  });
+
+  it("a user edit INSIDE the streamed region never loses text to the stream's undo", () => {
+    // The cascade must keep every unit's snapshot sound: undoing the user
+    // edit first, then the stream, restores the exact original document.
+    const { core, clock } = makeCore("X");
+    const id = core.streamOpen(1);
+    core.streamAppend(id, "abc"); // "Xabc"
+    clock.advance(10);
+    core.applyEdit(core.revision(), [{ at: 2, delete: 1, insert: "" }], "user"); // "Xac"
+    core.streamAppend(id, "de"); // appended at the mapped anchor -> "Xacde"
+    core.streamClose(id);
+    expect(core.getText()).toBe("Xacde");
+    core.undo(); // user deletion restored (streamed text untouched)
+    expect(core.getText()).toBe("Xabcde");
+    core.undo(); // the whole stream reverts
+    expect(core.getText()).toBe("X");
   });
 
   it("streamAppend on an unknown/closed id throws; streamClose on one is a no-op", () => {
