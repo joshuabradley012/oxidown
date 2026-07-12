@@ -1068,6 +1068,95 @@ describe("Mod-Shift-Enter keymap (keyboard path for the task-checkbox toggle)", 
   });
 });
 
+describe("Mod-L / Ctrl-L keymap (Obsidian-parity toggleTask + browser shortcut consumption)", () => {
+  const modLKey = () =>
+    new KeyboardEvent("keydown", {
+      key: "l",
+      code: "KeyL",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+  it("applies a scripted CoreChange under the skip annotation (StubCore)", async () => {
+    const core = new StubCore();
+    const doc = "- [ ] buy milk";
+    const view = makeView(doc, core);
+    const pos = doc.indexOf("milk");
+    view.dispatch({ selection: { anchor: pos } });
+    core.queueReturn("command", {
+      revision: 99,
+      splices: [{ at: 3, delete: 1, insert: "x" }],
+      selection: null,
+    });
+    const applySpy = vi.spyOn(core, "applyEdit");
+
+    view.contentDOM.dispatchEvent(modLKey());
+    await flush();
+
+    expect(view.state.doc.toString()).toBe("- [x] buy milk");
+    // Applied via applyCoreChange (skip annotation), never echoed back into
+    // applyEdit — the same core-driven-change path as undo/redo/streaming.
+    expect(applySpy).not.toHaveBeenCalled();
+    expect(core.callsTo("command").at(-1)!.args).toEqual(["toggleTask", pos]);
+    view.destroy();
+  });
+
+  it("a scripted null still consumes the key (preventDefault) without dispatching anything", async () => {
+    const core = new StubCore();
+    const doc = "plain paragraph";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: 3 } });
+    core.queueReturn("command", null);
+
+    const event = modLKey();
+    // dispatchEvent returns false for a cancelable event once a handler has
+    // called preventDefault() — exactly the browser-shortcut-consumption
+    // behavior the binding documents: Mod-L must never reach the browser's
+    // own address-bar handling, whether or not toggleTask applies here.
+    const notCanceled = view.contentDOM.dispatchEvent(event);
+    await flush();
+
+    expect(notCanceled).toBe(false);
+    expect(event.defaultPrevented).toBe(true);
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(core.getText()).toBe(doc);
+    view.destroy();
+  });
+
+  it("flips '[ ]' to '[x]' (and back) end-to-end through the keymap (wasm)", async () => {
+    const core = makeWasmCore();
+    const doc = "- [ ] buy milk\nelsewhere";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: doc.indexOf("milk") } });
+
+    view.contentDOM.dispatchEvent(modLKey());
+    await flush();
+
+    expect(view.state.doc.toString()).toBe("- [x] buy milk\nelsewhere");
+    expect(core.getText()).toBe(view.state.doc.toString());
+
+    view.contentDOM.dispatchEvent(modLKey());
+    await flush();
+    expect(view.state.doc.toString()).toBe("- [ ] buy milk\nelsewhere");
+    view.destroy();
+  });
+
+  it("does nothing on a plain bullet — documented v1 behavior: no bullet-to-task promotion (wasm)", async () => {
+    const core = makeWasmCore();
+    const doc = "- plain bullet\nelsewhere";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: doc.indexOf("bullet") } });
+
+    view.contentDOM.dispatchEvent(modLKey());
+    await flush();
+
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(core.getText()).toBe(doc);
+    view.destroy();
+  });
+});
+
 describe("FIX 6: skip-annotated dispatches are mirror-verified immediately", () => {
   it("detects and recovers when a host changeFilter alters a core-driven (skip-annotated) change", async () => {
     const core = new StubCore();
@@ -1598,7 +1687,7 @@ describe("S9: readOnly editors never dispatch core edits", () => {
     view.destroy();
   });
 
-  it("Enter and Mod-Shift-Enter return false without dispatching", async () => {
+  it("Enter, Mod-Shift-Enter, and Mod-L return false without dispatching", async () => {
     const core = new StubCore();
     const doc = "- [ ] task\n";
     const view = makeReadOnlyView(doc, core, 6);
@@ -1608,6 +1697,7 @@ describe("S9: readOnly editors never dispatch core edits", () => {
     view.contentDOM.dispatchEvent(
       key({ key: "Enter", code: "Enter", ctrlKey: true, shiftKey: true }),
     );
+    view.contentDOM.dispatchEvent(key({ key: "l", code: "KeyL", ctrlKey: true }));
     await flush();
 
     expect(cmdSpy).not.toHaveBeenCalled();

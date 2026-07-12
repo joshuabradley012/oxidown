@@ -1,12 +1,14 @@
 import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
-import { defaultKeymap } from "@codemirror/commands";
+import { defaultKeymap, indentLess, indentMore } from "@codemirror/commands";
 // NOTE: no history()/historyKeymap here — the Oxidown core is the historian.
 import {
   applyCoreChange,
   loadWasmCore,
   oxidown,
+  runCoreCommand,
   type OxidownCore,
+  type RangeCommandName,
 } from "@oxidown/view-cm6";
 import { SAMPLE_DOC, STREAM_TEXT, largeDocFiller } from "./sample-doc";
 import "./style.css";
@@ -124,6 +126,77 @@ if (import.meta.env.DEV) {
   (window as unknown as { __oxidownView?: EditorView }).__oxidownView = view;
   (window as unknown as { __oxidownCore?: OxidownCore }).__oxidownCore = core;
 }
+
+// ---------------------------------------------------------------------------
+// Toolbar: a compact discoverability layer over the SAME core commands the
+// keybindings already use. Every button goes through core.command +
+// applyCoreChange — runCoreCommand (exported by the package) wraps the
+// try/validation-refusal/apply policy shared with every keymap command site,
+// so this file never touches the document directly. Keyboard shortcuts stay
+// the source of truth; this is just a mouse-discoverable path to the exact
+// same behavior. Streaming never disables editing (see the streaming section
+// below), so the toolbar stays enabled while a stream is running too.
+// ---------------------------------------------------------------------------
+
+const toolbar = document.getElementById("toolbar")!;
+
+// Buttons must not steal focus from the editor: preventing the default
+// mousedown (before the click fires) is the standard pattern for widgets
+// that shouldn't move focus off the editor (see the task-checkbox widget's
+// own mousedown handler in extension.ts) — the click handler below still
+// runs normally.
+toolbar.addEventListener("mousedown", (event) => event.preventDefault());
+
+function runToggle(name: RangeCommandName) {
+  if (view.state.readOnly) return;
+  const { from, to } = view.state.selection.main;
+  const outcome = runCoreCommand(name, () => core.command(name, from, to));
+  if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
+}
+
+function runIndent(name: "indentList" | "outdentList") {
+  if (view.state.readOnly) return;
+  const { from, to } = view.state.selection.main;
+  const outcome = runCoreCommand(name, () => core.command(name, from, to));
+  if (!outcome.ok) return; // thrown: handled-and-ignored, like every other command site
+  if (outcome.change === null) {
+    // Same fallback semantics as the Tab/Shift-Tab keybinding: outside list
+    // context, fall back to CM6's own indentMore/indentLess.
+    (name === "indentList" ? indentMore : indentLess)(view);
+    return;
+  }
+  applyCoreChange(view, outcome.change, "oxidown.command");
+}
+
+function runToggleTaskBtn() {
+  if (view.state.readOnly) return;
+  const pos = view.state.selection.main.head;
+  const outcome = runCoreCommand("toggleTask", () => core.command("toggleTask", pos));
+  if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
+}
+
+function runSetHeading(level: 0 | 1 | 2 | 3 | 4 | 5 | 6) {
+  if (view.state.readOnly) return;
+  const pos = view.state.selection.main.head;
+  const outcome = runCoreCommand("setHeading", () => core.command("setHeading", pos, level));
+  if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
+}
+
+toolbar.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest("button");
+  if (!button) return;
+  if (button.dataset.toggle) {
+    runToggle(button.dataset.toggle as RangeCommandName);
+  } else if (button.dataset.heading !== undefined) {
+    runSetHeading(Number(button.dataset.heading) as 0 | 1 | 2 | 3 | 4 | 5 | 6);
+  } else if ("task" in button.dataset) {
+    runToggleTaskBtn();
+  } else if (button.dataset.indent) {
+    runIndent(button.dataset.indent as "indentList" | "outdentList");
+  }
+  // Whatever ran above, keep typing focus in the editor.
+  view.focus();
+});
 
 // Source-mode toggle: swap out live-preview decorations; document syncing and
 // core-driven undo/redo keep working (the plugin re-attaches without reloading

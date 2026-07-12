@@ -77,6 +77,45 @@ body {
   white-space: nowrap;
 }
 
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 14px;
+  border-bottom: 1px solid #ddd;
+  background: #fafafa;
+  flex: none;
+}
+
+#toolbar button {
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  min-width: 26px;
+  padding: 4px 7px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: #fff;
+  color: #1a1a1a;
+  cursor: pointer;
+}
+
+#toolbar button:hover {
+  background: #eef2fa;
+  border-color: #b9c8e6;
+}
+
+#toolbar button:active {
+  background: #dee8f9;
+}
+
+.toolbar-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 4px;
+  background: #ddd;
+}
+
 #editor {
   flex: 1;
   min-height: 0;

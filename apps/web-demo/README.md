@@ -54,6 +54,11 @@ canonical delimiter flavors (`**`, `*`, `~~`, matching backtick runs),
 toggling twice returns the exact original bytes (round-trip tested in the
 library suite); non-canonical flavors normalize on the way back — e.g.
 `__x__` deliberately re-wraps as `**x**` (see `crates/oxidown-core/README.md`).
+The button row above the editor (Bold/Italic/Strikethrough/Code, H1–H3 +
+paragraph, task checkbox, indent/outdent) is a mouse-discoverable layer over
+these same commands — every button calls `core.command(...)` and
+`applyCoreChange` exactly like its keybinding, so it's just muscle-memory-free
+discoverability, never a second code path.
 
 ### Task lists
 
@@ -61,7 +66,12 @@ Type a GFM task item (`- [ ] like this`) and click the rendered checkbox: it
 calls `core.command("toggleTask", pos)` and applies the result the same way
 undo/redo and streaming do — the checkbox is the project's first "widget
 island" (a CM6 replace decoration wrapping a real `<input type="checkbox">`).
-Clicking it never moves the text cursor.
+Clicking it never moves the text cursor. **Mod-Shift-Enter** and **Mod-L**
+(Obsidian's own "Toggle checkbox status" hotkey) toggle the task on the
+cursor's line from the keyboard; Mod-L always consumes the keystroke (the
+browser would otherwise grab Cmd/Ctrl-L for the address bar) even when the
+cursor isn't on a task item — unlike Obsidian, running it on a plain bullet
+does not (yet) convert the line into a task.
 
 ### Reveal / conceal behavior
 

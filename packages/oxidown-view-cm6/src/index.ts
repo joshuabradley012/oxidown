@@ -23,6 +23,7 @@ export {
   oxidown,
   oxidownCommands,
   applyCoreChange,
+  runCoreCommand,
   changesToSplices,
   endOfLastSplice,
   sanitizeSurrogates,

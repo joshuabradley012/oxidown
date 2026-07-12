@@ -16,6 +16,22 @@
       <span id="stream-status" class="banner" title="Streaming status + chunk rate"></span>
       <span id="perf-hud" title="Last core call timings (measured JS-side)"></span>
     </header>
+    <div id="toolbar" role="toolbar" aria-label="Formatting">
+      <button type="button" data-toggle="toggleStrong" title="Bold (Ctrl/Cmd-B)"><strong>B</strong></button>
+      <button type="button" data-toggle="toggleEm" title="Italic (Ctrl/Cmd-I)"><em>I</em></button>
+      <button type="button" data-toggle="toggleStrike" title="Strikethrough (Ctrl/Cmd-Shift-X)"><s>S</s></button>
+      <button type="button" data-toggle="toggleCode" title="Inline code (Ctrl/Cmd-E)"><code>&lt;/&gt;</code></button>
+      <span class="toolbar-sep" aria-hidden="true"></span>
+      <button type="button" data-heading="1" title="Heading 1">H1</button>
+      <button type="button" data-heading="2" title="Heading 2">H2</button>
+      <button type="button" data-heading="3" title="Heading 3">H3</button>
+      <button type="button" data-heading="0" title="Paragraph">¶</button>
+      <span class="toolbar-sep" aria-hidden="true"></span>
+      <button type="button" data-task title="Task checkbox (Ctrl/Cmd-Shift-Enter or Ctrl/Cmd-L)">☑</button>
+      <span class="toolbar-sep" aria-hidden="true"></span>
+      <button type="button" data-indent="outdentList" title="Outdent (Shift-Tab)">⇤</button>
+      <button type="button" data-indent="indentList" title="Indent (Tab)">⇥</button>
+    </div>
     <main id="editor"></main>
     <script type="module" src="/src/main.ts"></script>
   </body>
