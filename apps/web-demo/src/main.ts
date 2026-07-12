@@ -177,7 +177,13 @@ function endStream(status: "done" | "stopped") {
     streamTimer = null;
   }
   if (streamId !== null) {
-    core.streamClose(streamId);
+    try {
+      core.streamClose(streamId);
+    } catch (err) {
+      // endStream must be safe to call on a broken core (e.g. right after a
+      // streamAppend threw) — log and move on so the UI still resets.
+      console.error("[oxidown demo] streamClose failed:", err);
+    }
     streamId = null;
   }
   streamBtn.disabled = false;

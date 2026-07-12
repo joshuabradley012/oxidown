@@ -18,15 +18,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: clippy
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: cargo test --workspace
         run: cargo test --workspace
@@ -45,19 +45,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Add wasm32-unknown-unknown target
         run: rustup target add wasm32-unknown-unknown
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install wasm-pack
-        uses: taiki-e/install-action@wasm-pack
+        uses: taiki-e/install-action@9a79470254ab1bfe1fa4cb61c6f6fb0bf86aeb3d # wasm-pack
 
       - name: wasm-pack build
         run: wasm-pack build crates/oxidown-wasm --target web --out-dir pkg
@@ -97,37 +97,35 @@ jobs:
             exit 1
           fi
 
+      - name: Upload wasm pkg for the web job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: oxidown-wasm-pkg
+          path: crates/oxidown-wasm/pkg
+          if-no-files-found: error
+
   web:
     name: pnpm build + test
     runs-on: ubuntu-latest
+    # Needs the built wasm pkg so the JS suite's wasm conformance tests run
+    # against the real artifact instead of silently skipping.
+    needs: wasm
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - name: Detect packageManager field
-        id: pm
-        run: |
-          if grep -q '"packageManager"' package.json; then
-            echo "present=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "present=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      # If package.json pins a pnpm version via "packageManager", let the
-      # action read it (Corepack-style). Otherwise fall back to the pinned
-      # 11.x line that's known-green locally (pnpm 11.9.0).
-      - name: Setup pnpm (from packageManager field)
-        if: steps.pm.outputs.present == 'true'
-        uses: pnpm/action-setup@v6
-
-      - name: Setup pnpm (pinned 11.x)
-        if: steps.pm.outputs.present != 'true'
-        uses: pnpm/action-setup@v6
+      - name: Download wasm pkg
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          version: 11
+          name: oxidown-wasm-pkg
+          path: crates/oxidown-wasm/pkg
+
+      # Reads the pnpm version from package.json's "packageManager" field.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: pnpm

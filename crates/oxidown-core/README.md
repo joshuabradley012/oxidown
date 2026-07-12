@@ -2,7 +2,8 @@
 
 The Oxidown editor core. Implements the boundary contract in
 [`docs/boundary-v0.md`](../../docs/boundary-v0.md) — v0/v0.1 (M0) plus the
-v0.2 (M1) additions: the rope is the document, the parse is a disposable
+v0.2 additions and v0.3 amendments (M1; the contract's current version is
+v0.3): the rope is the document, the parse is a disposable
 overlay, decorations are derived, undo is core-driven. Public API positions
 are **UTF-16 code units**; internals are UTF-8 byte offsets and never leak.
 
@@ -11,17 +12,17 @@ are **UTF-16 code units**; internals are UTF-8 byte offsets and never leak.
 | Module | Responsibility |
 |---|---|
 | `text` | `ropey` rope wrapper. UTF-16 ⇄ UTF-8 conversion via ropey's utf16 metrics (`utf16_cu_to_char` / `char_to_utf16_cu`), with surrogate-split detection by round-tripping through the char index. `ByteSplice` (the internal splice type), single-byte probes, and line-range lookup live here. |
-| `parser` | Phase A (plan.md §5.2): full-document reparse per edit with `pulldown-cmark` 0.13 `into_offset_iter()`. M0 node set: ATX headings h1–h6, strong, emphasis, inline code. M1 adds: strikethrough, links (inline + autolink/email), blockquotes (per-line, with nesting depth), fenced code blocks (fence + body lines), list markers, task-item checkboxes, thematic breaks — see "M1 parser notes" below. `parse_document` produces the overlay **and** the top-level block spans for the block index in ONE pulldown pass per edit. Byte-exact spans are computed from event spans + source bytes, never from event *text* payloads (handles `***bold-italic***` nesting, links inside emphasis, code spans containing delimiter-looking characters, lists inside blockquotes; setext headings are recognized and skipped). |
+| `parser` | Phase A parsing (plan.md §5.2) with `pulldown-cmark` 0.13 `into_offset_iter()`; per edit the `editor` invokes it on an incremental window, a tail slice, or the full document (see `editor`). M0 node set: ATX headings h1–h6, strong, emphasis, inline code. M1 adds: strikethrough, links (inline + autolink/email), blockquotes (per-line, with nesting depth), fenced code blocks (fence + body lines), list markers, task-item checkboxes, thematic breaks — see "M1 parser notes" below. `parse_document` produces the overlay **and** the top-level block spans for the block index in ONE pulldown pass per edit. Byte-exact spans are computed from event spans + source bytes, never from event *text* payloads (handles `***bold-italic***` nesting, links inside emphasis, code spans containing delimiter-looking characters, lists inside blockquotes; setext headings are recognized and skipped). |
 | `mapping` | Shared position/range mapping through splice batches, parameterized by `Bias` (`Before`/`After` at exact insertion points). One algorithm behind the composition range, anchors, and the block index (`map_pos`, `map_range` extend-biased, `map_range_shrink`). |
 | `anchor` | Public anchors (v0.2): id → (byte pos, bias), mapped through every applied batch. Deletion collapses to the deletion site (never null in M1); `load` clears all anchors; ids are never reused. |
 | `block_index` | Top-level blocks with sticky `BlockId(replica, counter)` (plan.md §5.3). M1-internal (not on the wasm boundary); consumed by streaming's tail fast path. Identity via shrink-biased span mapping + linear two-pointer overlap matching — see the module docs for the split/merge/replace semantics. |
 | `oplog` | Append-only `Op { id: (replica, counter), lamport, parent_counter, origin, splice }` log. Every edit appends, including undo/redo applications. No clocks, no entropy. |
 | `history` | Undo/redo as inverted-op stacks. Stack discipline keeps stored inverses valid in current-doc coordinates without mapping — except AI stream units, which merge appends into one (possibly non-top) unit via a frame-preserving cascade (`record_stream_append`; see its docs). Coalescing: single-splice `user`/`ime` edits within 500 ms whose splice falls inside the top unit's replaced region merge; `paste`/`command`/`ai` never coalesce; coalescing pauses during composition and breaks after undo/redo. |
 | `composition` | IME session range (bytes), mapped through every edit batch; IME-origin insertions touching the range grow it. |
-| `commands` | v0.2 command planners: pure functions from (overlay, source, target) to minimal splices + post-apply selection, or `None` when a command doesn't apply. See "M1 command decisions" below. |
-| `decorations` | Filters the cached overlay for a viewport (never reparses). Core-side reveal: closed-interval intersection of any selection with the node's full extent (delimiters included) — so a cursor immediately before/after a delimiter reveals. Composition rule: conceal spans intersecting the session range are emitted as `mark:delim`. M1 adds the `Block` (blockquote/code-fence/code-block/hr line chrome) and `Widget` (task checkbox) decoration variants, kept separate from the M0 `Line` variant so its shape (and every M0 test matching it) is untouched — see "M1 decoration notes" below. |
-| `editor` | `Editor`: `load`, `apply_edit` (validated multi-splice batches, ascending original-doc coordinates), `undo`/`redo` (returning `CoreChange` incl. cursor placement per v0.2 clarification 1), `decorations`, `composition_begin/end`, anchors (`create/resolve/drop_anchor`), `command`, streaming (`stream_open/append/close` with the tail fast path), `get_text`, `doc_len_utf16`, `revision`. All UTF-16 conversion happens here. |
-| `error` | `CoreError` (`StaleRevision`, `InvalidSplice`, `OutOfBounds`, `SurrogateSplit`, `InvalidRange`, `UnknownStream`). No panics on bad external input. |
+| `commands` | v0.2/v0.3 command planners: pure functions from (overlay, source, target) to minimal splices + post-apply selection, or `None` when a command doesn't apply. See "M1 command decisions" below. |
+| `decorations` | Filters the cached overlay for a viewport (never reparses). Core-side reveal: closed-interval intersection of any selection with the node's reveal extent — the full extent, delimiters included, for inline nodes (so a cursor immediately before/after a delimiter reveals); the whole line for line-prefix marker constructs and the whole fenced block for fence lines (v0.3). Composition rule: conceal spans intersecting the session range are emitted as `mark:delim`. M1 adds the `Block` (blockquote/code-fence/code-block/hr/list-item line chrome) and `Widget` (task checkbox, bullet, ordered) decoration variants, kept separate from the M0 `Line` variant so its shape (and every M0 test matching it) is untouched — see "M1 decoration notes" below. |
+| `editor` | `Editor`: `load`, `apply_edit` (validated multi-splice batches, ascending original-doc coordinates), `undo`/`redo` (returning `CoreChange` incl. cursor placement per v0.2 clarification 1), `decorations`, `composition_begin/end`, anchors (`create/resolve/drop_anchor`), `command`, streaming (`stream_open/append/close` with the tail fast path), `get_text`, `doc_len_utf16`, `revision`. Owns the reparse strategies (`reparse_incremental` / `reparse_tail` / `reparse_with`, counted by `reparse_counts`) — see "Reparse architecture" below. All UTF-16 conversion happens here. |
+| `error` | `CoreError` (`StaleRevision`, `InvalidSplice`, `OutOfBounds`, `SurrogateSplit`, `InvalidRange`, `InvalidArgument`, `UnknownStream`). No panics on bad external input. |
 
 wasm-safety: the core never calls `SystemTime`/`Instant` (they panic on
 `wasm32-unknown-unknown`). `apply_edit` takes an injected `now_ms: f64`;
@@ -38,20 +39,25 @@ deviations:
 - **Reveal intersection is boundary-inclusive** (a cursor touching either end
   of a node's extent reveals it) — matching CM6/Obsidian feel.
 - **Heading delimiter** = the `#` run plus one following space *or tab*
-  (CommonMark allows both).
+  (CommonMark allows both). CommonMark's optional CLOSING sequence —
+  space/tab, a run of `#`, then only spaces/tabs to end of line (`# foo #`;
+  `# foo#` has no preceding space and is content) — is a SECOND delimiter
+  span, concealing/revealing with the same line-level semantics as the
+  opening run.
 - **Inline-code content keeps CommonMark padding spaces** (`` ` x ` `` →
   content ~`" x "`): they are document bytes; only the backtick runs conceal.
 - **Empty edit batches (or all-no-op splices) return the current revision
   unchanged** rather than burning a revision.
 - **`load` on a used editor keeps the revision monotonic** (it returns
   `previous + 1`, which is `1` — "revision 0's successor" — on a fresh core).
-- **Undo coalescing "positionally adjacent"** = the new single splice lies
-  within (or touches the ends of) the region the top undo unit would remove:
-  covers typing runs, insert-at-front, and backspacing over just-typed text.
+- **Undo coalescing** — the new single splice must lie within (or touch the
+  ends of) the region the top undo unit would remove (v0.1 clarification 4
+  as amended in v0.3): covers typing runs, insert-at-front, and backspacing
+  over just-typed text.
 
 ## M1 parser/decoration notes (node & extent decisions the contract leaves open)
 
-The v0.2 contract (docs/boundary-v0.md) specifies *what* to emit per
+The v0.2/v0.3 contract (docs/boundary-v0.md) specifies *what* to emit per
 construct but leaves several node/extent choices open. Decisions made,
 in the order Phase 1 made them:
 
@@ -60,14 +66,20 @@ in the order Phase 1 made them:
   like strong/em); `content` = the link text; a separate `url` field carries
   the destination span, emitted as `mark:url` **only when revealed** (the
   contract's "destination part, emitted only when the link node is
-  revealed"). The destination span is found by scanning source bytes from
-  the closing `)` backward (paren-depth-matched, so `(parens)` inside a URL
-  don't break it) rather than trusting pulldown's `dest_url` payload, which
-  may be normalized/percent-decoded differently from the source; a URL
-  wrapped in `<...>` is unwrapped to just the inner span, and a trailing
-  ` "title"` is excluded from the emitted `mark:url` span. Only
+  revealed"). The destination span is located by a FORWARD parse rather
+  than trusting pulldown's `dest_url` payload (which may be normalized/
+  percent-decoded differently from the source): the opening `[` is matched
+  to its `]` by bracket depth (skipping backslash escapes and backtick code
+  spans, whose contents may hold unbalanced brackets), then
+  `(<ws> destination <ws> title? )` is parsed forward — a backward
+  paren-depth scan from the closing `)` was tried first and mis-pairs
+  parens inside quoted titles (`[t](u "a)b")`, `[t](u "(a")` — both
+  valid). A URL wrapped in `<...>` is unwrapped to just the inner span,
+  and a trailing title (any CommonMark flavor: `"…"`, `'…'`, or `(…)`) is
+  excluded from the emitted `mark:url` span. Anything the forward parse
+  can't follow is defensively dropped rather than mis-spanned. Only
   `LinkType::Inline` is decorated — reference/collapsed/shortcut links and
-  wikilinks parse (the parser "understands more than it decorates") but
+  wikilinks parse (the parser "may understand more than it decorates") but
   emit no M1 node, since the contract only names `[text](url)` and
   autolinks.
 - **Autolinks (`<url>`, `<email>`)** have **no delimiters at all**: `content`
@@ -81,8 +93,9 @@ in the order Phase 1 made them:
   newline excluded, exactly like heading extent) and whose `delims` are
   the `> ` marker run(s) *actually present* at that line's start. A cursor
   on one quoted line reveals only that line's markers, independent of
-  sibling lines — consistent with "reveal per LINE like headings" and with
-  how a view would want to un-hide one line's chrome while editing it.
+  sibling lines — consistent with the contract's line-level marker reveal
+  (v0.3, which matches heading semantics) and with how a view would want
+  to un-hide one line's chrome while editing it.
 - **Blockquote depth is computed by span overlap, not by counting `>`
   characters on the line.** Nesting depth intervals are recorded when each
   `BlockQuote` node starts (pulldown's `Start` event already reports the
@@ -106,33 +119,64 @@ in the order Phase 1 made them:
   closing fence line only if one is actually present and matches the
   opening fence's char+length), not from pulldown's `Text` event payloads —
   robust to however many `Text` events pulldown emits for the body, and
-  byte-exact regardless. Fences (`line:code-fence`) are never concealed in
-  M1 per the contract ("Fences stay visible... styled only"); body lines
-  get both `line:code-block` and `mark:code` over their content, with no
-  delimiters (so no reveal predicate applies to code blocks at all).
+  byte-exact regardless. The enclosing containers' per-line prefix
+  (blockquote `> ` runs and/or the opening fence's own list-item indent) is
+  stripped BEFORE classifying fence vs. body lines and before emitting
+  spans: without it, `> ``` ` fails closing-fence detection and falls
+  through as a body line, a list-nested closing fence can carry >= 4
+  leading spaces (defeating the 3-space allowance), and body `mark:code`
+  would cover marker/indent bytes that belong to the containers' own
+  decorations. Fence lines emit `line:code-fence`, and the raw fence text
+  (``` + info string) CONCEALS with BLOCK-level reveal per the contract: a
+  cursor/selection anywhere inside the fenced block (either fence or the
+  body — the fence nodes' reveal extent is the whole fence-to-fence range)
+  reveals both raw fences as `mark:delim`, so they are editable whenever
+  the block is. Body lines get both `line:code-block` and `mark:code` over
+  their content, with no delimiters of their own.
 - **List item marker extent is found by lookahead to the next parse event**,
   not by re-deriving CommonMark's marker-width rule from bytes: the width
   of `- `/`1. `/`1) ` (and how many spaces of indentation belong to the
   marker vs. count as the item's own indentation) is exactly what pulldown
   has already computed correctly by locating where the item's real content
   begins — reimplementing that byte-scanning rule independently would be
-  redundant and a likely source of subtle bugs. This is the one M1
-  construct that isn't resolved purely from a single event's span.
-- **Task widget reveal extent is the *list item's* marker extent** (bullet
-  through the closing `]`, e.g. `"- [ ]"`), not just the checkbox's own span
-  (`"[ ]"`) — per the contract ("task widget reveal keys off the list
-  item's marker extent"), so that clicking the *rendered* checkbox widget
-  (which sits inside that larger byte range) still counts as touching the
-  node and reveals it on the next selection-driven recompute.
-- **List markers are never reveal-gated at all** — they're modelled as a
-  `ListMarker` node with empty `delims`/`content`, handled by its own
-  branch in `decorations::compute` that unconditionally emits `mark:list-
-  marker` over the node's extent, bypassing the conceal/reveal machinery
-  entirely (matches "always visible, styled, never concealed").
+  redundant and a likely source of subtle bugs. The lookahead is CLAMPED to
+  the marker's own line: when the marker line has no content of its own
+  (`"-\n  foo"`), the next event starts on a later line and the raw
+  lookahead would sweep the terminator and the following line's indent into
+  the marker span — a bullet widget would then conceal the newline and
+  visually merge two lines. An EMPTY item (`"- \n"`, a bare `"-"`) produces
+  no anchoring event at all, so its marker token is SYNTHESIZED from the
+  source bytes at `End(Item)` — empty items still decorate, keep their slot
+  in the ordered sequence, and stay visible to the `enter` command. This is
+  the one M1 construct that isn't resolved purely from a single event's
+  span.
+- **Task widget reveal extent is the item's whole first line** (v0.3
+  line-level marker reveal, matching headings): a cursor/selection touching
+  any part of the line — including clicking the *rendered* checkbox widget,
+  which sits inside it — reveals the checkbox as `mark:delim`, with the
+  item's `- ` marker concealing/revealing in lockstep.
+- **List markers reveal-gate as widgets, LINE-level** — modelled as a
+  `ListMarker` node with empty `delims`/`content` whose reveal extent is
+  the item's whole first line, handled by its own branch in
+  `decorations::compute`: concealed, an unordered marker emits
+  `widget:bullet` and an ordered marker `widget:ordered` (carrying the
+  view-computed sequence number + delimiter, v0.3) over the whole marker
+  span; revealed (cursor/selection anywhere on the line) or under active
+  composition, the raw marker emits as `mark:list-marker` instead. A task
+  item's `- ` run is the exception: it conceals/reveals as `mark:delim` in
+  lockstep with its checkbox (the widget alone represents the item). Every
+  item line additionally emits a `line:list-item` decoration with depth and
+  `revealed`; nested items (depth >= 2) get a conceal (revealed:
+  `mark:delim`) over their raw leading indent.
+- **Strikethrough delimiter runs are read from the source**: GFM parses
+  both `~x~` and `~~x~~` as strikethrough, so the run length (1 or 2) is
+  taken from the bytes, never assumed to be 2. (The canonical wrap the
+  `toggleStrike` command inserts is still `~~`.)
 - **GFM options enabled**: `ENABLE_STRIKETHROUGH`, `ENABLE_TASKLISTS`,
   `ENABLE_TABLES`, `ENABLE_FOOTNOTES`. Tables and footnotes parse (so they
   don't corrupt surrounding block structure) but emit no M1 node — "parser
-  may understand more than it decorates" (plan.md §5.2). `ENABLE_GFM`
+  may understand more than it decorates" (the contract's M1 emission
+  scope). `ENABLE_GFM`
   itself (alert-tagged blockquotes: `[!NOTE]` etc.) and
   `ENABLE_SMART_PUNCTUATION` are deliberately **not** enabled — out of the
   M1 markdown scope (plan.md §6) and, for smart punctuation specifically,
@@ -144,10 +188,16 @@ in the order Phase 1 made them:
 enter the op log with origin `command`, never coalesce, and return
 `CoreChange { revision, splices (current-doc UTF-16), selection }`.
 
+- **Inline toggles refuse multi-block ranges**: a from/to spanning more than
+  one leaf block throws `InvalidArgument` instead of planning — the wrapped
+  text could never parse as one inline node, and a re-toggle would stack
+  delimiters. A thrown command never mutates (contract: views treat it as a
+  consumed no-op, not a desync), so the caller can tell "refused" from
+  "didn't apply" (`None`).
 - **Inline toggle OFF** when a same-kind node's closed extent fully contains
   the target range; the *innermost* such node when several nest (`_a *b* c_`
   + toggleEm in `b` unwraps `*b*`). Delimiters strip whatever their source
-  flavor (`__`, `_`, longer backtick runs).
+  flavor (`__`, `_`, `~`, longer backtick runs).
 - **Inline toggle ON/EXTEND** otherwise: the range unions with every
   same-kind node it *touches* (closed intersection — adjacency merges rather
   than stacking `****`), touched nodes' delimiters strip, one canonical pair
@@ -193,7 +243,7 @@ enter the op log with origin `command`, never coalesce, and return
   insertion split around it so no foreign unit ever deletes streamed text).
   Undo after close therefore reverts exactly the streamed spans (mapped),
   in one step, without touching user edits made during the stream — the
-  clarified "sound behavior".
+  behavior v0.2 clarification 2 pins.
 - Documented edge: undoing the stream's unit *while the stream is open*
   moves it to the redo stack; the next append starts a fresh unit (and
   clears redo). The one-unit guarantee is per uninterrupted-by-undo stream
@@ -204,8 +254,10 @@ enter the op log with origin `command`, never coalesce, and return
 - `stream_open` positions are strict (they become insertion points).
 - **Tail fast path**: a single-insertion append landing at/after the LAST
   top-level block's start (when that block starts at a line boundary —
-  indented code blocks don't, and fall back) re-parses only
-  `[tail_block_start, end)` and splices overlay + block index. Documented
+  indented code blocks don't — and the first-line merge-hazard guards
+  shared with `apply_edit` pass; see "Reparse architecture" below;
+  otherwise the append falls back to the incremental reparse) re-parses
+  only `[tail_block_start, end)` and splices overlay + block index. Documented
   Phase-A assumption: a standalone parse of that slice is
   decoration-equivalent because top-level markdown blocks are
   prefix-independent at line granularity; the whole-document couplings
@@ -213,21 +265,51 @@ enter the op log with origin `command`, never coalesce, and return
   M1 doesn't decorate. A fuzz-style test asserts fast-path overlay ==
   full-reparse overlay after streaming markdown across block boundaries.
 
-## Known deviations / Phase-A caveats
+## Reparse architecture (the contract's complexity clause)
 
-1. **`applyEdit` complexity**: the contract says O(edit + dirty block); Phase
-   A reparses the whole document per edit, i.e. O(doc). Sanctioned by plan.md
-   §5.2 ("full reparse per edit is single-digit-ms up to ~100KB — fine for v1
-   and honest about it"); the M0 gate is the measured budget, and Phase B
-   (block-incremental parser) replaces this behind the same contract.
-   Measured (native, release, incl. the M1 block-index update — still ONE
-   pulldown pass per edit): mean ~440µs / p95 ~900µs per apply+decorations
-   on a dense ~100 KB doc. Stream appends via the tail fast path: mean
-   ~17µs / p95 ~31µs per ~50-char chunk over 2000 chunks.
-2. Nothing else — the boundary surface, semantics, and error behavior follow
-   `docs/boundary-v0.md` including the v0.2 clarifications (CoreChange
-   return shape for undo/redo, stream undo grouping, list-marker spans with
-   trailing whitespace, link delim/url/delim reveal pieces).
+The contract's "O(edit + dirty block), not O(doc)" clause holds via three
+strategies, dispatched per text change in `editor.rs` (`reparse_counts`
+exposes which fired, so tests can assert the fast paths actually run rather
+than silently full-reparsing):
+
+- **Tail fast path** (`reparse_tail`): a single-splice edit or stream append
+  landing at/after the last top-level block's start (with guards against the
+  de-interruption/setext/indent-capture merge hazards — see
+  `tail_edit_fast_path_region`'s doc comment) reparses only
+  `[tail_block_start, end)` and splices overlay + block index.
+- **Windowed incremental reparse** (`reparse_incremental`): everything else —
+  `apply_edit`, `undo`/`redo`, and every `command` route here. Dirty window =
+  one top-level block of slack above the edit, extended below until the fresh
+  parse's block boundaries realign with the old ones; fresh nodes/blocks are
+  spliced into the cached overlay, the untouched suffix's spans are rebased
+  by the edit's delta, and block IDs are re-matched through the ordinary
+  `BlockIndex::update`.
+- **Degrade cases**: edits whose effect cannot realign with any downstream
+  block boundary (canonically, toggling a code fence open mid-document)
+  reparse from the window start to the end of the document — correctness
+  first. `reparse_with` (full document) remains only for `load` and as the
+  no-block-index fallback.
+
+Honest asymptotics: parse work is O(edit + dirty window); the suffix
+rebase/ID re-match bookkeeping remains O(doc) with a small constant
+(~0.1µs/KB measured). Every strategy is equivalence-gated node-for-node /
+span-for-span against a from-scratch parse
+(`tests/reparse_equivalence.rs` — fuzzed, runs un-ignored in CI). The known
+whole-document couplings a windowed parse cannot see (link reference
+definitions, footnote definitions) affect only constructs M1 does not
+decorate — the same documented assumption as the tail fast path. Measured
+(native, release; research/08 "After" section): mid-document single-char
+`apply_edit` ~13µs at 100KB / ~31µs at 300KB; apply+decorations combined
+p95 ~56µs at 100KB; tail-path stream appends mean ~5-6µs per chunk.
+
+## Known deviations
+
+None — the boundary surface, semantics, complexity, and error behavior
+follow `docs/boundary-v0.md` including the v0.2 clarifications (CoreChange
+return shape for undo/redo, stream undo grouping, list-marker spans with
+trailing whitespace, link delim/url/delim reveal pieces) and the v0.3
+amendments (line-level marker reveal, `widget:ordered`, `enter`, the
+undo-coalescing region rule, the surrogate payload rules).
 
 ## Tests
 

@@ -4,6 +4,10 @@ The minimum contract between `oxidown-core` and a platform view, for the M0 spik
 This document is authoritative: if the Rust core and the TypeScript view disagree, the one that
 matches this file wins; if this file is wrong, change it in the same PR as the code.
 
+Current contract version: **v0.3** — the base v0 sections below are followed by the v0.1
+clarifications, the v0.2 (M1) additions, and inline v0.3 amendments; the "v0.3 changelog"
+section at the end enumerates exactly what v0.3 comprises.
+
 Web-boundary flavor: **all positions in this protocol are UTF-16 code units** (CodeMirror's unit).
 The wasm crate converts to core-internal UTF-8 byte offsets. Core internals never leak bytes.
 
@@ -43,7 +47,7 @@ export interface DecorationMark {
 export interface DecorationConceal {
   kind: "conceal";
   from: number;
-  to: number; // delimiter chars to visually collapse — views must NOT remove them from the DOM
+  to: number; // delimiter chars to conceal — they stay in the DOCUMENT (see "Rules for the view")
 }
 export interface DecorationLine {
   kind: "line";
@@ -114,8 +118,20 @@ Nesting (`**bold *italic***`) must work; reveal applies per-node, not per-line.
 
 ## Rules for the view (from research/01 §4 — the anti-flicker playbook)
 
-- Conceal by **visual collapse** (e.g. `font-size: 0.01em` + `letter-spacing`), never by removing
-  characters from the DOM: line heights must not change between concealed and revealed states.
+- Concealment is a rendering choice; what is protected are these invariants *(restated as a
+  v0.3 amendment — the original rule mandated visual collapse, e.g. `font-size: 0.01em` +
+  `letter-spacing`, and forbade removing characters from the DOM)*:
+  1. the **document text is the source of truth** — concealed characters remain in the
+     document (copy, positions, and edits all see them; the view never mutates text to hide it);
+  2. **no vertical layout shift** — line heights must not change between concealed and
+     revealed states;
+  3. the **caret remains addressable at concealed positions** — a cursor placed inside or at
+     the edge of a concealed span must have well-defined, visible coordinates.
+  Replace-based concealment (e.g. CM6 `Decoration.replace`, Obsidian's mechanism) that
+  preserves those invariants is explicitly permitted; the CM6 view uses it, because the
+  visual-collapse CSS hack itself violated invariant 3 (hidden-but-laid-out inner text gave
+  `coordsAtPos` phantom x-positions at conceal boundaries — the caret vanished or floated;
+  see the rationale at `packages/oxidown-view-cm6/src/extension.ts`'s `concealDeco`).
 - Do not rebuild decorations mid mouse-drag; recompute on drag end.
 - Do not request/rebuild decorations while `EditorView.composing` is true; recompute on
   composition end. Pair with `compositionBegin`/`compositionEnd` calls into the core.
@@ -156,8 +172,13 @@ fast-path below.
    Views must not depend on which node owns which delimiter characters beyond what the emitted
    spans say. (The MockCore currently emits strong-outer — a known, documented deviation; the
    wasm core is authoritative.)
-4. **Undo-coalescing adjacency:** a new edit coalesces if its `[at, at + delete]` range touches
-   the previous edit's end position. Multi-splice batches never coalesce.
+4. **Undo-coalescing adjacency** *(amended in v0.3 — the original wording, "touches the
+   previous edit's end position", was narrower than the pinned rule)*: a consecutive
+   `user`/`ime` edit coalesces when it is a single splice falling entirely within (or touching
+   the ends of) the region the top undo unit's undo would remove — which covers typing runs,
+   insert-at-front, and backspace runs over just-typed text. Multi-splice batches never
+   coalesce. A coalesce that shrinks the unit's inverse to a pure no-op (type a character,
+   backspace it) drops the unit from history entirely.
 5. **`undo`/`redo` origins** never flow through `applyEdit` (views apply history splices under a
    skip annotation). Cores must still treat them defensively as isolated non-coalescing units.
 6. **Heading reveal extent** is the whole heading line: a cursor anywhere on the line reveals
@@ -186,9 +207,16 @@ widget kinds they don't recognize (forward compatibility).
 export interface DecorationLineV2 {
   kind: "line";
   at: number;
-  style: "h1"|"h2"|"h3"|"h4"|"h5"|"h6"|"blockquote"|"code-block"|"code-fence"|"hr";
-  /** blockquote nesting depth (1-based); present only for style "blockquote". */
+  style: "h1"|"h2"|"h3"|"h4"|"h5"|"h6"|"blockquote"|"code-block"|"code-fence"|"hr"|"list-item";
+  /** Nesting depth (1-based); present for styles "blockquote" and "list-item". */
   depth?: number;
+  /**
+   * "blockquote"/"list-item" only: the line is revealed (a cursor/selection
+   * touches it — see "Marker reveal is LINE-level" below), so the view drops
+   * the line's decorative padding/bars and renders source geometry.
+   * Omitted from the wire when false.
+   */
+  revealed?: boolean;
 }
 export interface DecorationWidget {
   kind: "widget";
@@ -579,3 +607,66 @@ Rules:
 Stale revision, overlapping splices, or out-of-bounds positions: throw (wasm: `Err` → JS
 exception). The view treats any core exception as a mirror-desync emergency: re-`load()` from
 the view buffer and log loudly. Never continue silently.
+
+Two validation-refusal error names (v0.3):
+
+- `InvalidArgs` — thrown by the wasm adapter/mock argument layer, before dispatch, when a raw
+  argument is malformed (non-integer or negative numbers, a missing command argument, a
+  `setHeading` level outside 0–6 at the boundary).
+- `InvalidArgument` — thrown by the core when a value is semantically outside its documented
+  domain (e.g. a heading level above 6 at the core API; an inline-toggle range spanning more
+  than one leaf block).
+
+Both are refusals thrown WITHOUT mutating the core; callers should treat them as consumed
+no-ops (log and move on — never fall back to a default action, never resync), per the
+Commands section's no-mutation-on-throw rule.
+
+## Unpaired surrogates in payloads (v0.3 addition)
+
+Complementing v0.1 clarification 7 (which governs splice *positions*), the document TEXT
+itself never contains an unpaired surrogate code unit:
+
+- `load` and `applyEdit` throw `InvalidPayload: ...` when a text payload carries a lone
+  surrogate (enforced at the adapter/mock layer, before the text crosses the boundary —
+  wasm-bindgen's string conversion would otherwise silently corrupt it to U+FFFD).
+- `streamAppend` buffers a TRAILING lone high surrogate per stream (adapter/mock behavior: a
+  producer chunking at fixed UTF-16 lengths can split a surrogate pair across chunks); the
+  withheld code unit is prepended to the next chunk. A lone surrogate anywhere else in a
+  chunk throws `InvalidPayload: ...` (and clears the stream's pending buffer).
+- `streamClose` flushes a still-pending high surrogate as one U+FFFD before closing — it can
+  never be completed, and the document invariant must hold.
+- Empty chunks — including a chunk fully withheld as a pending surrogate — and all-no-op edit
+  batches return with the revision unchanged and create no undo unit.
+
+---
+
+# v0.3 changelog
+
+**The current version of this contract is v0.3.** v0.3 is additive/amending on top of
+v0.2 and, following the same in-place convention as the v0.2 clarifications, its items live
+inline in the sections above, each tagged "(v0.3 amendment)" or "(v0.3 addition)". The full
+list:
+
+- **Line-level marker reveal** — the reveal extent of every line-prefix marker construct
+  (blockquote runs, list markers, task marker pairs, nested leading indent) is the construct's
+  whole line, replacing v0.2's glyph-adjacency/piecewise model. See "Marker reveal is
+  LINE-level" under the M1 emission scope.
+- **`widget:ordered`** — view-computed ordered-list numbering; concealed ordered markers are a
+  computed-value widget carrying `number`/`delim`, and the core never rewrites source digits.
+  See "Ordered-list numbering is a computed-value WIDGET".
+- **The `enter` command** — construct-aware Enter (continue a list marker/quote prefix on
+  non-empty content; exit an EMPTY one in a single press), plus the empty-item parser note
+  shipped with it. See "`enter` (v0.3 addition)".
+- **Replace-based concealment permitted** — the conceal rule in "Rules for the view" is
+  restated as the invariants it protects (document text is the source of truth; no vertical
+  layout shift; caret addressable at concealed positions), and replace decorations preserving
+  them are explicitly allowed.
+- **Undo-coalescing region rule** — v0.1 clarification 4 amended: a single-splice `user`/`ime`
+  edit coalesces when it falls within (or touches the ends of) the top undo unit's undo
+  region, not merely when it touches the previous edit's end position.
+- **Error names `InvalidArgs` / `InvalidArgument`** — argument-layer vs. core-level semantic
+  validation refusals; both consumed no-ops. See "Error handling".
+- **Unpaired-surrogate payload rules** — see "Unpaired surrogates in payloads" above.
+- **Incremental-reparse complexity note** — the amendment under "Performance budget" pinning
+  how `applyEdit`'s "O(edit + dirty block)" clause holds (windowed reparse, realignment,
+  documented degrade cases).

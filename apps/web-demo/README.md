@@ -45,9 +45,11 @@ it all in one step).
 
 Select some text and press **Mod-B** (bold), **Mod-I** (italic),
 **Mod-Shift-X** (strikethrough), or **Mod-E** (inline code) to toggle
-delimiters via `core.command(...)` instead of typing them by hand. Toggling
-twice returns the exact original bytes (round-trip tested in the library
-suite).
+delimiters via `core.command(...)` instead of typing them by hand. For
+canonical delimiter flavors (`**`, `*`, `~~`, matching backtick runs),
+toggling twice returns the exact original bytes (round-trip tested in the
+library suite); non-canonical flavors normalize on the way back — e.g.
+`__x__` deliberately re-wraps as `**x**` (see `crates/oxidown-core/README.md`).
 
 ### Task lists
 

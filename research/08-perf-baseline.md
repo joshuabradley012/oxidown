@@ -6,6 +6,8 @@
 
 ## 0. Headline finding, up front
 
+> **Since fixed** — see "After: results with the staged optimizations" at the end of this report; this section records the pre-fix baseline that motivated the work.
+
 **`Editor::apply_edit` has no fast path at all, for any edit position.** The tail fast path (`tail_fast_path_region` / `reparse_tail`) exists in `crates/oxidown-core/src/editor.rs`, but it is wired into exactly one caller: `stream_append` (the AI-streaming ingestion API). The interactive, every-keystroke path — `apply_edit`, called by the view for every user edit — unconditionally calls `reparse_with`, a full `parser::parse_document` pass over the **entire current document**, regardless of whether the edit is at the start, middle, or end. This was confirmed two ways:
 
 1. **Code reading**: `apply_edit` (editor.rs line 173) calls `self.reparse_with(&batch)` unconditionally — no position check, no branch to `reparse_tail`. Only `stream_append` (line 416-421) checks `tail_fast_path_region` first.
