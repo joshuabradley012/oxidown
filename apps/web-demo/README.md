@@ -1,11 +1,12 @@
 # Oxidown web demo (M0 + M1)
 
-Full-page CodeMirror 6 editor wired to an Oxidown core through the boundary
-protocol (`docs/boundary-v0.md`, v0 + the v0.2/M1 additions). By default it
-runs against the TypeScript `MockCore`; add `?core=wasm` to the URL to try the
-real Rust/wasm core once `crates/oxidown-wasm/pkg` has been built (it falls
-back to the mock with a visible banner otherwise). Streaming, commands, and
-task checkboxes all work identically against either core.
+Full-page CodeMirror 6 editor wired to the Oxidown Rust/wasm core through the
+boundary protocol (`docs/boundary-v0.md`, v0 + the v0.2/M1 additions). The
+wasm core is the only core — the TypeScript `MockCore` that older revisions
+fell back to is retired — so `crates/oxidown-wasm/pkg` must be built before
+running the demo; if it's missing or fails to load, the page shows a clear
+error instead of an editor (no silent fallback). A stale `?core=wasm` query
+param in old bookmarks is harmless and ignored.
 
 ## Run
 
@@ -13,11 +14,14 @@ From the repo root:
 
 ```sh
 pnpm install
+pnpm build:wasm   # builds crates/oxidown-wasm → pkg (requires wasm-pack)
 pnpm dev          # builds @oxidown/view-cm6, then serves this app
 ```
 
 Open the printed URL (default http://localhost:5173). `pnpm -r build` builds
-everything; `pnpm -r test` runs the library tests.
+everything; `pnpm -r test` runs the library tests (they also need the wasm
+pkg — the behavior suites run against the real core and fail loudly without
+it).
 
 ## What to test manually
 

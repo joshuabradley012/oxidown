@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ChangeSet, Text } from "@codemirror/state";
-import { changesToSplices, endOfLastSplice } from "../src/splices";
-import { applySplices } from "../src/mock-core";
+import { applySplices, changesToSplices, endOfLastSplice } from "../src/splices";
 
 /** mulberry32 — small deterministic PRNG for property-style tests. */
 function mulberry32(seed: number): () => number {

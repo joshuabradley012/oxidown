@@ -8,6 +8,23 @@ Current contract version: **v0.4** — the base v0 sections below are followed b
 clarifications, the v0.2 (M1) additions, and inline v0.3/v0.4 amendments; the "v0.3 changelog"
 and "v0.4 changelog" sections at the end enumerate exactly what each version comprises.
 
+**Testing strategy.** The Rust/wasm core (`crates/oxidown-wasm`, wrapped by
+`packages/oxidown-view-cm6/src/wasm-core.ts`) is the ONLY implementation of this contract — there
+is no longer a second, hand-maintained TypeScript reference core. Every test that asserts
+CONTRACT BEHAVIOR (decorations, reveal, commands, numbering, undo/redo/coalescing, streaming,
+anchors, composition) runs directly against the real wasm core, loaded Node-side in vitest via
+`initSync` over the built `.wasm` bytes (`packages/oxidown-view-cm6/test/wasm-loader.ts`); those
+tests fail loudly if `crates/oxidown-wasm/pkg` hasn't been built, rather than skip. A separate,
+deliberately dumb `StubCore` (`packages/oxidown-view-cm6/test/stub-core.ts` — a plain text buffer
+with no markdown knowledge, whole-text-snapshot undo, and scriptable per-method hooks) exists only
+for the CM6 view's WIRING tests — change forwarding, skip annotations, desync recovery, keymap
+fallback, and the like — where a fast, fully-scriptable double is more useful than a real parser.
+Earlier drafts of this document and its test suite used a third option, a hand-written `MockCore`
+that reimplemented this whole contract in TypeScript; it was retired (pre-1.0) once the wasm core
+was fast and stable enough for every test to depend on it directly — a from-scratch parity
+implementation was pure double-implementation tax, and its behavior drifted from the authoritative
+core more than once (e.g. `***x***` nesting, below).
+
 Web-boundary flavor: **all positions in this protocol are UTF-16 code units** (CodeMirror's unit).
 The conversion to core-internal UTF-8 byte offsets happens inside `oxidown-core` itself — every
 public `Editor` entry point converts on the way in and out (editor.rs `utf16_to_byte*` /
@@ -196,8 +213,7 @@ fast-path below.
    calls on the same instance (stale revision numbers are never re-issued).
 3. **`***x***`:** per CommonMark, emphasis is the outer node (`<em><strong>x</strong></em>`).
    Views must not depend on which node owns which delimiter characters beyond what the emitted
-   spans say. (The MockCore currently emits strong-outer — a known, documented deviation; the
-   wasm core is authoritative.)
+   spans say.
 4. **Undo-coalescing adjacency** *(amended in v0.3 — the original wording, "touches the
    previous edit's end position", was narrower than the pinned rule)*: a consecutive
    `user`/`ime` edit coalesces when it is a single splice falling entirely within (or touching
@@ -508,9 +524,8 @@ the open outer ordered list, now sit against the new top-level bullet list, wher
 marker cannot start a list → it de-lists without ever being edited.
 
 To prevent both, after computing the batch (indent AND outdent alike), TWO lines are checked
-with one deterministic structural rule (identical in the Rust core and the mock — a shared rule,
-not post-hoc parser validation, so both cores agree even where their parsers differ in
-leniency):
+with one deterministic structural rule (a single rule the command applies directly, not post-hoc
+parser validation):
 
 1. the FIRST affected line (the moved item itself), at its new column;
 2. the first UNAFFECTED list-item line BELOW the affected set, at its own (unchanged) column —
@@ -666,7 +681,7 @@ Rules:
   mutated the core but the change was silently dropped, desyncing the view's mirror. Returns
   `null` in the common nothing-pending case. The flush edit belongs to the STREAM'S single undo
   unit (it is the stream's last append), not a unit of its own. The surrogate buffering — and
-  therefore the flush — lives at the adapter/mock layer: the raw wasm binding never buffers
+  therefore the flush — lives at the TS adapter layer: the raw wasm binding never buffers
   (surrogate policy is enforced JS-side before text crosses the boundary), so its own
   `streamClose` has nothing to return; the TS adapter produces the returned change.
 
@@ -718,42 +733,38 @@ Position arguments are additionally bounded to `u32::MAX` at the wasm boundary (
 `usize` is 32 bits; a larger value would otherwise silently truncate — `2^32 + 6` becoming
 `6` — and edit the wrong range). Since any integer above `u32::MAX` is necessarily beyond the
 document, such a position throws the ordinary `OutOfBounds: position X beyond document length
-Y (UTF-16 code units)` — the same error the mock, whose numbers have no 32-bit cliff, reaches
-via its document-bounds check. Positions are NEVER silently truncated, wrapped, or clamped.
-This applies equally to positions INSIDE structured JSON payloads (splice `at`/`delete`,
-selection `anchor`/`head`): malformed values (negative, non-integral) throw `InvalidPayload`
-with the `malformed splices` / `malformed selections` message, while well-formed integers
-above `u32::MAX` or beyond the document throw the ordinary `OutOfBounds` — identical names
-and messages on both cores.
+Y (UTF-16 code units)` directly off the core's own document-bounds check. Positions are NEVER
+silently truncated, wrapped, or clamped. This applies equally to positions INSIDE structured
+JSON payloads (splice `at`/`delete`, selection `anchor`/`head`): malformed values (negative,
+non-integral) throw `InvalidPayload` with the `malformed splices` / `malformed selections`
+message, while well-formed integers above `u32::MAX` or beyond the document throw the ordinary
+`OutOfBounds`.
 
 Validation-refusal error names (v0.3):
 
-- `InvalidArgs` — thrown by the wasm adapter/mock argument layer, before dispatch, when a raw
+- `InvalidArgs` — thrown by the wasm adapter's argument layer, before dispatch, when a raw
   argument is malformed (non-integer or negative numbers, a missing command argument, a
   `setHeading` level outside 0–6 at the boundary).
 - `InvalidArgument` — thrown by the core when a value is semantically outside its documented
   domain (e.g. a heading level above 6 at the core API; an inline-toggle range spanning more
   than one leaf block; a command position splitting a CRLF pair — v0.4).
-- `InvalidPayload` — thrown by the adapter/mock payload layer when a STRUCTURED payload is
+- `InvalidPayload` — thrown by the adapter's payload layer when a STRUCTURED payload is
   malformed before it can cross the boundary: mis-shaped or non-serializable `splices` /
-  `selections` (e.g. a negative or non-integer field — wasm:
-  ``InvalidPayload: malformed splices: invalid value: integer `-1`, expected u32``; the mock
-  mirrors the name and `malformed splices` / `malformed selections` prefixes), and text
+  `selections` (e.g. a negative or non-integer field —
+  ``InvalidPayload: malformed splices: invalid value: integer `-1`, expected u32``), and text
   payloads carrying unpaired surrogates (see "Unpaired surrogates in payloads" below).
 - `InvalidOrigin` — thrown by `applyEdit` when the `origin` string is not a documented
   `EditOrigin` value.
 - `InvalidBias` — thrown by `createAnchor` when the bias is not `"before"` / `"after"`.
 - `InvalidCommand` — thrown by `command` when the command name is unknown.
 
-`applyEdit` validates in a pinned order (identical on mock and wasm): malformed
+`applyEdit` validates in a pinned order: malformed
 `baseRevision` (`InvalidArgs`) → staleness (`StaleRevision`) → splice payload (surrogate
 inserts, malformed numbers, ordering, bounds) → origin (`InvalidOrigin`) → apply-time
 surrogate-split check (`SurrogateSplit`). A call that is simultaneously stale AND
 payload-malformed therefore throws `StaleRevision`.
 
-`decorations` likewise validates in a pinned order (v0.4 — identical on mock and wasm, closing
-a divergence where the wasm layer checked the selections payload first and the two cores threw
-DIFFERENT names, in different handling classes, for the same doubly-invalid call): malformed
+`decorations` likewise validates in a pinned order (v0.4 clarification): malformed
 `revision` (`InvalidArgs`) → staleness (`StaleRevision`) → malformed `from`/`to`
 (`InvalidArgs`) → viewport range (`InvalidRange`: `from > to`) → viewport bounds
 (`OutOfBounds`) → per-selection malformed fields (`InvalidPayload`) → per-selection bounds
@@ -788,9 +799,9 @@ Complementing v0.1 clarification 7 (which governs splice *positions*), the docum
 itself never contains an unpaired surrogate code unit:
 
 - `load` and `applyEdit` throw `InvalidPayload: ...` when a text payload carries a lone
-  surrogate (enforced at the adapter/mock layer, before the text crosses the boundary —
+  surrogate (enforced at the TS adapter layer, before the text crosses the boundary —
   wasm-bindgen's string conversion would otherwise silently corrupt it to U+FFFD).
-- `streamAppend` buffers a TRAILING lone high surrogate per stream (adapter/mock behavior: a
+- `streamAppend` buffers a TRAILING lone high surrogate per stream (adapter behavior: a
   producer chunking at fixed UTF-16 lengths can split a surrogate pair across chunks); the
   withheld code unit is prepended to the next chunk. A lone surrogate anywhere else in a
   chunk throws `InvalidPayload: ...` (and clears the stream's pending buffer).

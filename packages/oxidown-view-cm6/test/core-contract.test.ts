@@ -1,13 +1,42 @@
-import { describe, expect, it } from "vitest";
-import { MockCore, applySplices } from "../src/mock-core";
+/**
+ * Contract-behavior suite, run against the REAL Rust/wasm core — the only
+ * implementation of docs/boundary-v0.md. Ported from the retired MockCore's
+ * test file (test/mock-core.test.ts, deleted together with src/mock-core.ts):
+ * every assertion that pinned CONTRACT behavior (decorations, reveal,
+ * commands, numbering, undo/redo/coalescing, streaming, anchors, composition)
+ * lives on here 1:1; the handful of spots where the mock deviated from the
+ * authoritative core (noted inline, e.g. `***x***` nesting) now assert the
+ * CORE's behavior.
+ *
+ * Clock control: the mock took an injected `now()`; the wasm core reads
+ * `Date.now()` through js_sys, so the undo-coalescing suites fake the Date
+ * global instead (vi.useFakeTimers + setSystemTime) — same determinism,
+ * production code path.
+ *
+ * Loading: test/wasm-loader.ts — fails LOUDLY (naming `pnpm build:wasm`)
+ * when crates/oxidown-wasm/pkg is missing; never skips.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { loadWasmCoreFactory } from "./wasm-loader";
+import { applySplices } from "../src/splices";
 import type { Decoration, RangeCommandName, SelectionRange, Splice } from "../src/protocol";
 
+const makeWasmCore = await loadWasmCoreFactory();
+
+// Fake ONLY the Date global (the coalescing window reads Date.now via
+// js_sys::Date); timers stay real — nothing here schedules any.
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"], now: 0 });
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 function makeCore(text: string) {
-  let t = 0;
-  const core = new MockCore({ now: () => t });
+  const core = makeWasmCore();
   const clock = {
     advance(ms: number) {
-      t += ms;
+      vi.setSystemTime(Date.now() + ms);
     },
   };
   core.load(text);
@@ -22,7 +51,7 @@ const marks = (ds: Decoration[], style?: string) =>
   ds.filter((d) => d.kind === "mark" && (style === undefined || d.style === style));
 const lines = (ds: Decoration[]) => ds.filter((d) => d.kind === "line");
 
-describe("MockCore decorations — M0 set", () => {
+describe("core decorations — M0 set", () => {
   it("ATX headings h1–h6: line decoration + conceal over hashes and following space", () => {
     for (let level = 1; level <= 6; level++) {
       const hashes = "#".repeat(level);
@@ -105,17 +134,21 @@ describe("MockCore decorations — M0 set", () => {
     ]);
   });
 
-  it("***both*** parses as strong+em over the same content", () => {
+  it("***both*** parses as em OUTSIDE strong (CommonMark; v0.1 clarification 3)", () => {
+    // ADAPTED from the mock port: the retired MockCore emitted strong-outer
+    // here — a documented deviation the contract explicitly flagged. The
+    // authoritative core follows CommonMark: <em><strong>x</strong></em>,
+    // so the em mark spans [1, 9) and the strong mark sits inside at [3, 7).
     const doc = "***both*** end";
     const { core } = makeCore(doc);
     const ds = core.decorations(core.revision(), 0, doc.length, cursor(14));
-    expect(marks(ds, "strong")).toEqual([{ kind: "mark", from: 2, to: 8, style: "strong" }]);
-    expect(marks(ds, "em")).toEqual([{ kind: "mark", from: 3, to: 7, style: "em" }]);
+    expect(marks(ds, "em")).toEqual([{ kind: "mark", from: 1, to: 9, style: "em" }]);
+    expect(marks(ds, "strong")).toEqual([{ kind: "mark", from: 3, to: 7, style: "strong" }]);
     expect(conceals(ds)).toEqual([
-      { kind: "conceal", from: 0, to: 2 },
-      { kind: "conceal", from: 2, to: 3 },
-      { kind: "conceal", from: 7, to: 8 },
-      { kind: "conceal", from: 8, to: 10 },
+      { kind: "conceal", from: 0, to: 1 },
+      { kind: "conceal", from: 1, to: 3 },
+      { kind: "conceal", from: 7, to: 9 },
+      { kind: "conceal", from: 9, to: 10 },
     ]);
   });
 
@@ -154,7 +187,7 @@ describe("MockCore decorations — M0 set", () => {
   });
 });
 
-describe("MockCore reveal predicate", () => {
+describe("core reveal predicate", () => {
   const doc = "a **b** c"; // strong node extent [2, 7)
   const revealDs = (pos: number) => {
     const { core } = makeCore(doc);
@@ -220,7 +253,7 @@ describe("MockCore reveal predicate", () => {
   });
 });
 
-describe("MockCore text mirror and revisions", () => {
+describe("core text mirror and revisions", () => {
   it("round-trips getText through applyEdit batches", () => {
     const { core } = makeCore("hello world");
     let expected = "hello world";
@@ -240,7 +273,7 @@ describe("MockCore text mirror and revisions", () => {
     }
   });
 
-  it("throws StaleRevision (wasm message parity) for applyEdit and decorations", () => {
+  it("throws StaleRevision for applyEdit and decorations", () => {
     const { core } = makeCore("abc");
     const rev = core.revision();
     core.applyEdit(rev, [{ at: 0, delete: 0, insert: "x" }], "user");
@@ -252,7 +285,7 @@ describe("MockCore text mirror and revisions", () => {
     expect(() => core.decorations(core.revision(), 0, 1, cursor(0))).not.toThrow();
   });
 
-  it("throws OutOfBounds / InvalidSplice (wasm message parity) on bad splices", () => {
+  it("throws OutOfBounds / InvalidSplice on bad splices", () => {
     const { core } = makeCore("abc");
     expect(() =>
       core.applyEdit(core.revision(), [{ at: 2, delete: 5, insert: "" }], "user"),
@@ -269,9 +302,7 @@ describe("MockCore text mirror and revisions", () => {
     ).toThrow(/^InvalidSplice: .*ascending and non-overlapping/);
   });
 
-  it("FIX: an empty or all-no-op batch leaves the revision unchanged and creates no undo unit", () => {
-    // editor.rs apply_edit filters no-op splices and early-returns on an
-    // empty batch; the mock used to rev++ unconditionally via mutateDoc.
+  it("an empty or all-no-op batch leaves the revision unchanged and creates no undo unit", () => {
     const { core } = makeCore("abc");
     const rev = core.revision();
     expect(core.applyEdit(rev, [], "user")).toBe(rev);
@@ -281,7 +312,7 @@ describe("MockCore text mirror and revisions", () => {
     expect(core.getText()).toBe("abc");
   });
 
-  it("FIX: splice boundaries inside a surrogate pair throw SurrogateSplit", () => {
+  it("splice boundaries inside a surrogate pair throw SurrogateSplit", () => {
     const { core } = makeCore("a😀b"); // 😀 = code units [1, 3)
     for (const splices of [
       [{ at: 2, delete: 0, insert: "x" }], // at splits the pair
@@ -294,8 +325,8 @@ describe("MockCore text mirror and revisions", () => {
     expect(core.getText()).toBe("a😀b");
   });
 
-  it("FIX: lone-surrogate payloads throw InvalidPayload on load and applyEdit", () => {
-    const core = new MockCore();
+  it("lone-surrogate payloads throw InvalidPayload on load and applyEdit", () => {
+    const core = makeWasmCore();
     expect(() => core.load("bad\uD800doc")).toThrow(
       "InvalidPayload: text contains an unpaired surrogate",
     );
@@ -307,7 +338,7 @@ describe("MockCore text mirror and revisions", () => {
   });
 
   it("revisions increase monotonically, including across load()", () => {
-    const core = new MockCore();
+    const core = makeWasmCore();
     const r1 = core.load("a");
     expect(r1).toBe(1); // revision 0's successor
     const r2 = core.applyEdit(r1, [{ at: 0, delete: 0, insert: "b" }], "user");
@@ -317,7 +348,7 @@ describe("MockCore text mirror and revisions", () => {
   });
 });
 
-describe("MockCore undo/redo and coalescing", () => {
+describe("core undo/redo and coalescing", () => {
   it("coalesces adjacent user edits within 500ms into one unit", () => {
     const { core, clock } = makeCore("");
     core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "a" }], "user");
@@ -384,16 +415,33 @@ describe("MockCore undo/redo and coalescing", () => {
     expect(core.getText()).toBe("");
   });
 
-  it("non-adjacent edits do not coalesce even within the window", () => {
-    const { core, clock } = makeCore("");
-    core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "a" }], "user");
-    clock.advance(10);
-    core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "z" }], "user");
-    expect(core.getText()).toBe("za");
-    core.undo();
-    expect(core.getText()).toBe("a");
-    core.undo();
-    expect(core.getText()).toBe("");
+  it("insert-at-front coalesces (v0.3 region rule); an edit away from the unit's region does not", () => {
+    // ADAPTED from the mock port: the retired mock kept the ORIGINAL v0.1
+    // adjacency wording ("touches the previous edit's end position") for
+    // this case and asserted two units for a@0 then z@0. The v0.3-amended
+    // contract rule — a single splice falling within/touching the ends of
+    // the region the top unit's undo would remove, explicitly covering
+    // insert-at-front — makes them ONE unit, and the core implements that.
+    const a = makeCore("");
+    a.core.applyEdit(a.core.revision(), [{ at: 0, delete: 0, insert: "a" }], "user");
+    a.clock.advance(10);
+    a.core.applyEdit(a.core.revision(), [{ at: 0, delete: 0, insert: "z" }], "user");
+    expect(a.core.getText()).toBe("za");
+    const u = a.core.undo();
+    expect(u!.splices).toEqual([{ at: 0, delete: 2, insert: "" }]); // one unit
+    expect(a.core.getText()).toBe("");
+    expect(a.core.undo()).toBeNull();
+
+    // An edit NOT touching the unit's undo region stays its own unit.
+    const b = makeCore("xxxx");
+    b.core.applyEdit(b.core.revision(), [{ at: 0, delete: 0, insert: "a" }], "user");
+    b.clock.advance(10);
+    b.core.applyEdit(b.core.revision(), [{ at: 3, delete: 0, insert: "z" }], "user");
+    expect(b.core.getText()).toBe("axxzxx");
+    b.core.undo();
+    expect(b.core.getText()).toBe("axxxx");
+    b.core.undo();
+    expect(b.core.getText()).toBe("xxxx");
   });
 
   it("a new edit clears the redo stack", () => {
@@ -436,13 +484,13 @@ describe("MockCore undo/redo and coalescing", () => {
   });
 });
 
-describe("MockCore undo/redo use the exact recorded batches, not a collapsed diff", () => {
-  // A multi-splice unit collapsed through diffSplices becomes ONE
-  // prefix/suffix splice; every live position strictly inside it (anchors,
-  // an open stream's insertion anchor, the composition range) teleports to
-  // its start when mapped. undo()/redo() must map through the recorded
-  // exact batches instead — the same discipline applyStreamText's cascade
-  // already uses (verified divergence from the Rust core otherwise).
+describe("core undo/redo use the exact recorded batches, not a collapsed diff", () => {
+  // A multi-splice unit collapsed through a whole-text prefix/suffix diff
+  // becomes ONE splice; every live position strictly inside it (anchors, an
+  // open stream's insertion anchor, the composition range) teleports to its
+  // start when mapped. undo()/redo() must map through the recorded exact
+  // batches instead (history.rs) — the retired mock's coarse-diff cascade
+  // bug is exactly what these pin against.
 
   it("undo of a multi-splice command returns the exact inverse batch and restores anchors", () => {
     const { core } = makeCore("a bold c");
@@ -491,7 +539,7 @@ describe("MockCore undo/redo use the exact recorded batches, not a collapsed dif
     core.streamClose(sid);
   });
 
-  it("coalesced units (exact inverse invalidated) still undo via the single-splice diff fallback", () => {
+  it("coalesced typing runs undo as one single-splice unit", () => {
     const { core, clock } = makeCore("");
     core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "a" }], "user");
     clock.advance(10);
@@ -502,8 +550,8 @@ describe("MockCore undo/redo use the exact recorded batches, not a collapsed dif
   });
 });
 
-describe("MockCore composition stability rule", () => {
-  it("conceal spans TOUCHED by the composition range are emitted as delim marks (per-span, core parity)", () => {
+describe("core composition stability rule", () => {
+  it("conceal spans TOUCHED by the composition range are emitted as delim marks (per-span)", () => {
     const doc = "**bold** x"; // delimiter spans [0, 2) and [6, 8)
     const { core } = makeCore(doc);
     // Selection parked away from the node; without composition it conceals.
@@ -520,9 +568,8 @@ describe("MockCore composition stability rule", () => {
     ]);
     core.compositionEnd();
 
-    // FIX (per-conceal-span, decorations.rs parity): a composition range
-    // strictly inside the CONTENT touches neither delimiter span, so both
-    // stay concealed — the mock used to over-reveal the whole node.
+    // Per-conceal-span (decorations.rs): a composition range strictly inside
+    // the CONTENT touches neither delimiter span, so both stay concealed.
     core.compositionBegin(4, 4);
     const inside = core.decorations(core.revision(), 0, doc.length, cursor(10));
     expect(conceals(inside)).toHaveLength(2);
@@ -585,7 +632,7 @@ describe("MockCore composition stability rule", () => {
 // v0.2 (M1) additions
 // ---------------------------------------------------------------------------
 
-describe("MockCore decorations — M1 subset (v0.2)", () => {
+describe("core decorations — M1 vocabulary (v0.2)", () => {
   it("strikethrough ~~x~~: content mark + delimiter conceals", () => {
     const doc = "a ~~b~~ c";
     const { core } = makeCore(doc);
@@ -598,7 +645,10 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
   });
 
   it("blockquote (depth 1): LINE-level reveal, matching headings (v0.3)", () => {
-    const doc = "> hello\nworld";
+    // A blank line separates the quote from "world": without it, CommonMark
+    // lazy continuation makes "world" part of the quote (asserted below) —
+    // the retired mock never modeled lazy continuation.
+    const doc = "> hello\n\nworld";
     const { core } = makeCore(doc);
     // Cursor on the OTHER line: markers concealed, line not revealed.
     const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
@@ -616,6 +666,30 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
         { kind: "line", at: 0, style: "blockquote", depth: 1, revealed: true },
       ]);
     }
+  });
+
+  it("blockquote lazy continuation: an unmarked next line is part of the quote (CommonMark)", () => {
+    // ADAPTED from the mock port: the mock treated "world" as a plain
+    // paragraph; per CommonMark it lazily continues the quote's paragraph,
+    // so the core emits a blockquote line decoration for it too — and
+    // LINE-level reveal applies per line (the continuation line has no
+    // marker to reveal, but its `revealed` flag still drops the bar).
+    const doc = "> hello\nworld";
+    const { core } = makeCore(doc);
+    const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
+    expect(lines(ds)).toEqual([
+      { kind: "line", at: 0, style: "blockquote", depth: 1 },
+      { kind: "line", at: 8, style: "blockquote", depth: 1, revealed: true },
+    ]);
+    expect(conceals(ds)).toEqual([{ kind: "conceal", from: 0, to: 2 }]);
+    // Cursor on the marked first line reveals ITS marker; the continuation
+    // line keeps its (marker-less) unrevealed decoration.
+    const onFirst = core.decorations(core.revision(), 0, doc.length, cursor(4));
+    expect(marks(onFirst, "delim")).toEqual([{ kind: "mark", from: 0, to: 2, style: "delim" }]);
+    expect(lines(onFirst)).toEqual([
+      { kind: "line", at: 0, style: "blockquote", depth: 1, revealed: true },
+      { kind: "line", at: 8, style: "blockquote", depth: 1 },
+    ]);
   });
 
   it("fenced code block: fence lines styled + raw fences concealed, revealed per line", () => {
@@ -644,14 +718,19 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
   });
 
   it("thematic break: hr line + concealed dashes, revealed as delim on the line", () => {
-    const doc = "before\n---\nafter";
+    // ADAPTED from the mock port: a blank line must precede the dashes —
+    // per CommonMark, "---" directly under a paragraph is that paragraph's
+    // SETEXT-heading underline, not a thematic break (the retired mock
+    // parsed it as an hr regardless; setext headings are outside the M1
+    // decoration scope, so that shape emits nothing).
+    const doc = "before\n\n---\nafter";
     const { core } = makeCore(doc);
     const ds = core.decorations(core.revision(), 0, doc.length, cursor(doc.length));
-    expect(lines(ds)).toEqual([{ kind: "line", at: 7, style: "hr" }]);
-    expect(conceals(ds)).toEqual([{ kind: "conceal", from: 7, to: 10 }]);
+    expect(lines(ds)).toEqual([{ kind: "line", at: 8, style: "hr" }]);
+    expect(conceals(ds)).toEqual([{ kind: "conceal", from: 8, to: 11 }]);
     // Cursor on the hr line reveals the raw dashes as a delim mark.
-    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(8));
-    expect(marks(revealed, "delim")).toEqual([{ kind: "mark", from: 7, to: 10, style: "delim" }]);
+    const revealed = core.decorations(core.revision(), 0, doc.length, cursor(9));
+    expect(marks(revealed, "delim")).toEqual([{ kind: "mark", from: 8, to: 11, style: "delim" }]);
     expect(conceals(revealed)).toEqual([]);
   });
 
@@ -698,7 +777,7 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     expect(conceals(ds)).toEqual([]);
   });
 
-  it("ordered markers display sequential numbers ignoring raw digits (mock parity)", () => {
+  it("ordered markers display sequential numbers ignoring raw digits", () => {
     // "1./1./3." must DISPLAY 1,2,3 — research/07 §0: CommonMark only fixes
     // the list's start number; sibling digits are cosmetic.
     const { core } = makeCore("1. a\n1. b\n3. c\n");
@@ -710,7 +789,7 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     expect(widgets.map((w) => w.number)).toEqual([1, 2, 3]);
   });
 
-  it("ordered list start number is honored (mock parity)", () => {
+  it("ordered list start number is honored", () => {
     // "4./5./9." displays 4,5,6.
     const { core } = makeCore("4. a\n5. b\n9. c\n");
     const ds = core.decorations(core.revision(), 0, core.docLength(), []);
@@ -721,7 +800,7 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     expect(widgets.map((w) => w.number)).toEqual([4, 5, 6]);
   });
 
-  it("a delimiter change starts a new, sequence-independent ordered list (mock parity)", () => {
+  it("a delimiter change starts a new, sequence-independent ordered list", () => {
     const { core } = makeCore("1. a\n2) b\n");
     const ds = core.decorations(core.revision(), 0, core.docLength(), []);
     const widgets = ds.filter(
@@ -734,7 +813,7 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     ]);
   });
 
-  it("a nested ordered list restarts its own sequence (mock parity)", () => {
+  it("a nested ordered list restarts its own sequence", () => {
     const { core } = makeCore("1. a\n   1. nested\n   2. nested2\n2. b\n");
     const ds = core.decorations(core.revision(), 0, core.docLength(), []);
     const widgets = ds.filter(
@@ -744,12 +823,10 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     expect(widgets.map((w) => w.number)).toEqual([1, 1, 2, 2]);
   });
 
-  it("FIX 2: a blank line does NOT reset ordered numbering (loose list, parity with the Rust core)", () => {
+  it("a blank line does NOT reset ordered numbering (loose list)", () => {
     // Per CommonMark a blank line doesn't close a list — that's exactly what
     // makes it "loose" — so "1. a\n1. b\n\n1. c" is ONE list and must display
-    // 1,2,3, matching the wasm core (which counts straight through blank
-    // lines). Before the fix, the mock treated the blank line like any other
-    // non-item line and cleared the running sequence, producing [1,2,1].
+    // 1,2,3 (the core counts straight through blank lines).
     const { core } = makeCore("1. a\n1. b\n\n1. c\n");
     const ds = core.decorations(core.revision(), 0, core.docLength(), []);
     const widgets = ds.filter(
@@ -759,10 +836,7 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     expect(widgets.map((w) => w.number)).toEqual([1, 2, 3]);
   });
 
-  it("FIX 2 control: a real paragraph line (non-blank, non-item) still resets ordered numbering", () => {
-    // Unlike a blank line, actual paragraph CONTENT between list items is not
-    // modeled as loose-list continuation by this mock — it still closes the
-    // running sequence, so a fresh "1. c" starts its own list at 1.
+  it("a real paragraph line (non-blank, non-item) still resets ordered numbering", () => {
     const { core } = makeCore("1. a\n1. b\n\nplain paragraph\n\n1. c\n");
     const ds = core.decorations(core.revision(), 0, core.docLength(), []);
     const widgets = ds.filter(
@@ -784,8 +858,8 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
     ]);
     expect(ds.filter((d) => d.kind === "conceal" && d.from === 0 && d.to === 2).length).toBe(1);
 
-    // Reveal extent = the LIST ITEM's marker extent [0, 5) — a cursor inside
-    // it withholds the task widget.
+    // Reveal extent is the whole line — a cursor inside the marker region
+    // withholds the task widget.
     const revealedDs = core.decorations(core.revision(), 0, doc.length, cursor(3));
     expect(revealedDs.filter((d) => d.kind === "widget" && d.widget === "task")).toEqual([]);
     // Lockstep reveal: the dash AND the brackets show together as delims.
@@ -838,7 +912,7 @@ describe("MockCore decorations — M1 subset (v0.2)", () => {
   });
 });
 
-describe("MockCore anchors (v0.2)", () => {
+describe("core anchors (v0.2)", () => {
   it("before-bias anchor stays put when an insertion lands exactly on it", () => {
     const { core } = makeCore("abcdef");
     const id = core.createAnchor(3, "before");
@@ -878,7 +952,7 @@ describe("MockCore anchors (v0.2)", () => {
   });
 });
 
-describe("MockCore command (v0.2)", () => {
+describe("core command (v0.2)", () => {
   it("toggleStrong wraps a plain selection, then double-toggle is byte-identical", () => {
     const { core } = makeCore("hello world");
     const c1 = core.command("toggleStrong", 6, 11); // "world"
@@ -937,12 +1011,10 @@ describe("MockCore command (v0.2)", () => {
     expect(core.command("toggleTask", 3)).toBeNull();
   });
 
-  it("FIX 4: an unknown command name THROWS (parity with wasm's InvalidCommand), never null", () => {
-    // Before the fix, an unrecognized name fell through to `default: return
-    // null`, indistinguishable from a command that legitimately doesn't
-    // apply here — every mock test would stay green for a future typo'd
-    // command name even though the real wasm core throws `InvalidCommand`
-    // per call (validated before dispatch). The mock must fail the same way.
+  it("an unknown command name THROWS InvalidCommand, never null", () => {
+    // An unrecognized name is a caller/protocol bug — the core throws
+    // `InvalidCommand` (validated before dispatch), never a silent null
+    // indistinguishable from "doesn't apply here".
     const { core } = makeCore("hello world");
     expect(() => core.command("bogusCommand" as unknown as RangeCommandName, 0, 1)).toThrow(
       /InvalidCommand/,
@@ -953,7 +1025,7 @@ describe("MockCore command (v0.2)", () => {
   });
 });
 
-describe("MockCore indentList/outdentList (v0.2, marker-width-aware Tab nesting)", () => {
+describe("core indentList/outdentList (v0.2, marker-width-aware Tab nesting)", () => {
   it("bullet under bullet indents by 2", () => {
     const { core } = makeCore("- a\n- b\n");
     core.command("indentList", 6, 6);
@@ -1015,7 +1087,9 @@ describe("MockCore indentList/outdentList (v0.2, marker-width-aware Tab nesting)
     const change = core.command("indentList", 2, 2);
     expect(change).not.toBeNull();
     expect(change!.splices).toEqual([]);
-    expect(change!.selection).toBeNull();
+    // `selection` is optional on the wire (protocol: `selection?: ... | null`);
+    // the wasm core omits it for a no-op change.
+    expect(change!.selection ?? null).toBeNull();
     expect(core.revision()).toBe(rev);
     expect(core.getText()).toBe("- a\n- b\n");
   });
@@ -1103,7 +1177,7 @@ describe("MockCore indentList/outdentList (v0.2, marker-width-aware Tab nesting)
     expect(core.getText()).toBe("> - x\n>   - p\n>     - c1\n- outside\n");
   });
 
-  // --- paragraph-interruption guard (parity with the Rust core) -----------
+  // --- paragraph-interruption guard ----------------------------------------
   //
   // A non-1 ordered marker cannot START a list in paragraph-interruption
   // position (CommonMark): the moved line's digits rewrite to "1" unless it
@@ -1163,7 +1237,7 @@ describe("MockCore indentList/outdentList (v0.2, marker-width-aware Tab nesting)
     expect(core.getText()).toBe("1. a\n2. b\n"); // digits AND indent restored together
   });
 
-  // --- below-context interruption guard (parity with the Rust core) -------
+  // --- below-context interruption guard ------------------------------------
   //
   // The edit can change the parse context of a line BELOW the affected set
   // that the command never touched: the same landing-scan check runs on the
@@ -1265,10 +1339,10 @@ describe("MockCore indentList/outdentList (v0.2, marker-width-aware Tab nesting)
   });
 });
 
-describe("MockCore enter (v0.3, construct-aware Enter)", () => {
-  // Parity with crates/oxidown-core/src/commands.rs `enter` (module doc
-  // comment "## enter"): continue on non-empty content, single-press exit
-  // on empty constructs, null when neither applies.
+describe("core enter (v0.3, construct-aware Enter)", () => {
+  // crates/oxidown-core/src/commands.rs `enter` (module doc comment "##
+  // enter"): continue on non-empty content, single-press exit on empty
+  // constructs, null when neither applies.
 
   // -- continue -------------------------------------------------------------
 
@@ -1348,9 +1422,9 @@ describe("MockCore enter (v0.3, construct-aware Enter)", () => {
   });
 
   it("outdenting an empty nested task fires the below-line rewrite guard", () => {
-    // Same shape as the Rust test: outdenting "   - [ ] " to top level puts
-    // the untouched "3. c" against the new bullet list, where the guard's
-    // landing-scan says a non-1 ordered marker cannot start a list.
+    // Outdenting "   - [ ] " to top level puts the untouched "3. c" against
+    // the new bullet list, where the guard's landing-scan says a non-1
+    // ordered marker cannot start a list.
     const doc = "1. a\n2. b\n   - [ ] x\n   - [ ] \n3. c\n";
     const { core } = makeCore(doc);
     const pos = doc.indexOf("   - [ ] \n") + "   - [ ] ".length;
@@ -1436,7 +1510,7 @@ describe("MockCore enter (v0.3, construct-aware Enter)", () => {
   });
 });
 
-describe("MockCore streaming (v0.2)", () => {
+describe("core streaming (v0.2)", () => {
   it("streamOpen/Append/Close: appends land at the (mapped) insertion anchor", () => {
     const { core } = makeCore("head\n");
     const id = core.streamOpen(core.docLength());
@@ -1452,7 +1526,8 @@ describe("MockCore streaming (v0.2)", () => {
     const { core } = makeCore("");
     const id = core.streamOpen(0);
     const change = core.streamAppend(id, "abc");
-    expect(change.selection).toBeNull();
+    // `selection` is optional on the wire; streaming changes omit it.
+    expect(change.selection ?? null).toBeNull();
   });
 
   it("an entire stream session is one undo unit when uninterrupted", () => {
@@ -1467,14 +1542,13 @@ describe("MockCore streaming (v0.2)", () => {
     expect(core.getText()).toBe("X");
   });
 
-  it("FIX: an interleaved user edit gets its own unit; the STREAM stays one unit (creation-order undo)", () => {
+  it("an interleaved user edit gets its own unit; the STREAM stays one unit (creation-order undo)", () => {
     // Boundary v0.2 clarification 2 (history.rs `record_stream_append`): an
     // entire stream (open→close) is ONE undo unit even with user edits
     // interleaved, and undo order is unit-CREATION order (LIFO by creation).
     // The user edit's unit was created AFTER the stream's unit began, so it
     // pops first; the second undo then reverts the whole stream (A+B
-    // together). The mock used to split the stream into one unit per
-    // interruption, popping B / USER / A.
+    // together).
     const { core, clock } = makeCore("head\n\ntail");
     const id = core.streamOpen(core.docLength());
     core.streamAppend(id, "A");
@@ -1498,14 +1572,13 @@ describe("MockCore streaming (v0.2)", () => {
     expect(core.redo()).toBeNull();
   });
 
-  it("FIX: the undo cascade maps stream positions through MULTI-SPLICE user batches exactly (multi-cursor)", () => {
+  it("the undo cascade maps stream positions through MULTI-SPLICE user batches exactly (multi-cursor)", () => {
     // A single multi-cursor applyEdit batch with splices on BOTH sides of
     // the stream insertion point. The cascade must map the append position
-    // through the RECORDED splice batch (history.rs record_stream_append);
-    // the old coarse prefix/suffix diff collapsed the whole batch to one
-    // splice spanning both edits, so a stream position strictly inside that
-    // span teleported to the splice's start — undoing the user edit moved
-    // the streamed text to the wrong place.
+    // through the RECORDED splice batch (history.rs record_stream_append) —
+    // a coarse prefix/suffix diff would collapse the whole batch to one
+    // splice spanning both edits and teleport a stream position strictly
+    // inside that span to the splice's start.
     const { core, clock } = makeCore("aaaa bbbb cccc");
     const id = core.streamOpen(7); // between "bb" and "bb"
     core.streamAppend(id, "Y"); // creates the stream's (single) undo unit
@@ -1544,7 +1617,7 @@ describe("MockCore streaming (v0.2)", () => {
     expect(core.redo()).toBeNull();
   });
 
-  it("FIX: the cascade stays exact across SEVERAL interleaved multi-splice batches and appends", () => {
+  it("the cascade stays exact across SEVERAL interleaved multi-splice batches and appends", () => {
     const { core, clock } = makeCore("head middle tail");
     const id = core.streamOpen("head m".length); // 6, inside "middle"
     core.streamAppend(id, "A");
@@ -1634,11 +1707,10 @@ describe("MockCore streaming (v0.2)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// M1 review fixes (fix-spec S1–S5, S13) — pulldown-cmark parser fidelity and
-// the command/history semantics pinned identically on the Rust core.
+// Parser fidelity and command semantics pinned by the M1 review (S1–S5, S13)
 // ---------------------------------------------------------------------------
 
-describe("MockCore parser fidelity (S13a–c): flanking rules and code spans", () => {
+describe("core parser fidelity (S13a–c): flanking rules and code spans", () => {
   const ds = (doc: string, sel: SelectionRange[] = []) => {
     const { core } = makeCore(doc);
     return core.decorations(core.revision(), 0, doc.length, sel);
@@ -1726,7 +1798,7 @@ describe("MockCore parser fidelity (S13a–c): flanking rules and code spans", (
   });
 });
 
-describe("MockCore list marker span (S13d, v0.4): glyphs plus ALL following spaces/tabs", () => {
+describe("core list marker span (S13d, v0.4): glyphs plus ALL following spaces/tabs", () => {
   const widgets = (doc: string) => {
     const { core } = makeCore(doc);
     return core
@@ -1744,7 +1816,7 @@ describe("MockCore list marker span (S13d, v0.4): glyphs plus ALL following spac
     ]);
   });
 
-  it("five spaces → [0, 6); six spaces cap at 5 whitespace chars → still [0, 6)", () => {
+  it("five spaces → [0, 6); six spaces hit the indented-code boundary → still [0, 6)", () => {
     expect(widgets("-     five spaces")).toEqual([
       { kind: "widget", from: 0, to: 6, widget: "bullet" },
     ]);
@@ -1779,15 +1851,25 @@ describe("MockCore list marker span (S13d, v0.4): glyphs plus ALL following spac
     expect(widgets("-   ")).toEqual([{ kind: "widget", from: 0, to: 2, widget: "bullet" }]);
   });
 
-  it("Enter treats the whole whitespace run as marker prefix (contentStart rule)", () => {
+  it("Enter's content start is the FIXED marker token end (glyphs + one space), not the ws-run end", () => {
+    // ADAPTED from the mock port: the mock reused the S13d all-whitespace
+    // lookahead for `enter`'s prefix gate and returned null at position 3.
+    // Per the contract, `enter`'s "content start = the marker token's end"
+    // uses the indentList section's FIXED token (glyphs + exactly one
+    // space), so position 3 — inside the extra spaces — is already at/after
+    // content start: the press CONTINUES (splitting the item mid-line). The
+    // S13d all-whitespace rule governs the decoration SPAN only.
     const { core } = makeCore("-   spaced\n");
-    expect(core.command("enter", 3, 3)).toBeNull(); // inside the marker's ws run
+    const mid = core.command("enter", 3, 3);
+    expect(mid).not.toBeNull();
+    expect(core.getText()).toBe("-  \n-  spaced\n");
+    core.undo();
     core.command("enter", 10, 10); // at the item's end: continues the list
     expect(core.getText()).toBe("-   spaced\n- \n");
   });
 });
 
-describe("MockCore toggle whitespace trimming (S1)", () => {
+describe("core toggle whitespace trimming (S1)", () => {
   it("a whitespace-edged selection trims before wrapping, double-toggle is byte-identical", () => {
     const { core } = makeCore("a b");
     const c1 = core.command("toggleStrong", 0, 2);
@@ -1827,15 +1909,24 @@ describe("MockCore toggle whitespace trimming (S1)", () => {
   });
 
   it("exotic contract whitespace (NBSP, ideographic space) trims too", () => {
-    const { core } = makeCore(" a　");
+    const { core } = makeCore(" a　");
     core.command("toggleEm", 0, 3);
-    expect(core.getText()).toBe(" *a*　");
+    expect(core.getText()).toBe(" *a*　");
   });
 
-  it("toggleCode does NOT trim (padding behavior unchanged)", () => {
+  it("toggleCode does NOT trim — the code planner pads space-edged content instead", () => {
+    // ADAPTED from the mock port: the mock emitted bare backticks (`a `b);
+    // the core's planner pads a space-edged selection ("` a  `") so
+    // CommonMark's both-ends space stripping round-trips the exact content
+    // — the v0.4 contract text pins "the code planner's existing padding
+    // treatment stands".
     const { core } = makeCore("a b");
-    core.command("toggleCode", 0, 2);
-    expect(core.getText()).toBe("`a `b");
+    const c = core.command("toggleCode", 0, 2);
+    expect(core.getText()).toBe("` a  `b");
+    expect(c!.splices).toEqual([
+      { at: 0, delete: 0, insert: "` " },
+      { at: 2, delete: 0, insert: " `" },
+    ]);
   });
 
   it("cursor-only toggles are unchanged (no trimming path)", () => {
@@ -1846,7 +1937,7 @@ describe("MockCore toggle whitespace trimming (S1)", () => {
   });
 });
 
-describe("MockCore CRLF split guard (S2)", () => {
+describe("core CRLF split guard (S2)", () => {
   it("a command position between \\r and \\n throws the pinned InvalidArgument, mutating nothing", () => {
     const { core } = makeCore("one\r\ntwo");
     const rev = core.revision();
@@ -1877,7 +1968,7 @@ describe("MockCore CRLF split guard (S2)", () => {
   });
 });
 
-describe("MockCore setHeading block gate and level-0 removal (S3)", () => {
+describe("core setHeading block gate and level-0 removal (S3)", () => {
   it("S3a: refuses a list item inside a blockquote: '> - item'", () => {
     const { core } = makeCore("> - item");
     const rev = core.revision();
@@ -1924,7 +2015,7 @@ describe("MockCore setHeading block gate and level-0 removal (S3)", () => {
   });
 });
 
-describe("MockCore undo depth cap (S4)", () => {
+describe("core undo depth cap (S4)", () => {
   it("caps at 100 units, dropping the OLDEST: 101 units → 100 undos, first unit gone", () => {
     const { core } = makeCore("");
     core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "A" }], "paste");
@@ -1949,7 +2040,7 @@ describe("MockCore undo depth cap (S4)", () => {
   });
 });
 
-describe("MockCore heading trailing whitespace + closing run (S5)", () => {
+describe("core heading trailing whitespace + closing run (S5)", () => {
   it("'# foo   ': trailing spaces are not heading content", () => {
     const doc = "# foo   ";
     const { core } = makeCore(doc);

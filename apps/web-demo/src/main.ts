@@ -4,7 +4,6 @@ import { defaultKeymap } from "@codemirror/commands";
 // NOTE: no history()/historyKeymap here — the Oxidown core is the historian.
 import {
   applyCoreChange,
-  MockCore,
   loadWasmCore,
   oxidown,
   type OxidownCore,
@@ -58,14 +57,17 @@ function withTiming(core: OxidownCore, onSample: (s: PerfSample) => void): Oxido
     streamClose: (id) => core.streamClose(id),
 
     // Optional teardown: forwarded only when the wrapped core has one (the
-    // wasm adapter frees its wasm-bindgen instance; MockCore omits it), so
-    // this proxy's surface matches the wrapped core's exactly.
+    // wasm adapter frees its wasm-bindgen instance), so this proxy's surface
+    // matches the wrapped core's exactly.
     ...(core.destroy ? { destroy: () => core.destroy?.() } : {}),
   };
 }
 
 // ---------------------------------------------------------------------------
-// Core selection: ?core=wasm tries the wasm build, falls back to MockCore
+// Core loading: the wasm core is the ONLY core (the TypeScript MockCore is
+// retired). A stale `?core=wasm` in a bookmarked URL is harmless — the param
+// is simply never read. If the wasm pkg is missing or fails to instantiate,
+// the demo shows a clear error instead of silently degrading.
 // ---------------------------------------------------------------------------
 
 const banner = document.getElementById("core-banner")!;
@@ -76,22 +78,21 @@ const streamBtn = document.getElementById("stream-btn") as HTMLButtonElement;
 const stopStreamBtn = document.getElementById("stop-stream-btn") as HTMLButtonElement;
 const streamStatus = document.getElementById("stream-status")!;
 
-const wantWasm = new URLSearchParams(location.search).get("core") === "wasm";
-let rawCore: OxidownCore | null = null;
-if (wantWasm) {
-  rawCore = await loadWasmCore();
+const rawCore: OxidownCore | null = await loadWasmCore();
+if (!rawCore) {
+  banner.textContent = "core: FAILED to load wasm";
+  banner.classList.add("fallback");
+  const editorEl = document.getElementById("editor")!;
+  const error = document.createElement("div");
+  error.className = "load-error";
+  error.innerHTML =
+    "<strong>The Oxidown wasm core failed to load.</strong>" +
+    "<p>Build it with <code>pnpm build:wasm</code> (repo root) and reload. " +
+    "Details are in the browser console.</p>";
+  editorEl.appendChild(error);
+  throw new Error("[oxidown demo] wasm core failed to load — no editor created");
 }
-if (rawCore) {
-  banner.textContent = "core: wasm";
-} else {
-  rawCore = new MockCore();
-  if (wantWasm) {
-    banner.textContent = "core: mock (wasm unavailable — fell back)";
-    banner.classList.add("fallback");
-  } else {
-    banner.textContent = "core: mock (add ?core=wasm to try the wasm build)";
-  }
-}
+banner.textContent = "core: wasm";
 
 const fmt = (ms: number | null) => (ms === null ? "—" : `${ms.toFixed(2)}ms`);
 const core = withTiming(rawCore, (s) => {
@@ -158,7 +159,6 @@ loadLargeBtn.addEventListener("click", () => {
 // stream keeps appending exactly where it left off — every CoreChange the
 // core returns is applied via applyCoreChange with no explicit selection,
 // so CM6 maps your existing cursor through the change instead of moving it.
-// This works identically against MockCore and (once built) the wasm core.
 // ---------------------------------------------------------------------------
 
 function randInt(min: number, max: number): number {

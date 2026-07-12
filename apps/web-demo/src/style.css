@@ -82,6 +82,26 @@ body {
   min-height: 0;
 }
 
+/* Shown instead of the editor when the wasm core fails to load. */
+.load-error {
+  max-width: 560px;
+  margin: 48px auto;
+  padding: 16px 20px;
+  border: 1px solid #e0b4b4;
+  border-radius: 8px;
+  background: #fdf3f3;
+  color: #8a1f1f;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.load-error code {
+  background: #f3e0e0;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: ui-monospace, monospace;
+}
+
 .cm-editor {
   height: 100%;
   font-size: 16px;

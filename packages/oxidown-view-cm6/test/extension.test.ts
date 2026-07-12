@@ -1,17 +1,32 @@
 // @vitest-environment jsdom
 //
-// Integration smoke tests for the CM6 extension against MockCore, under jsdom.
-// jsdom cannot do real layout, so these tests focus on the wiring: change
-// forwarding, mirror consistency, history transactions not being echoed back,
-// and decoration rebuild scheduling.
+// Integration smoke tests for the CM6 extension under jsdom. jsdom cannot do
+// real layout, so these tests focus on the wiring: change forwarding, mirror
+// consistency, history transactions not being echoed back, and decoration
+// rebuild scheduling.
+//
+// Two cores back these tests:
+//  - StubCore (test/stub-core.ts): a deliberately dumb, scriptable double —
+//    plain text buffer, snapshot undo, empty decorations, per-method fault
+//    injection. Used wherever the test exercises VIEW wiring (splice
+//    forwarding, skip annotations, recovery paths, keymap fallback, freeze
+//    scheduling) and the core's markdown knowledge is irrelevant.
+//  - the REAL wasm core (test/wasm-loader.ts, production adapter): used
+//    wherever the test genuinely needs real decorations or real command
+//    results (widgets, reveal-driven payload changes, surrogate refusals,
+//    real toggles/undo interplay). The loader fails loudly if the pkg is
+//    missing (`pnpm build:wasm`).
 
 import { describe, expect, it, vi } from "vitest";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { defaultKeymap, history, undoDepth } from "@codemirror/commands";
-import { MockCore } from "../src/mock-core";
+import { StubCore } from "./stub-core";
+import { loadWasmCoreFactory } from "./wasm-loader";
 import { applyCoreChange, oxidown, oxidownSkip, sanitizeSurrogates } from "../src/extension";
-import type { Decoration } from "../src/protocol";
+import type { Decoration, OxidownCore } from "../src/protocol";
+
+const makeWasmCore = await loadWasmCoreFactory();
 
 // jsdom implements Range but none of its layout methods. CM6's rAF-driven
 // measure cycle (reached since drawSelection joined the extension bundle)
@@ -25,7 +40,7 @@ const emptyRect = { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, 
 (Range.prototype as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect =
   () => ({ ...emptyRect, toJSON: () => emptyRect });
 
-function makeView(doc: string, core: MockCore) {
+function makeView(doc: string, core: OxidownCore) {
   const parent = document.createElement("div");
   document.body.appendChild(parent);
   const view = new EditorView({
@@ -40,9 +55,9 @@ function makeView(doc: string, core: MockCore) {
 
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-describe("oxidown extension wiring (jsdom)", () => {
+describe("oxidown extension wiring (jsdom, StubCore)", () => {
   it("loads the view buffer into the core and forwards edits as splices", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("hello **world**", core);
     expect(core.getText()).toBe("hello **world**");
 
@@ -58,17 +73,23 @@ describe("oxidown extension wiring (jsdom)", () => {
       ],
     });
     expect(core.getText()).toBe(view.state.doc.toString());
+    // The whole batch crossed as ONE applyEdit call with two splices.
+    const lastApply = core.callsTo("applyEdit").at(-1)!;
+    expect(lastApply.args[1]).toEqual([
+      { at: 0, delete: 1, insert: "H" },
+      { at: 6, delete: 1, insert: "!" },
+    ]);
     await flush();
     view.destroy();
   });
 
   it("recovers from a core error by re-loading the mirror (and logs loudly)", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("abc", core);
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    // Desync the core behind the view's back: the next forwarded edit is based
-    // on a revision/coordinates the core can't apply cleanly, or the mirror
-    // check fails — either way the extension must re-load() from the view.
+    // Desync the core behind the view's back: the next forwarded edit leaves
+    // the mirror lengths disagreeing, so the verifyMirror check fails and the
+    // extension must re-load() from the view.
     core.applyEdit(core.revision(), [{ at: 0, delete: 3, insert: "" }], "user");
     view.dispatch({ changes: { from: 3, to: 3, insert: "d" } });
     expect(core.getText()).toBe("abcd");
@@ -80,7 +101,7 @@ describe("oxidown extension wiring (jsdom)", () => {
   });
 
   it("rebuilds decorations at most once per microtask batch", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const spy = vi.spyOn(core, "decorations");
     const view = makeView("# Title\n\n**bold** text", core);
     const initialCalls = spy.mock.calls.length; // constructor build
@@ -96,44 +117,8 @@ describe("oxidown extension wiring (jsdom)", () => {
     view.destroy();
   });
 
-  it("skips the re-render when a cursor-only move leaves the payload unchanged", async () => {
-    const core = new MockCore();
-    const view = makeView("plain text here\n**bold** span line\n", core);
-    await flush();
-    type P = { decorations: unknown };
-    const plugin = (view as unknown as { plugins: { value: unknown }[] }).plugins
-      .map((p) => p.value)
-      .filter((v): v is P => !!v && typeof v === "object" && "decorations" in v)[0];
-    // settle any initial rebuild so we start from a cached payload
-    view.dispatch({ selection: { anchor: 1 } });
-    await flush();
-    const before = plugin.decorations;
-
-    // Caret moves WITHIN the plain first line: decorations cannot change —
-    // the RangeSet must keep its identity (rebuild + dispatch skipped).
-    view.dispatch({ selection: { anchor: 3 } });
-    await flush();
-    view.dispatch({ selection: { anchor: 9 } });
-    await flush();
-    expect(plugin.decorations).toBe(before);
-
-    // Caret into the **bold** span on line 2: reveal flips, payload differs,
-    // a real rebuild must happen.
-    view.dispatch({ selection: { anchor: "plain text here\n".length + 3 } });
-    await flush();
-    expect(plugin.decorations).not.toBe(before);
-
-    // After a DOC change, identical-looking payloads must not be trusted:
-    // the rebuild runs again (payload cache invalidated).
-    const afterBold = plugin.decorations;
-    view.dispatch({ changes: { from: 6, to: 6, insert: "x" }, userEvent: "input.type" });
-    await flush();
-    expect(plugin.decorations).not.toBe(afterBold);
-    view.destroy();
-  });
-
   it("core-driven undo/redo dispatches are not echoed back into applyEdit", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const applySpy = vi.spyOn(core, "applyEdit");
     const view = makeView("", core);
 
@@ -141,14 +126,11 @@ describe("oxidown extension wiring (jsdom)", () => {
     expect(core.getText()).toBe("hello");
     const applyCallsAfterTyping = applySpy.mock.calls.length;
 
-    // Trigger the Mod-z binding by invoking core.undo + the same dispatch the
-    // keymap performs is covered in the browser; here we verify the annotation
-    // path: a transaction that the keymap would produce must be skipped.
-    const result = core.undo();
-    expect(result).not.toBeNull();
     // The keymap handler is what tags the transaction; simulate a plain
     // (untagged) dispatch and confirm it IS forwarded, proving the skip logic
     // depends on the annotation:
+    const result = core.undo();
+    expect(result).not.toBeNull();
     view.dispatch({
       changes: result!.splices.map((s) => ({ from: s.at, to: s.at + s.delete, insert: s.insert })),
     });
@@ -158,7 +140,7 @@ describe("oxidown extension wiring (jsdom)", () => {
   });
 
   it("keyboard undo/redo round-trips the document through the core", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("", core);
     view.dispatch({ changes: { from: 0, to: 0, insert: "abc" }, userEvent: "input.type" });
     expect(core.getText()).toBe("abc");
@@ -193,12 +175,52 @@ describe("oxidown extension wiring (jsdom)", () => {
   });
 });
 
+describe("reveal-driven payload cache (wasm core)", () => {
+  it("skips the re-render when a cursor-only move leaves the payload unchanged", async () => {
+    const core = makeWasmCore();
+    const view = makeView("plain text here\n**bold** span line\n", core);
+    await flush();
+    type P = { decorations: unknown };
+    const plugin = (view as unknown as { plugins: { value: unknown }[] }).plugins
+      .map((p) => p.value)
+      .filter((v): v is P => !!v && typeof v === "object" && "decorations" in v)[0];
+    // settle any initial rebuild so we start from a cached payload
+    view.dispatch({ selection: { anchor: 1 } });
+    await flush();
+    const before = plugin.decorations;
+
+    // Caret moves WITHIN the plain first line: decorations cannot change —
+    // the RangeSet must keep its identity (rebuild + dispatch skipped).
+    view.dispatch({ selection: { anchor: 3 } });
+    await flush();
+    view.dispatch({ selection: { anchor: 9 } });
+    await flush();
+    expect(plugin.decorations).toBe(before);
+
+    // Caret into the **bold** span on line 2: reveal flips, payload differs,
+    // a real rebuild must happen.
+    view.dispatch({ selection: { anchor: "plain text here\n".length + 3 } });
+    await flush();
+    expect(plugin.decorations).not.toBe(before);
+
+    // After a DOC change, identical-looking payloads must not be trusted:
+    // the rebuild runs again (payload cache invalidated).
+    const afterBold = plugin.decorations;
+    view.dispatch({ changes: { from: 6, to: 6, insert: "x" }, userEvent: "input.type" });
+    await flush();
+    expect(plugin.decorations).not.toBe(afterBold);
+    view.destroy();
+  });
+});
+
 describe("Tab/Shift-Tab keymap (indentList/outdentList with indentMore/indentLess fallback)", () => {
   const tabKey = (shift = false) =>
     new KeyboardEvent("keydown", { key: "Tab", code: "Tab", shiftKey: shift, bubbles: true, cancelable: true });
 
-  it("falls back to indentMore in a plain paragraph (not a list)", async () => {
-    const core = new MockCore();
+  it("falls back to indentMore in a plain paragraph (not a list) — StubCore returns null", async () => {
+    // StubCore's command() always answers null ("doesn't apply"), which is
+    // exactly the keymap's fallback path — no markdown knowledge needed.
+    const core = new StubCore();
     const view = makeView("plain paragraph", core);
     view.dispatch({ selection: { anchor: 3 } });
 
@@ -211,8 +233,8 @@ describe("Tab/Shift-Tab keymap (indentList/outdentList with indentMore/indentLes
     view.destroy();
   });
 
-  it("indents the whole item when the cursor is in the middle of the item's text", async () => {
-    const core = new MockCore();
+  it("indents the whole item when the cursor is in the middle of the item's text (wasm)", async () => {
+    const core = makeWasmCore();
     const doc = "- a\n- b\n";
     const view = makeView(doc, core);
     // Cursor on the "b" character itself, not at the line/item start.
@@ -226,8 +248,8 @@ describe("Tab/Shift-Tab keymap (indentList/outdentList with indentMore/indentLes
     view.destroy();
   });
 
-  it("Shift-Tab outdents via outdentList and reverses an indent", async () => {
-    const core = new MockCore();
+  it("Shift-Tab outdents via outdentList and reverses an indent (wasm)", async () => {
+    const core = makeWasmCore();
     const doc = "- a\n  - b\n";
     const view = makeView(doc, core);
     view.dispatch({ selection: { anchor: doc.indexOf("b") } });
@@ -240,8 +262,8 @@ describe("Tab/Shift-Tab keymap (indentList/outdentList with indentMore/indentLes
     view.destroy();
   });
 
-  it("a no-movement no-op (first item of a list) does not fall back to indentMore", async () => {
-    const core = new MockCore();
+  it("a no-movement no-op (first item of a list) does not fall back to indentMore (wasm)", async () => {
+    const core = makeWasmCore();
     const doc = "- a\n- b\n";
     const view = makeView(doc, core);
     view.dispatch({ selection: { anchor: doc.indexOf("a") } });
@@ -255,12 +277,12 @@ describe("Tab/Shift-Tab keymap (indentList/outdentList with indentMore/indentLes
     view.destroy();
   });
 
-  it("indenting a non-1 ordered item applies the digit-rewrite batch cleanly through CM6", async () => {
+  it("indenting a non-1 ordered item applies the digit-rewrite batch cleanly through CM6 (wasm)", async () => {
     // The paragraph-interruption guard adds a digit-rewrite splice that
     // TOUCHES the indent splice (both anchored at the line start when the
     // item is at column 0) — this exercises that batch through a real CM6
-    // dispatch, not just the mock's own string splicing.
-    const core = new MockCore();
+    // dispatch.
+    const core = makeWasmCore();
     const doc = "1. a\n2. b\n";
     const view = makeView(doc, core);
     view.dispatch({ selection: { anchor: doc.indexOf("b") } });
@@ -278,7 +300,7 @@ describe("Enter keymap (construct-aware continue/exit with default-newline fallb
   const enterKey = () =>
     new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true });
 
-  function makeViewWithDefaults(doc: string, core: MockCore) {
+  function makeViewWithDefaults(doc: string, core: OxidownCore) {
     // Mirror the documented host setup: oxidown() BEFORE defaultKeymap, so
     // the core-driven Enter wins where it applies and CM6's own
     // insertNewline* handles the null fallback.
@@ -293,8 +315,8 @@ describe("Enter keymap (construct-aware continue/exit with default-newline fallb
     });
   }
 
-  it("falls back to the default newline in a plain paragraph", async () => {
-    const core = new MockCore();
+  it("falls back to the default newline in a plain paragraph (StubCore returns null)", async () => {
+    const core = new StubCore();
     const view = makeViewWithDefaults("plain paragraph", core);
     view.dispatch({ selection: { anchor: 5 } });
 
@@ -309,8 +331,8 @@ describe("Enter keymap (construct-aware continue/exit with default-newline fallb
     view.destroy();
   });
 
-  it("continues a list item and exits the empty one — full round trip through CM6", async () => {
-    const core = new MockCore();
+  it("continues a list item and exits the empty one — full round trip through CM6 (wasm)", async () => {
+    const core = makeWasmCore();
     const doc = "- buy milk\n";
     const view = makeViewWithDefaults(doc, core);
     view.dispatch({ selection: { anchor: doc.indexOf("milk") + 4 } });
@@ -332,7 +354,7 @@ describe("Enter keymap (construct-aware continue/exit with default-newline fallb
   });
 
   it("does not intercept Enter while an IME composition is active", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const commandSpy = vi.spyOn(core, "command");
     const view = makeViewWithDefaults("- item\n", core);
     view.dispatch({ selection: { anchor: 6 } });
@@ -349,7 +371,7 @@ describe("Enter keymap (construct-aware continue/exit with default-newline fallb
 });
 
 describe("source mode (decorations: false)", () => {
-  function makeSourceView(doc: string, core: MockCore) {
+  function makeSourceView(doc: string, core: OxidownCore) {
     const parent = document.createElement("div");
     document.body.appendChild(parent);
     return new EditorView({
@@ -362,7 +384,7 @@ describe("source mode (decorations: false)", () => {
   }
 
   it("never builds decorations — not even via the mouseup rebuild path", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const spy = vi.spyOn(core, "decorations");
     const view = makeSourceView("# Title\n\n**bold** text", core);
     expect(spy).not.toHaveBeenCalled();
@@ -385,7 +407,7 @@ describe("vertical-motion freeze (goal-column stability)", () => {
   it("suppresses rebuilds during an Arrow run and catches up after the trailing delay", async () => {
     vi.useFakeTimers();
     try {
-      const core = new MockCore();
+      const core = new StubCore();
       const spy = vi.spyOn(core, "decorations");
       const view = makeView("line one\n\n**bold text is** the *thing*", core);
       await vi.runAllTimersAsync(); // settle constructor build
@@ -420,7 +442,7 @@ describe("vertical-motion freeze (goal-column stability)", () => {
   it("typing ends the freeze immediately", async () => {
     vi.useFakeTimers();
     try {
-      const core = new MockCore();
+      const core = new StubCore();
       const spy = vi.spyOn(core, "decorations");
       const view = makeView("**bold**", core);
       await vi.runAllTimersAsync();
@@ -444,8 +466,8 @@ describe("vertical-motion freeze (goal-column stability)", () => {
 });
 
 describe("v0.2 additions (M1)", () => {
-  it("applyCoreChange (commands/streaming) is not echoed back into applyEdit", async () => {
-    const core = new MockCore();
+  it("applyCoreChange (commands/streaming) is not echoed back into applyEdit (wasm)", async () => {
+    const core = makeWasmCore();
     const applySpy = vi.spyOn(core, "applyEdit");
     const view = makeView("hello world", core);
     const callsAfterSetup = applySpy.mock.calls.length;
@@ -468,7 +490,7 @@ describe("v0.2 additions (M1)", () => {
   });
 
   it("streaming appends (applyCoreChange with no selection) never move the user's cursor", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("top\n\nbottom", core);
     // Park the cursor at the top of the document, as if the user were typing there.
     view.dispatch({ selection: { anchor: 0 } });
@@ -486,8 +508,8 @@ describe("v0.2 additions (M1)", () => {
     view.destroy();
   });
 
-  it("task widget renders a checkbox; clicking it dispatches toggleTask via the CoreChange path", async () => {
-    const core = new MockCore();
+  it("task widget renders a checkbox; clicking it dispatches toggleTask via the CoreChange path (wasm)", async () => {
+    const core = makeWasmCore();
     const doc = "- [ ] buy milk\nelsewhere";
     const parent = document.createElement("div");
     document.body.appendChild(parent);
@@ -526,8 +548,8 @@ describe("v0.2 additions (M1)", () => {
     view.destroy();
   });
 
-  it("task checkbox prevents mousedown default (Chrome focus steal) and carries an aria-label", async () => {
-    const core = new MockCore();
+  it("task checkbox prevents mousedown default (Chrome focus steal) and carries an aria-label (wasm)", async () => {
+    const core = makeWasmCore();
     const doc = "- [ ] buy milk\nelsewhere";
     const parent = document.createElement("div");
     document.body.appendChild(parent);
@@ -566,11 +588,11 @@ describe("v0.2 additions (M1)", () => {
     view.destroy();
   });
 
-  it("ordered marker widget renders the computed number, replaced by raw digits when the line is revealed", async () => {
+  it("ordered marker widget renders the computed number, replaced by raw digits when the line is revealed (wasm)", async () => {
     // Contract v0.3 amendment (research/07 §0/§1.2): a concealed ordered
     // marker is a widget rendering the VIEW-COMPUTED number, never raw
     // source digits.
-    const core = new MockCore();
+    const core = makeWasmCore();
     const doc = "1. one\n2. two\nelsewhere";
     const parent = document.createElement("div");
     document.body.appendChild(parent);
@@ -605,10 +627,10 @@ describe("v0.2 additions (M1)", () => {
     view.destroy();
   });
 
-  it("ordered marker widgets display the view-computed sequence, not raw digits", async () => {
+  it("ordered marker widgets display the view-computed sequence, not raw digits (wasm)", async () => {
     // "1./1./3." must DISPLAY 1,2,3 (research/07 §0: CommonMark only fixes
     // the list's start number; sibling digits are cosmetic).
-    const core = new MockCore();
+    const core = makeWasmCore();
     const doc = "1. a\n1. b\n3. c\nelsewhere";
     const parent = document.createElement("div");
     document.body.appendChild(parent);
@@ -622,9 +644,6 @@ describe("v0.2 additions (M1)", () => {
     });
     await flush();
 
-    // .trim() strips the widget's trailing NBSP (the required marker
-    // whitespace, rendered as a non-collapsing space — see extension.ts):
-    // the assertion cares about the displayed digits+delim, not that detail.
     const markerText = () =>
       Array.from(view.contentDOM.querySelectorAll(".ox-ordered-marker")).map(
         (el) => el.textContent?.trim(),
@@ -634,7 +653,7 @@ describe("v0.2 additions (M1)", () => {
   });
 
   it("an unknown decoration style/widget kind from the core is ignored without crashing", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("hello world", core);
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const fake: Decoration[] = [
@@ -660,10 +679,12 @@ describe("v0.2 additions (M1)", () => {
   });
 });
 
-describe("hr rule suppression while editing", () => {
+describe("hr rule suppression while editing (wasm)", () => {
   it("swaps ox-hr for ox-hr-revealed when the cursor is on the hr line", async () => {
-    const core = new MockCore();
-    const view = makeView("before\n---\nafter", core);
+    // Blank line before the dashes: "---" directly under a paragraph would
+    // be its setext underline, not an hr (CommonMark).
+    const core = makeWasmCore();
+    const view = makeView("before\n\n---\nafter", core);
     await flush();
     // Concealment is a replace decoration: the raw `---` is NOT in the DOM
     // when concealed — find the line by its class instead of its text.
@@ -675,16 +696,16 @@ describe("hr rule suppression while editing", () => {
     expect(hrLine().classList.contains("ox-hr")).toBe(true);
     expect(hrLine().classList.contains("ox-hr-revealed")).toBe(false);
     // Cursor on the hr line (inside "---"): revealed class appears.
-    view.dispatch({ selection: { anchor: 8 } });
+    view.dispatch({ selection: { anchor: 9 } });
     await flush();
     expect(hrLine().classList.contains("ox-hr-revealed")).toBe(true);
     view.destroy();
   });
 });
 
-describe("FIX 1: TaskCheckboxWidget resolves its target from the DOM at click time", () => {
+describe("FIX 1: TaskCheckboxWidget resolves its target from the DOM at click time (wasm)", () => {
   function makeTaskView(doc: string) {
-    const core = new MockCore();
+    const core = makeWasmCore();
     const parent = document.createElement("div");
     document.body.appendChild(parent);
     const view = new EditorView({
@@ -755,15 +776,13 @@ describe("FIX 1: TaskCheckboxWidget resolves its target from the DOM at click ti
 
 describe("FIX 4: a thrown command() is logged and swallowed, never a mirror-desync resync", () => {
   it("Mod-b (runToggle): swallowed without re-loading the core or touching the doc", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("hello world", core);
     view.dispatch({ selection: { anchor: 0, head: 5 } });
 
     const loadSpy = vi.spyOn(core, "load");
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const cmdSpy = vi.spyOn(core, "command").mockImplementation(() => {
-      throw new Error("boom");
-    });
+    core.throwOnce("command", new Error("boom"));
 
     const boldKey = new KeyboardEvent("keydown", {
       key: "b",
@@ -780,13 +799,12 @@ describe("FIX 4: a thrown command() is logged and swallowed, never a mirror-desy
     // NOT a mirror-desync emergency, so no re-load.
     expect(loadSpy).not.toHaveBeenCalled();
     expect(view.state.doc.toString()).toBe("hello world");
-    cmdSpy.mockRestore();
     errSpy.mockRestore();
     view.destroy();
   });
 
-  it("checkbox click: swallowed without re-loading the core", async () => {
-    const core = new MockCore();
+  it("checkbox click: swallowed without re-loading the core (wasm renders the widget)", async () => {
+    const core = makeWasmCore();
     const doc = "- [ ] buy milk\nelsewhere";
     const parent = document.createElement("div");
     document.body.appendChild(parent);
@@ -822,16 +840,14 @@ describe("FIX 4: a thrown command() is logged and swallowed, never a mirror-desy
   });
 
   it("Tab (runIndent): swallowed WITHOUT falling back to indentMore (an error is not `null`)", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const doc = "- a\n- b\n";
     const view = makeView(doc, core);
     view.dispatch({ selection: { anchor: doc.indexOf("b") } });
 
     const loadSpy = vi.spyOn(core, "load");
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const cmdSpy = vi.spyOn(core, "command").mockImplementation(() => {
-      throw new Error("boom");
-    });
+    core.throwOnce("command", new Error("boom"));
 
     const tabKey = new KeyboardEvent("keydown", {
       key: "Tab",
@@ -847,13 +863,12 @@ describe("FIX 4: a thrown command() is logged and swallowed, never a mirror-desy
     // Must NOT have fallen back to indentMore's fixed 2-space indent: an
     // exception is handled-and-ignored, not "doesn't apply here".
     expect(view.state.doc.toString()).toBe(doc);
-    cmdSpy.mockRestore();
     errSpy.mockRestore();
     view.destroy();
   });
 
   it("Enter (runEnter): swallowed WITHOUT falling back to the default newline", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const doc = "- item\n";
     const parent = document.createElement("div");
     document.body.appendChild(parent);
@@ -868,9 +883,7 @@ describe("FIX 4: a thrown command() is logged and swallowed, never a mirror-desy
 
     const loadSpy = vi.spyOn(core, "load");
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const cmdSpy = vi.spyOn(core, "command").mockImplementation(() => {
-      throw new Error("boom");
-    });
+    core.throwOnce("command", new Error("boom"));
 
     const enterKey = new KeyboardEvent("keydown", {
       key: "Enter",
@@ -886,7 +899,6 @@ describe("FIX 4: a thrown command() is logged and swallowed, never a mirror-desy
     // Must NOT have fallen back to a plain newline: an exception is
     // handled-and-ignored, not "no list/quote context here".
     expect(view.state.doc.toString()).toBe(doc);
-    cmdSpy.mockRestore();
     errSpy.mockRestore();
     view.destroy();
   });
@@ -907,16 +919,14 @@ describe("history keymap error doctrine (undo/redo wrapped like every other core
     ["redo", "y", "redo"],
   ] as const) {
     it(`a thrown core.${kind}() is logged and recovered (mirror re-load), never an uncaught crash`, async () => {
-      const core = new MockCore();
+      const core = new StubCore();
       const view = makeView("abc", core);
       view.dispatch({ changes: { from: 3, to: 3, insert: "d" }, userEvent: "input.type" });
       await flush();
 
       const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const loadSpy = vi.spyOn(core, "load");
-      const histSpy = vi.spyOn(core, method).mockImplementation(() => {
-        throw new Error("boom");
-      });
+      core.throwOnce(method, new Error("boom"));
 
       // Must not throw out of the keymap handler.
       expect(() => view.contentDOM.dispatchEvent(modKey(key))).not.toThrow();
@@ -927,7 +937,6 @@ describe("history keymap error doctrine (undo/redo wrapped like every other core
       expect(loadSpy).toHaveBeenCalledWith(view.state.doc.toString());
       expect(core.getText()).toBe(view.state.doc.toString());
 
-      histSpy.mockRestore();
       errSpy.mockRestore();
       await flush();
       view.destroy();
@@ -937,15 +946,13 @@ describe("history keymap error doctrine (undo/redo wrapped like every other core
 
 describe("composition call sites are guarded (desync-emergency discipline)", () => {
   it("a throwing compositionBegin is logged and recovered via mirror re-load, never an uncaught crash", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("abc", core);
     await flush();
 
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const loadSpy = vi.spyOn(core, "load");
-    const beginSpy = vi.spyOn(core, "compositionBegin").mockImplementation(() => {
-      throw new Error("boom");
-    });
+    core.throwOnce("compositionBegin", new Error("boom"));
 
     expect(() =>
       view.contentDOM.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })),
@@ -957,23 +964,20 @@ describe("composition call sites are guarded (desync-emergency discipline)", () 
     expect(loadSpy).toHaveBeenCalledWith(view.state.doc.toString());
     expect(core.getText()).toBe(view.state.doc.toString());
 
-    beginSpy.mockRestore();
     errSpy.mockRestore();
     await flush();
     view.destroy();
   });
 
   it("a throwing compositionEnd still recovers AND schedules the catch-up rebuild", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("**bold** text", core);
     await flush();
 
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const loadSpy = vi.spyOn(core, "load");
     const decoSpy = vi.spyOn(core, "decorations");
-    const endSpy = vi.spyOn(core, "compositionEnd").mockImplementation(() => {
-      throw new Error("boom");
-    });
+    core.throwOnce("compositionEnd", new Error("boom"));
     const before = decoSpy.mock.calls.length;
 
     expect(() =>
@@ -988,7 +992,6 @@ describe("composition call sites are guarded (desync-emergency discipline)", () 
     expect(decoSpy.mock.calls.length).toBeGreaterThan(before);
     expect(core.getText()).toBe(view.state.doc.toString());
 
-    endSpy.mockRestore();
     errSpy.mockRestore();
     view.destroy();
   });
@@ -1005,8 +1008,8 @@ describe("Mod-Shift-Enter keymap (keyboard path for the task-checkbox toggle)", 
       cancelable: true,
     });
 
-  it("toggles the task on the cursor's line via core.command('toggleTask')", async () => {
-    const core = new MockCore();
+  it("toggles the task on the cursor's line via core.command('toggleTask') (wasm)", async () => {
+    const core = makeWasmCore();
     const doc = "- [ ] buy milk\nelsewhere";
     const view = makeView(doc, core);
     // Cursor in the middle of the item's text — toggleTask resolves the
@@ -1031,7 +1034,7 @@ describe("Mod-Shift-Enter keymap (keyboard path for the task-checkbox toggle)", 
   });
 
   it("does nothing on a non-task line (null falls through; no crash, no edit)", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const doc = "plain paragraph";
     const view = makeView(doc, core);
     view.dispatch({ selection: { anchor: 3 } });
@@ -1045,16 +1048,14 @@ describe("Mod-Shift-Enter keymap (keyboard path for the task-checkbox toggle)", 
   });
 
   it("a thrown toggleTask is swallowed like every other command site (no resync, no edit)", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const doc = "- [ ] task\n";
     const view = makeView(doc, core);
     view.dispatch({ selection: { anchor: 2 } });
 
     const loadSpy = vi.spyOn(core, "load");
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const cmdSpy = vi.spyOn(core, "command").mockImplementation(() => {
-      throw new Error("boom");
-    });
+    core.throwOnce("command", new Error("boom"));
 
     view.contentDOM.dispatchEvent(toggleKey());
     await flush();
@@ -1062,7 +1063,6 @@ describe("Mod-Shift-Enter keymap (keyboard path for the task-checkbox toggle)", 
     expect(errSpy).toHaveBeenCalled();
     expect(loadSpy).not.toHaveBeenCalled();
     expect(view.state.doc.toString()).toBe(doc);
-    cmdSpy.mockRestore();
     errSpy.mockRestore();
     view.destroy();
   });
@@ -1070,7 +1070,7 @@ describe("Mod-Shift-Enter keymap (keyboard path for the task-checkbox toggle)", 
 
 describe("FIX 6: skip-annotated dispatches are mirror-verified immediately", () => {
   it("detects and recovers when a host changeFilter alters a core-driven (skip-annotated) change", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const initial = "0123456789";
     const parent = document.createElement("div");
     document.body.appendChild(parent);
@@ -1129,14 +1129,14 @@ describe("FIX 6: skip-annotated dispatches are mirror-verified immediately", () 
     view.destroy();
   });
 
-  it("does NOT false-positive when a batched update carries a skip-annotated transaction that isn't last", async () => {
+  it("does NOT false-positive when a batched update carries a skip-annotated transaction that isn't last (wasm)", async () => {
     // A host may deliver several transactions in ONE ViewUpdate
     // (view.update([...]) / a batching dispatch). Core-driven changes were
     // applied to the core BEFORE the update runs, so while iterating the
     // batch, core.docLength() is already the FINAL length — comparing it
     // against a NON-last skip-annotated transaction's intermediate newDoc
     // used to false-positive and wipe undo history/anchors via load().
-    const core = new MockCore();
+    const core = makeWasmCore();
     const view = makeView("abc", core);
     await flush();
 
@@ -1177,8 +1177,8 @@ describe("FIX 6: skip-annotated dispatches are mirror-verified immediately", () 
     await flush();
   });
 
-  it("does NOT re-check (or false-positive) on an ordinary, unaltered core-driven change", async () => {
-    const core = new MockCore();
+  it("does NOT re-check (or false-positive) on an ordinary, unaltered core-driven change (wasm)", async () => {
+    const core = makeWasmCore();
     const view = makeView("hello world", core);
     await flush();
 
@@ -1199,9 +1199,9 @@ describe("FIX 6: skip-annotated dispatches are mirror-verified immediately", () 
   });
 });
 
-describe("widget DOM identity across unrelated edits", () => {
+describe("widget DOM identity across unrelated edits (wasm)", () => {
   it("keeps the SAME checkbox <input> node after typing above the task line", async () => {
-    const core = new MockCore();
+    const core = makeWasmCore();
     const doc = "line one\n- [ ] task\n";
     const parent = document.createElement("div");
     document.body.appendChild(parent);
@@ -1235,7 +1235,7 @@ describe("widget DOM identity across unrelated edits", () => {
 });
 
 describe("CoreChange selection placement", () => {
-  function makeCapturingView(doc: string, core: MockCore) {
+  function makeCapturingView(doc: string, core: OxidownCore) {
     const parent = document.createElement("div");
     document.body.appendChild(parent);
     const trs: Transaction[] = [];
@@ -1253,14 +1253,14 @@ describe("CoreChange selection placement", () => {
   }
 
   it("a CoreChange WITH a selection moves the cursor there and requests scrollIntoView", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const { view, trs } = makeCapturingView("abcdef", core);
     view.dispatch({ changes: { from: 6, to: 6, insert: "XYZ" }, userEvent: "input.type" });
     // Park the cursor somewhere the undo's mapped position would NOT land,
     // so the selection placement is distinguishable from default mapping.
     view.dispatch({ selection: { anchor: 1 } });
 
-    const change = core.undo(); // deletes "XYZ"; selection at the deletion site (6)
+    const change = core.undo(); // deletes "XYZ"; StubCore's selection lands at the splice end (6)
     expect(change).not.toBeNull();
     expect(change!.selection).not.toBeNull();
     trs.length = 0;
@@ -1276,15 +1276,15 @@ describe("CoreChange selection placement", () => {
     view.destroy();
   });
 
-  it("a CoreChange WITHOUT a selection leaves the user's mapped cursor alone (no scrollIntoView)", async () => {
-    const core = new MockCore();
+  it("a CoreChange WITHOUT a selection leaves the user's mapped cursor alone (no scrollIntoView) (wasm)", async () => {
+    const core = makeWasmCore();
     const doc = "- [ ] task\nelsewhere";
     const { view, trs } = makeCapturingView(doc, core);
     view.dispatch({ selection: { anchor: doc.length } });
 
-    const change = core.command("toggleTask", 2); // selection: null
+    const change = core.command("toggleTask", 2); // no selection on the wire
     expect(change).not.toBeNull();
-    expect(change!.selection).toBeNull();
+    expect(change!.selection ?? null).toBeNull();
     trs.length = 0;
     applyCoreChange(view, change!, "oxidown.command");
 
@@ -1301,7 +1301,7 @@ describe("CoreChange selection placement", () => {
 
 describe("streaming cursor preservation (AT / AFTER the insertion point, interleaved typing)", () => {
   it("cursor AT the insertion point does not ride the appended text", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("top\nbottom", core);
     const end = view.state.doc.length;
     view.dispatch({ selection: { anchor: end } });
@@ -1319,7 +1319,7 @@ describe("streaming cursor preservation (AT / AFTER the insertion point, interle
   });
 
   it("cursor AFTER the insertion point shifts by exactly the chunk length", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("start\nend", core);
     const cursor = "start\nen".length; // inside "end", after the stream point
     view.dispatch({ selection: { anchor: cursor } });
@@ -1335,7 +1335,7 @@ describe("streaming cursor preservation (AT / AFTER the insertion point, interle
   });
 
   it("user typing during the stream interleaves: both edits land, cursor stays with the user", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("top\nbottom", core);
     view.dispatch({ selection: { anchor: 3 } }); // end of "top"
 
@@ -1365,7 +1365,7 @@ describe("streaming cursor preservation (AT / AFTER the insertion point, interle
   });
 });
 
-describe("formatting keymap happy path (Mod-b / Mod-i / Mod-Shift-x / Mod-e)", () => {
+describe("formatting keymap happy path (Mod-b / Mod-i / Mod-Shift-x / Mod-e) (wasm)", () => {
   const cases: Array<[key: string, shift: boolean, delim: string]> = [
     ["b", false, "**"],
     ["i", false, "*"],
@@ -1374,7 +1374,7 @@ describe("formatting keymap happy path (Mod-b / Mod-i / Mod-Shift-x / Mod-e)", (
   ];
   for (const [key, shift, delim] of cases) {
     it(`Mod-${shift ? "Shift-" : ""}${key} wraps the selection in ${delim}`, async () => {
-      const core = new MockCore();
+      const core = makeWasmCore();
       const view = makeView("hello world", core);
       view.dispatch({ selection: { anchor: 6, head: 11 } });
 
@@ -1402,7 +1402,7 @@ describe("formatting keymap happy path (Mod-b / Mod-i / Mod-Shift-x / Mod-e)", (
 
 describe("drag freeze released by dragend (native drag-and-drop, no mouseup)", () => {
   it("defers the rebuild during the drag and flushes it on dragend", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const spy = vi.spyOn(core, "decorations");
     const view = makeView("hello **world**", core);
     await flush(); // settle the constructor build + any initial rebuild
@@ -1440,8 +1440,10 @@ describe("S7: surrogate-safe desync recovery", () => {
     expect(sanitizeSurrogates("x𐀀\uDC00y").length).toBe(5);
   });
 
-  it("recovers from a dispatched lone-surrogate insertion: no crash, core and view converge on U+FFFD", async () => {
-    const core = new MockCore();
+  it("recovers from a dispatched lone-surrogate insertion: no crash, core and view converge on U+FFFD (wasm)", async () => {
+    // The real adapter refuses the unpaired surrogate (InvalidPayload); the
+    // recovery path must sanitize the buffer before the reload.
+    const core = makeWasmCore();
     const view = makeView("abc", core);
     await flush();
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1472,8 +1474,8 @@ describe("S7: surrogate-safe desync recovery", () => {
     view.destroy();
   });
 
-  it("the repair transaction is skip-annotated and outside CM6 history", async () => {
-    const core = new MockCore();
+  it("the repair transaction is skip-annotated and outside CM6 history (wasm)", async () => {
+    const core = makeWasmCore();
     const parent = document.createElement("div");
     document.body.appendChild(parent);
     const trs: Transaction[] = [];
@@ -1509,9 +1511,9 @@ describe("S7: surrogate-safe desync recovery", () => {
   });
 });
 
-describe("S8: async language-load repaint (full pipeline)", () => {
+describe("S8: async language-load repaint (full pipeline) (wasm)", () => {
   it("paints tok-* marks once the lazily-loaded language resolves, with NO other events", async () => {
-    const core = new MockCore();
+    const core = makeWasmCore();
     // A fenced block whose language ("js") loads asynchronously on first use.
     const doc = "```js\nconst x = 1; // note\n```\n";
     const view = makeView(doc, core);
@@ -1545,7 +1547,7 @@ describe("S8: async language-load repaint (full pipeline)", () => {
 });
 
 describe("S9: readOnly editors never dispatch core edits", () => {
-  function makeReadOnlyView(doc: string, core: MockCore, anchor?: number) {
+  function makeReadOnlyView(doc: string, core: OxidownCore, anchor?: number) {
     const parent = document.createElement("div");
     document.body.appendChild(parent);
     return new EditorView({
@@ -1566,7 +1568,7 @@ describe("S9: readOnly editors never dispatch core edits", () => {
     new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
 
   it("formatting toggles (Mod-b) return false without calling core.command", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const doc = "hello world";
     const view = makeReadOnlyView(doc, core);
     view.dispatch({ selection: { anchor: 6, head: 11 } }); // selection changes are not edits
@@ -1582,7 +1584,7 @@ describe("S9: readOnly editors never dispatch core edits", () => {
   });
 
   it("Tab/Shift-Tab neither run indentList/outdentList nor fall back to indentMore/indentLess", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const doc = "- a\n- b\n";
     const view = makeReadOnlyView(doc, core, doc.indexOf("b"));
     const cmdSpy = vi.spyOn(core, "command");
@@ -1597,7 +1599,7 @@ describe("S9: readOnly editors never dispatch core edits", () => {
   });
 
   it("Enter and Mod-Shift-Enter return false without dispatching", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const doc = "- [ ] task\n";
     const view = makeReadOnlyView(doc, core, 6);
     const cmdSpy = vi.spyOn(core, "command");
@@ -1614,7 +1616,7 @@ describe("S9: readOnly editors never dispatch core edits", () => {
   });
 
   it("undo/redo keys never touch the core's history stacks", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const doc = "abc";
     const view = makeReadOnlyView(doc, core);
     const undoSpy = vi.spyOn(core, "undo");
@@ -1631,8 +1633,8 @@ describe("S9: readOnly editors never dispatch core edits", () => {
     view.destroy();
   });
 
-  it("checkbox clicks are ignored (no toggleTask dispatch, no edit)", async () => {
-    const core = new MockCore();
+  it("checkbox clicks are ignored (no toggleTask dispatch, no edit) (wasm)", async () => {
+    const core = makeWasmCore();
     const doc = "- [ ] buy milk\nelsewhere";
     // Cursor on a different line so the widget is rendered (reveal is line-level).
     const view = makeReadOnlyView(doc, core, doc.length);
@@ -1665,8 +1667,8 @@ describe("S10: validation refusals are logged quietly (no console.error)", () =>
       cancelable: true,
     });
 
-  it("multi-block Mod-b (a contract validation refusal) produces no console.error", async () => {
-    const core = new MockCore();
+  it("multi-block Mod-b (a contract validation refusal) produces no console.error (wasm)", async () => {
+    const core = makeWasmCore();
     const doc = "para one\n\npara two";
     const view = makeView(doc, core);
     // Selection spanning two paragraphs: the core refuses the toggle with an
@@ -1688,30 +1690,28 @@ describe("S10: validation refusals are logged quietly (no console.error)", () =>
   });
 
   it("routes on the Invalid* prefix: InvalidArgument goes to console.debug, other names stay loud", async () => {
-    const core = new MockCore();
+    const core = new StubCore();
     const view = makeView("hello world", core);
     view.dispatch({ selection: { anchor: 0, head: 5 } });
 
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const dbgSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
 
-    // A refusal spelled with the Rust core's own guard name (message prefix,
-    // no CoreErrorName type needed): quiet.
-    const cmdSpy = vi.spyOn(core, "command").mockImplementation(() => {
-      throw new Error("InvalidArgument: from must be a non-negative integer, got -1");
-    });
+    // A refusal spelled with the core's own guard name (message prefix, no
+    // CoreErrorName type needed): quiet.
+    core.throwOnce(
+      "command",
+      new Error("InvalidArgument: from must be a non-negative integer, got -1"),
+    );
     view.contentDOM.dispatchEvent(boldKey());
     expect(errSpy).not.toHaveBeenCalled();
     expect(dbgSpy).toHaveBeenCalled();
 
     // Any non-Invalid* name keeps the existing loud doctrine.
-    cmdSpy.mockImplementation(() => {
-      throw new Error("UnknownStream: boom");
-    });
+    core.throwOnce("command", new Error("UnknownStream: boom"));
     view.contentDOM.dispatchEvent(boldKey());
     expect(errSpy).toHaveBeenCalled();
 
-    cmdSpy.mockRestore();
     errSpy.mockRestore();
     dbgSpy.mockRestore();
     await flush();
@@ -1719,9 +1719,9 @@ describe("S10: validation refusals are logged quietly (no console.error)", () =>
   });
 });
 
-describe("S11: a mixed skip + user batched update routes through desync recovery", () => {
+describe("S11: a mixed skip + user batched update routes through desync recovery (wasm)", () => {
   it("does not forward user splices computed against the wrong core doc", async () => {
-    const core = new MockCore();
+    const core = makeWasmCore();
     const view = makeView("abc", core);
     await flush();
 
@@ -1763,7 +1763,7 @@ describe("S11: a mixed skip + user batched update routes through desync recovery
   it("(control) an all-skip batched update still forwards nothing and loads nothing", async () => {
     // The mixed-case detector must not regress the legitimate all-skip batch
     // (already covered in FIX 6, re-asserted here against the new pre-scan).
-    const core = new MockCore();
+    const core = makeWasmCore();
     const view = makeView("abc", core);
     await flush();
 
@@ -1793,12 +1793,12 @@ describe("S11: a mixed skip + user batched update routes through desync recovery
 
 describe("S12: drawSelection opt-out + core-change history tagging", () => {
   it("bundles drawSelection by default; `drawSelection: false` omits it", () => {
-    const core1 = new MockCore();
+    const core1 = new StubCore();
     const view1 = makeView("abc", core1);
     expect(view1.dom.querySelector(".cm-cursorLayer")).not.toBeNull();
     view1.destroy();
 
-    const core2 = new MockCore();
+    const core2 = new StubCore();
     const parent = document.createElement("div");
     document.body.appendChild(parent);
     const view2 = new EditorView({
@@ -1812,8 +1812,8 @@ describe("S12: drawSelection opt-out + core-change history tagging", () => {
     view2.destroy();
   });
 
-  it("applyCoreChange transactions carry addToHistory: false — a wrongly-enabled CM6 history records nothing", async () => {
-    const core = new MockCore();
+  it("applyCoreChange transactions carry addToHistory: false — a wrongly-enabled CM6 history records nothing (wasm)", async () => {
+    const core = makeWasmCore();
     const parent = document.createElement("div");
     document.body.appendChild(parent);
     const trs: Transaction[] = [];
