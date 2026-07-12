@@ -277,6 +277,149 @@ fn user_deletes_part_of_streamed_text_then_stream_continues() {
     assert_eq!(mirror, ed.get_text());
 }
 
+/// Regression (CRITICAL, found by review probe): the stream-append cascade
+/// used to translate the chunk position through an above unit's inverse
+/// with plain `map_pos`, which collapses a position strictly inside a
+/// delete-span to the span START — but the cascade's batch rewrite splits
+/// such a span placing the RESTORE TEXT before the surviving chunk, so the
+/// chunk's true deeper-frame position is start + restore-text length.
+/// Whenever a user REPLACEMENT (delete+insert in one splice) covered the
+/// stream's insertion point, the stream unit's merged delete landed short
+/// by the restore text's length: this exact script used to undo to
+/// "a WXONbeta" instead of "alpha beta".
+#[test]
+fn stacked_user_replacements_above_stream_unit_round_trip() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha beta");
+    let mut mirror = ed.get_text();
+    let id = ed.stream_open(6).unwrap();
+    append(&mut ed, &mut mirror, id, "WX");
+    assert_eq!(ed.get_text(), "alpha WXbeta");
+
+    // User replacement 1: [0,8) ("alpha WX" — original text AND streamed
+    // text together) becomes "zz ".
+    let batch = vec![Splice { at: 0, delete: 8, insert: "zz ".into() }];
+    ed.apply_edit(ed.revision(), &batch, EditOrigin::User, 0.0).unwrap();
+    apply_to_mirror(&mut mirror, &batch);
+    assert_eq!(ed.get_text(), "zz beta");
+
+    // User replacement 2, stacked above the first: [1,6) becomes "e".
+    let batch = vec![Splice { at: 1, delete: 5, insert: "e".into() }];
+    ed.apply_edit(ed.revision(), &batch, EditOrigin::User, 10_000.0).unwrap();
+    apply_to_mirror(&mut mirror, &batch);
+    assert_eq!(ed.get_text(), "zea");
+
+    // The stream keeps flowing: this append cascades through BOTH
+    // replacement units (and lands strictly inside their inverse spans).
+    append(&mut ed, &mut mirror, id, "ONE ");
+    ed.stream_close(id);
+    let final_text = ed.get_text();
+    assert_eq!(ed.history_depths().0, 3, "stream unit + two user units");
+
+    // Full undo restores the EXACT original document...
+    let mut undo_texts = Vec::new();
+    for _ in 0..3 {
+        let u = ed.undo().unwrap();
+        apply_to_mirror(&mut mirror, &u.splices);
+        assert_eq!(mirror, ed.get_text(), "undo splices valid on view buffer");
+        undo_texts.push(ed.get_text());
+    }
+    assert_eq!(ed.get_text(), "alpha beta");
+    assert!(ed.undo().is_none());
+
+    // ...and full redo the exact final one, retracing every intermediate.
+    for expect in undo_texts.iter().rev().skip(1).chain([&final_text]) {
+        let r = ed.redo().unwrap();
+        apply_to_mirror(&mut mirror, &r.splices);
+        assert_eq!(mirror, ed.get_text(), "redo splices valid on view buffer");
+        assert_eq!(&ed.get_text(), expect);
+    }
+    assert!(ed.redo().is_none());
+}
+
+/// Multibyte variant of the cascade regression above: with 2-byte and
+/// 4-byte chars at the same offsets, the mis-translated cascade position
+/// landed the stream unit's merged delete mid-character, and `undo`
+/// PANICKED inside ropey (byte_slice char-boundary) across the boundary
+/// instead of merely corrupting text.
+#[test]
+fn stacked_user_replacements_above_stream_unit_round_trip_multibyte() {
+    let mut ed = Editor::new(1);
+    ed.load("αλφα βήτα"); // 9 chars, 2 bytes each; UTF-16 offsets 0..9
+    let original = ed.get_text();
+    let mut mirror = ed.get_text();
+    let id = ed.stream_open(5).unwrap(); // after "αλφα "
+    append(&mut ed, &mut mirror, id, "ŵ😀");
+    // User replacement 1 covers the streamed text: [0,8) -> "žž ".
+    let batch = vec![Splice { at: 0, delete: 8, insert: "žž ".into() }];
+    ed.apply_edit(ed.revision(), &batch, EditOrigin::User, 0.0).unwrap();
+    apply_to_mirror(&mut mirror, &batch);
+    // User replacement 2, stacked above: [1,5) -> "é".
+    let batch = vec![Splice { at: 1, delete: 4, insert: "é".into() }];
+    ed.apply_edit(ed.revision(), &batch, EditOrigin::User, 10_000.0).unwrap();
+    apply_to_mirror(&mut mirror, &batch);
+    // Stream continues through both replacement inverses.
+    append(&mut ed, &mut mirror, id, "ÖNÉ 😀");
+    ed.stream_close(id);
+    let final_text = ed.get_text();
+    assert_eq!(ed.history_depths().0, 3);
+
+    for _ in 0..3 {
+        let u = ed.undo().unwrap(); // pre-fix: ropey char-boundary panic here
+        apply_to_mirror(&mut mirror, &u.splices);
+        assert_eq!(mirror, ed.get_text());
+    }
+    assert_eq!(ed.get_text(), original);
+    for _ in 0..3 {
+        let r = ed.redo().unwrap();
+        apply_to_mirror(&mut mirror, &r.splices);
+        assert_eq!(mirror, ed.get_text());
+    }
+    assert_eq!(ed.get_text(), final_text);
+}
+
+/// A replacement whose span strictly CONTAINS the stream's insertion point
+/// mid-stream, twice over (two stacked user units above the stream unit):
+/// the next append must cascade to the right spot in every deeper frame and
+/// the whole history must round-trip exactly.
+#[test]
+fn replacements_containing_the_insertion_point_mid_stream_round_trip() {
+    let mut ed = Editor::new(1);
+    ed.load("hello world");
+    let mut mirror = ed.get_text();
+    let id = ed.stream_open(5).unwrap(); // after "hello"
+    append(&mut ed, &mut mirror, id, " S1");
+    assert_eq!(ed.get_text(), "hello S1 world");
+
+    // Replacement spanning across the insertion anchor (which sits after
+    // "S1"): [3,10) -> "-R1-".
+    let batch = vec![Splice { at: 3, delete: 7, insert: "-R1-".into() }];
+    ed.apply_edit(ed.revision(), &batch, EditOrigin::User, 0.0).unwrap();
+    apply_to_mirror(&mut mirror, &batch);
+    // A second overlapping replacement stacked above: [2,7) -> "X".
+    let batch = vec![Splice { at: 2, delete: 5, insert: "X".into() }];
+    ed.apply_edit(ed.revision(), &batch, EditOrigin::User, 10_000.0).unwrap();
+    apply_to_mirror(&mut mirror, &batch);
+
+    append(&mut ed, &mut mirror, id, " S2");
+    ed.stream_close(id);
+    let final_text = ed.get_text();
+    assert_eq!(ed.history_depths().0, 3, "stream unit + two user units");
+
+    for _ in 0..3 {
+        let u = ed.undo().unwrap();
+        apply_to_mirror(&mut mirror, &u.splices);
+        assert_eq!(mirror, ed.get_text());
+    }
+    assert_eq!(ed.get_text(), "hello world", "full undo restores the original");
+    for _ in 0..3 {
+        let r = ed.redo().unwrap();
+        apply_to_mirror(&mut mirror, &r.splices);
+        assert_eq!(mirror, ed.get_text());
+    }
+    assert_eq!(ed.get_text(), final_text, "full redo restores the final text");
+}
+
 #[test]
 fn two_concurrent_streams_have_independent_units() {
     let mut ed = Editor::new(1);
@@ -595,4 +738,113 @@ fn undo_redo_round_trip_with_interleaved_user_edit_mid_stream() {
     assert_eq!(ed.get_text(), "base ");
     assert_eq!(mirror, ed.get_text());
     assert!(ed.undo().is_none());
+}
+
+// ------------------------------------------------------- randomized fuzz --
+
+/// UTF-16 offsets of every char boundary of `s` (0..=len inclusive), so
+/// randomly chosen splice positions never split a surrogate pair.
+fn utf16_boundaries(s: &str) -> Vec<usize> {
+    let mut v = Vec::with_capacity(s.chars().count() + 1);
+    let mut cu = 0;
+    v.push(0);
+    for ch in s.chars() {
+        cu += ch.len_utf16();
+        v.push(cu);
+    }
+    v
+}
+
+/// Seeded randomized interleaving of stream appends and single-splice user
+/// edits — insertions, deletions, and REPLACEMENTS (delete+insert in one
+/// splice), multibyte included, landing anywhere in the document including
+/// inside the already-streamed region. After closing, a full undo must
+/// restore the exact original document and a full redo the exact final one,
+/// with every returned splice batch mirror-verified along the way.
+///
+/// Deterministic: fixed per-seed `StdRng` seeds, no clocks. Seed count
+/// scales with `OXIDOWN_FUZZ_EDITS` (default 300, same knob as
+/// `reparse_equivalence.rs`).
+///
+/// Regression coverage: the stream-append cascade's replacement-inverse
+/// mis-translation (see `stacked_user_replacements_above_stream_unit_round_trip`)
+/// failed 9/300 of exactly this interleaving shape before the fix — user
+/// replacements over the streamed region with later appends cascading
+/// through them — as text corruption or a ropey char-boundary panic.
+#[test]
+fn fuzz_interleaved_user_replacements_and_appends_round_trip() {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    let seeds: u64 = std::env::var("OXIDOWN_FUZZ_EDITS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+    const CHUNKS: &[&str] = &[
+        "W",
+        "XY",
+        "ONE ",
+        "chunk of text ",
+        "你好",
+        "é😀",
+        "line\n",
+        "**b**",
+    ];
+    const INSERTS: &[&str] = &["z", "zz ", "é", "你好", "# ", "\n", "<U>", "😀"];
+    const DOCS: &[&str] = &["alpha beta", "one two three four", "héllo wörld 你好", ""];
+    for seed in 0..seeds {
+        let mut rng = StdRng::seed_from_u64(0x0dd5_eed0_0000 + seed);
+        let base = DOCS[(seed as usize) % DOCS.len()];
+        let mut ed = Editor::new(1);
+        ed.load(base);
+        let mut mirror = ed.get_text();
+        let open_bounds = utf16_boundaries(&mirror);
+        let open16 = open_bounds[rng.gen_range(0..open_bounds.len())];
+        let id = ed.stream_open(open16).unwrap();
+        let mut now = 0.0f64;
+        for _ in 0..rng.gen_range(4..14) {
+            if rng.gen_bool(0.5) {
+                let chunk = CHUNKS[rng.gen_range(0..CHUNKS.len())];
+                append(&mut ed, &mut mirror, id, chunk);
+            } else {
+                // Random single-splice user edit; most carry BOTH a delete
+                // range and an insert (replacements — the shape the cascade
+                // bug needed).
+                let bounds = utf16_boundaries(&mirror);
+                let ai = rng.gen_range(0..bounds.len());
+                let bi = (ai + rng.gen_range(0..6)).min(bounds.len() - 1);
+                let (at, end) = (bounds[ai], bounds[bi]);
+                let insert = if rng.gen_bool(0.7) {
+                    INSERTS[rng.gen_range(0..INSERTS.len())]
+                } else {
+                    ""
+                };
+                if end == at && insert.is_empty() {
+                    continue;
+                }
+                let batch = vec![Splice { at, delete: end - at, insert: insert.into() }];
+                now += 1000.0; // outside the coalesce window: one unit per edit
+                ed.apply_edit(ed.revision(), &batch, EditOrigin::User, now).unwrap();
+                apply_to_mirror(&mut mirror, &batch);
+                assert_eq!(mirror, ed.get_text(), "seed {seed}: edit mirror agreement");
+            }
+        }
+        ed.stream_close(id);
+        let final_text = ed.get_text();
+
+        while let Some(u) = ed.undo() {
+            apply_to_mirror(&mut mirror, &u.splices);
+            assert_eq!(mirror, ed.get_text(), "seed {seed}: undo splices mirror-valid");
+        }
+        assert_eq!(ed.get_text(), base, "seed {seed}: full undo restores the original");
+        while let Some(r) = ed.redo() {
+            apply_to_mirror(&mut mirror, &r.splices);
+            assert_eq!(mirror, ed.get_text(), "seed {seed}: redo splices mirror-valid");
+        }
+        assert_eq!(
+            ed.get_text(),
+            final_text,
+            "seed {seed}: full redo restores the final text"
+        );
+    }
 }

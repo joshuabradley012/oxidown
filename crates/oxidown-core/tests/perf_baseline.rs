@@ -8,6 +8,12 @@
 //! Run everything (release mode is required for representative numbers):
 //!   cargo test -p oxidown-core --release --test perf_baseline -- --ignored --nocapture
 //!
+//! NOTE on enforcement: CI runs this suite non-fatally (`|| true` in
+//! ci.yml's perf step — shared runners are too noisy to gate on wall time),
+//! so every ceiling below is a LOCAL trip-wire, not a CI gate. Where a
+//! comment says a regression "trips" an assert, that means under a local
+//! `--release --ignored` run; CI merely prints the numbers.
+//!
 //! Iteration counts default to fast-CI-friendly values; override via the
 //! `OXIDOWN_PERF_ITERS` env var (applies as a per-test base count — see each
 //! test for how it's used) for a deeper local run:

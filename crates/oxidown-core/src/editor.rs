@@ -790,6 +790,25 @@ impl Editor {
     /// Re-parse only `[region_start, end)` and splice the results into the
     /// overlay and block index. `batch` (the applied append) lands entirely
     /// at/after `region_start`, so everything before it is untouched.
+    ///
+    /// COST NOTE (known limitation): per-append work is O(tail block), not
+    /// O(chunk) — the whole open block is re-parsed on every append. A
+    /// stream that never closes its tail block (one long paragraph with no
+    /// blank lines, or a single top-level list — a realistic AI-output
+    /// shape) therefore pays O(streamed-so-far) per append and O(n²) total;
+    /// measured ~36µs → ~745µs per 50-byte append as the tail block grows
+    /// to ~232KB. Characterized (not gated) by `tests/stream_perf.rs::
+    /// stream_append_into_never_closing_tail_block_grows_per_append`. This
+    /// is inherent to exact overlay equivalence with a non-incremental
+    /// parser: inline structure is globally coupled WITHIN a block (an
+    /// appended `*` can close an emphasis opened at the block's first
+    /// character; a line gaining `===` re-types the whole paragraph as a
+    /// heading; an appended backtick can re-pair every code span), so any
+    /// bounded per-append update would have to re-derive the parser's
+    /// delimiter state to stay provably equivalent — exactly the divergence
+    /// risk the `reparse_equivalence` gate exists to forbid. A real fix
+    /// needs an incremental inline parser (or per-block node caching keyed
+    /// on block text), deferred beyond M1.
     fn reparse_tail(&mut self, region_start: usize, batch: &[ByteSplice]) {
         self.reparse_counts.tail += 1;
         // COST NOTE: this `retain` walks the ENTIRE overlay (the kept prefix

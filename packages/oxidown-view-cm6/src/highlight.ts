@@ -12,7 +12,9 @@
  *
  * Languages load asynchronously the first time they appear; `onLoad` lets
  * the caller schedule a decoration rebuild when one arrives. Unknown
- * languages are remembered as misses and skipped thereafter.
+ * languages are remembered as misses and skipped thereafter; a FAILED load
+ * of a known language is retried on the next rebuild instead (a transient
+ * network error must not disable the language page-wide until reload).
  */
 
 import type { EditorState } from "@codemirror/state";
@@ -110,9 +112,14 @@ function supportFor(lang: string, onLoad: () => void): LanguageSupport | null | 
       for (const cb of callbacks) cb();
     },
     () => {
-      // A failed load is a known miss: there is nothing to repaint, so the
-      // pending callbacks are dropped, not invoked.
-      supports.set(key, null);
+      // A FAILED load (network hiccup, CDN outage) is NOT a permanent miss —
+      // only an unknown language is (the `!desc` branch above). Leave
+      // `supports` unset so the next decoration rebuild retries the load.
+      // There is nothing to repaint right now, so the pending callbacks are
+      // dropped, not invoked — which is also what prevents a retry loop:
+      // a failure schedules nothing itself, so the retry only happens when
+      // an ordinary trigger (edit/selection/viewport change) rebuilds
+      // decorations anyway.
       loading.delete(key);
     },
   );

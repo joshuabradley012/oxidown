@@ -436,6 +436,72 @@ describe("MockCore undo/redo and coalescing", () => {
   });
 });
 
+describe("MockCore undo/redo use the exact recorded batches, not a collapsed diff", () => {
+  // A multi-splice unit collapsed through diffSplices becomes ONE
+  // prefix/suffix splice; every live position strictly inside it (anchors,
+  // an open stream's insertion anchor, the composition range) teleports to
+  // its start when mapped. undo()/redo() must map through the recorded
+  // exact batches instead — the same discipline applyStreamText's cascade
+  // already uses (verified divergence from the Rust core otherwise).
+
+  it("undo of a multi-splice command returns the exact inverse batch and restores anchors", () => {
+    const { core } = makeCore("a bold c");
+    const id = core.createAnchor(4, "before"); // inside "bold"
+    core.command("toggleStrong", 2, 6); // splices: insert ** at 2 and at 6
+    expect(core.getText()).toBe("a **bold** c");
+    expect(core.resolveAnchor(id)).toBe(6);
+
+    const change = core.undo();
+    // The exact recorded inverse (two deletions), not one collapsed splice
+    // {at: 2, delete: 8, insert: "bold"}.
+    expect(change!.splices).toEqual([
+      { at: 2, delete: 2, insert: "" },
+      { at: 8, delete: 2, insert: "" },
+    ]);
+    expect(core.getText()).toBe("a bold c");
+    expect(core.resolveAnchor(id)).toBe(4); // the collapsed diff resolved 2
+  });
+
+  it("redo re-applies the exact forward batch, keeping anchors aligned", () => {
+    const { core } = makeCore("a bold c");
+    const id = core.createAnchor(4, "before");
+    core.command("toggleStrong", 2, 6);
+    core.undo();
+    const change = core.redo();
+    expect(change!.splices).toEqual([
+      { at: 2, delete: 0, insert: "**" },
+      { at: 6, delete: 0, insert: "**" },
+    ]);
+    expect(core.getText()).toBe("a **bold** c");
+    expect(core.resolveAnchor(id)).toBe(6);
+    // And a second round trip stays stable (the redo re-recorded the exact
+    // inverse on the undo stack).
+    core.undo();
+    expect(core.resolveAnchor(id)).toBe(4);
+  });
+
+  it("an open stream's insertion anchor survives undo of a multi-splice command at the right spot", () => {
+    const { core } = makeCore("a bold c");
+    const sid = core.streamOpen(4); // between "bo" and "ld"
+    core.command("toggleStrong", 2, 6);
+    core.undo(); // strips the delimiters; the stream point must return to 4
+    const change = core.streamAppend(sid, "X");
+    expect(change.splices).toEqual([{ at: 4, delete: 0, insert: "X" }]);
+    expect(core.getText()).toBe("a boXld c");
+    core.streamClose(sid);
+  });
+
+  it("coalesced units (exact inverse invalidated) still undo via the single-splice diff fallback", () => {
+    const { core, clock } = makeCore("");
+    core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "a" }], "user");
+    clock.advance(10);
+    core.applyEdit(core.revision(), [{ at: 1, delete: 0, insert: "b" }], "user"); // coalesces
+    const change = core.undo();
+    expect(change!.splices).toEqual([{ at: 0, delete: 2, insert: "" }]);
+    expect(core.getText()).toBe("");
+  });
+});
+
 describe("MockCore composition stability rule", () => {
   it("conceal spans TOUCHED by the composition range are emitted as delim marks (per-span, core parity)", () => {
     const doc = "**bold** x"; // delimiter spans [0, 2) and [6, 8)

@@ -7,7 +7,12 @@
 //! Streams ~2000 chunks of ~50 chars each into a ~100KB document (doc grows
 //! to ~200KB) and asserts the MEAN append cost stays under the 1ms budget
 //! (boundary v0.2 "Append fast-path"). The fast path re-parses only the
-//! open tail block, so per-append cost must not scale with document size.
+//! open tail block, so per-append cost must not scale with DOCUMENT size —
+//! it does scale with the open TAIL BLOCK's size (the whole block is
+//! re-parsed per append; see `reparse_tail`'s COST NOTE in editor.rs). The
+//! budget test below passes partly because its chunk pool injects a block
+//! boundary every ~40 chunks, resetting the tail block; the second test
+//! characterizes the never-closing-block worst case explicitly.
 
 use std::time::Instant;
 
@@ -90,5 +95,94 @@ fn stream_append_mean_under_1ms_on_100kb() {
     let t = Instant::now();
     ed.undo().unwrap();
     println!("  undo of the whole stream: {:.0}µs", t.elapsed().as_secs_f64() * 1e6);
+    assert_eq!(ed.get_text(), doc, "undo reverts the entire stream");
+}
+
+/// Characterization (deliberately NOT a growth gate): per-append cost when
+/// the streamed content never closes the tail block — one ever-growing
+/// paragraph with no blank lines, a realistic AI-output shape (a single
+/// top-level list with no blank lines behaves identically: one List block).
+/// The tail fast path re-parses the whole open block on every append, so
+/// per-append cost grows linearly with streamed-so-far (quadratic total) —
+/// see `reparse_tail`'s COST NOTE in editor.rs for why a bounded per-append
+/// update isn't provably safe with a non-incremental inline parser. This
+/// test PRINTS the growth curve (decile means + last/first ratio) and
+/// asserts only a generous absolute ceiling, so it stays CI-safe while
+/// still catching an order-of-magnitude regression — and keeps passing if
+/// the growth is ever actually fixed.
+#[test]
+#[ignore = "perf characterization; run with --ignored --nocapture"]
+fn stream_append_into_never_closing_tail_block_grows_per_append() {
+    // ~100KB of closed blocks above: untouched by the appends, present so
+    // the measurement reflects tail-block growth, not document size.
+    let doc = generate_doc(100 * 1024);
+    let mut ed = Editor::new(1);
+    ed.load(&doc);
+    let id = ed.stream_open(ed.doc_len_utf16()).unwrap();
+
+    // Open a fresh paragraph, then stream ~4600 chunks that NEVER produce a
+    // blank line: soft line breaks only, so the tail block never closes and
+    // grows to ~230KB. Inline-marked content (the realistic AI-output
+    // shape), so the per-append re-parse pays real inline work.
+    ed.stream_append(id, "\n\n").unwrap();
+    const CHUNKS: usize = 4600;
+    let chunk_pool = [
+        "words streaming into one endless paragraph block h", // 50 bytes
+        "lorem **ipsum** dolor *sit* amet `consectetur` and ",
+        "prose with 你好 CJK and an emoji 😀 plus _emphasis_\n", // soft break
+        "more [links](https://example.com) and ~~strikes~~ ",
+    ];
+    let mut samples_us: Vec<f64> = Vec::with_capacity(CHUNKS);
+    let mut appended = 2usize;
+    for i in 0..CHUNKS {
+        let chunk = chunk_pool[i % chunk_pool.len()];
+        appended += chunk.len();
+        let t = Instant::now();
+        ed.stream_append(id, chunk).unwrap();
+        samples_us.push(t.elapsed().as_secs_f64() * 1e6);
+    }
+    ed.stream_close(id);
+    assert_eq!(ed.get_text().len(), doc.len() + appended);
+    assert_eq!(ed.history_depths().0, 1, "still one undo unit");
+    let blocks = ed.block_index().blocks();
+    let tail_span = blocks.last().unwrap().span.clone();
+    assert!(
+        // Slack for the opening "\n\n" and a possibly-excluded trailing
+        // newline; the point is the whole streamed body is ONE block.
+        tail_span.end - tail_span.start >= appended - 8,
+        "the streamed content stayed one never-closing tail block \
+         (tail span {tail_span:?}, appended {appended} bytes)"
+    );
+
+    let bucket = CHUNKS / 10;
+    let decile_means: Vec<f64> = samples_us
+        .chunks(bucket)
+        .map(|c| c.iter().sum::<f64>() / c.len() as f64)
+        .collect();
+    println!(
+        "never-closing tail block: per-append decile means over {CHUNKS} \
+         ~50-byte chunks (tail block grows to ~{}KB):",
+        appended / 1024
+    );
+    for (i, m) in decile_means.iter().enumerate() {
+        println!(
+            "  decile {i}: {m:>6.0}µs  (tail block ~{}KB)",
+            (i + 1) * bucket * 50 / 1024
+        );
+    }
+    let first = decile_means[0];
+    let last = *decile_means.last().unwrap();
+    println!("  growth ratio last/first decile: {:.1}x", last / first);
+
+    // Ceiling only (measured last-decile mean ~500-800µs at ~230KB on a
+    // 2023 laptop): an order of magnitude of headroom, so CI variance never
+    // trips it — and a fix for the growth only makes it greener.
+    assert!(
+        last < 10_000.0,
+        "last-decile mean {last:.0}µs blew the 10ms characterization ceiling"
+    );
+
+    // The one-step undo must still revert the entire stream exactly.
+    ed.undo().unwrap();
     assert_eq!(ed.get_text(), doc, "undo reverts the entire stream");
 }

@@ -208,6 +208,35 @@ describe("adaptWasmCore boundary guards (fake wasm instance)", () => {
     expect(core.applyEdit(1, [{ at: 0, delete: 0, insert: EMOJI }], "user")).toBeGreaterThan(0);
   });
 
+  it("load clears every stream's pending surrogate (streamClose after load stays a null no-op)", () => {
+    const { inner, calls } = fakeInner();
+    const core = adaptWasmCore(inner);
+    const id = core.streamOpen(0);
+    core.streamAppend(id, `a${HIGH}`); // trailing high surrogate withheld in the adapter
+    core.load("fresh"); // core-side load clears streams; the buffer must follow
+    // No stale U+FFFD flush is appended to the (now dead) stream id.
+    expect(core.streamClose(id)).toBeNull();
+    expect(calls.filter((c) => c.method === "streamAppend").map((c) => c.text)).toEqual(["a"]);
+  });
+
+  it("applyEdit checks baseRevision/staleness BEFORE the surrogate payload check (mock precedence)", () => {
+    const { inner } = fakeInner();
+    const core = adaptWasmCore(inner);
+    core.load("abc"); // fake revision -> 1
+    // Malformed baseRevision wins over the bad payload.
+    expect(() => core.applyEdit(-1, [{ at: 0, delete: 0, insert: HIGH }], "user")).toThrow(
+      "InvalidArgs: baseRevision must be a non-negative integer, got -1",
+    );
+    // Staleness wins over the bad payload.
+    expect(() => core.applyEdit(7, [{ at: 0, delete: 0, insert: HIGH }], "user")).toThrow(
+      "StaleRevision: core is at revision 1, caller passed 7",
+    );
+    // A current revision still hits the surrogate check.
+    expect(() => core.applyEdit(1, [{ at: 0, delete: 0, insert: HIGH }], "user")).toThrow(
+      "InvalidPayload: splice insert contains an unpaired surrogate",
+    );
+  });
+
   it("destroy frees the wasm instance exactly once", () => {
     const { inner, calls } = fakeInner();
     const core = adaptWasmCore(inner);

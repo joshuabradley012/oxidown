@@ -41,10 +41,14 @@
 //!   `InvalidArgument`, matching `set_heading`'s code-context check — the
 //!   nearest analog: the target is a well-formed range that the command
 //!   simply doesn't apply to, not a malformed argument.
-//! * Stripping a code span also sheds its CommonMark padding pair iff the
-//!   content has both a leading and a trailing space and is not all spaces
-//!   (the exact inverse of the ON path's padding rule), so padded spans
-//!   round-trip byte-identically (`` `edge `` ⇄ ``` `` `edge `` ```).
+//! * The code ON path space-pads its delimiters when the final content is
+//!   backtick-edged OR space-edged (but not all spaces) — the exact shapes
+//!   CommonMark unpads at render time. Stripping a code span sheds one such
+//!   padding pair iff the content has both a leading and a trailing space
+//!   and is not all spaces (the same render-time unpadding condition, and a
+//!   byte-exact inverse of the ON path's rule), so spans round-trip
+//!   byte-identically (`` `edge `` ⇄ ``` `` `edge `` ```, `" x "` ⇄
+//!   `` `· x ·` ``).
 //!
 //! ## setHeading
 //!
@@ -500,7 +504,17 @@ pub fn toggle_inline(
 
 /// Canonical delimiter pair for an ON/EXTEND toggle. For code, the run is
 /// one backtick longer than the longest backtick run remaining in the final
-/// content, space-padded when that content starts or ends with a backtick.
+/// content, space-padded when that content starts or ends with a backtick
+/// OR a space (but is not all spaces). The backtick case keeps the edge
+/// backtick out of the delimiter run; the space case is CommonMark's own
+/// requirement — `` ` x ` `` renders as `x` (the renderer sheds one pad
+/// pair), so edge spaces survive rendering only under a pad pair. All-space
+/// content is exempt because CommonMark never unpads it (`` ` ` `` renders
+/// as a literal space), so a pad there would become content. Padding
+/// whenever the content is space-edged also keeps [`strip_spans`]' shed
+/// rule a byte-exact inverse — counterexample without it: `" x "` → ON →
+/// `` `· x ·` `` had no pad to shed, yet OFF shed the user's own edge
+/// spaces, returning `"x"` (data loss).
 fn delimiters(
     kind: InlineKind,
     src: &SrcBytes,
@@ -534,7 +548,9 @@ fn delimiters(
                 }
             }
             let ticks = "`".repeat(longest + 1);
-            if content.starts_with('`') || content.ends_with('`') {
+            let space_edged = (content.starts_with(' ') || content.ends_with(' '))
+                && !content.bytes().all(|b| b == b' ');
+            if content.starts_with('`') || content.ends_with('`') || space_edged {
                 (format!("{ticks} "), format!(" {ticks}"))
             } else {
                 (ticks.clone(), ticks)
@@ -549,7 +565,7 @@ fn delimiters(
 /// each side — iff the raw content has BOTH a leading and a trailing space
 /// and is not all spaces (the exact condition under which CommonMark strips
 /// a pad pair at render time, and the shape [`delimiters`]' ON path emits
-/// for edge-backtick content). Counterexample without this: `` `edge `` →
+/// for edge-backtick and space-edged content). Counterexample without this: `` `edge `` →
 /// ON → ``` `` `edge `` ``` → OFF left `· `edge ·` (two stray pad spaces)
 /// instead of round-tripping byte-identically. `` ` ` `` (all-space content)
 /// keeps its space: CommonMark never unpads it, so neither do we.
@@ -1423,7 +1439,13 @@ pub fn enter(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Opti
             src.push_slice_to(&mut prefix, line_range.start..ctx.quote_end); // quote prefix
             src.push_slice_to(&mut prefix, ctx.quote_end..item_start); // leading indent
             if let Some((_, value, delim)) = ordered_marker_value(src, item_start) {
-                prefix.push_str(&(value + 1).to_string());
+                // CommonMark caps ordered-list numbers at 9 digits: a
+                // 10-digit marker does not parse as a list item at all, so
+                // `999999999 + 1` would break this command's own itemness
+                // contract. Clamp at the cap — the new item repeats
+                // `999999999.` (simplest valid marker; renderers renumber
+                // sequentially anyway, so the duplicate is cosmetic-only).
+                prefix.push_str(&(value + 1).min(999_999_999).to_string());
                 prefix.push(delim as char);
                 prefix.push(' ');
             } else {

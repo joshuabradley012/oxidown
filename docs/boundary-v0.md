@@ -248,7 +248,10 @@ M1 emission scope (parser may understand more than it decorates):
   `mark:list-marker` (alignment is view styling: fixed-width right-aligned box + tabular
   numerals). **Unordered markers emit `widget:bullet` replacing the whole marker span (`"- "`)**,
   revealed as `mark:list-marker`. Task markers conceal (the checkbox widget represents the item)
-  and reveal as `mark:delim`, dash and brackets in lockstep.
+  and reveal as `mark:delim`, dash and brackets in lockstep. **Ordered task items** (`1. [ ] a`)
+  are the one carve-out from lockstep concealment: the concealed marker emits BOTH
+  `widget:ordered` (the number) and `widget:task` (the checkbox), since the ordinal carries
+  information the checkbox alone cannot — matching how Obsidian renders numbered task lists.
 - **Every list item line** emits `{kind:"line", style:"list-item", depth, revealed?}` (1-based
   depth) at the marker position — the view uses it for hanging indent (wrapped item text aligns
   with the first line's text). Nested items (depth ≥ 2) additionally emit a `conceal` over the
@@ -585,7 +588,13 @@ Rules:
 - Append fast-path: an append that only extends the open tail block must not force
   full-document work beyond Phase-A parsing; with Phase A this means the decoration/damage
   computation is O(tail block), and the parser call itself stays within the perf budget.
+  Corollary: the budget depends on the streamed content containing block boundaries — a
+  stream that never closes its tail block (one long paragraph, or a single blank-line-free
+  list) pays O(tail block) per append, quadratic in total streamed bytes (known M1 limit,
+  characterized in `stream_perf.rs`).
 - `streamClose` on an unknown/closed id is a no-op (returns `null`); `streamAppend` on one throws.
+  `load()` closes all open streams AND discards any adapter-buffered pending surrogate, so
+  `streamClose` on a pre-load id remains a null no-op — it never throws.
 - **`streamClose` returns `CoreChange | null` (v0.3 amendment — previously `void`).** When the
   stream's withheld trailing high surrogate is flushed as U+FFFD on close (see "Unpaired
   surrogates in payloads"), the resulting `CoreChange` is RETURNED so the view can apply it
@@ -613,7 +622,8 @@ Rules:
    created after the stream's unit began.
 3. **`list-marker` spans include the required trailing whitespace** (`"- "`, `"1. "`).
 4. **Link conceal spans** are two spans (`[` and `](url)`); on reveal they are emitted as
-   delim/url/delim pieces.
+   delim/url/delim pieces. An angle-bracketed destination (`[t](<u v>)`) contributes only the
+   inner span as `mark:url`; the `<`/`>` wrappers remain in the surrounding `mark:delim` pieces.
 5. **Line terminators**: wherever this contract says "physical source line" (line-level reveal
    extents, per-line marker/quote constructs, the line vocabulary of `indentList`/
    `outdentList`/`enter`), a line is terminated by `\n`, `\r\n`, or a **lone `\r`** — matching
@@ -636,8 +646,13 @@ Position arguments are additionally bounded to `u32::MAX` at the wasm boundary (
 document, such a position throws the ordinary `OutOfBounds: position X beyond document length
 Y (UTF-16 code units)` — the same error the mock, whose numbers have no 32-bit cliff, reaches
 via its document-bounds check. Positions are NEVER silently truncated, wrapped, or clamped.
+This applies equally to positions INSIDE structured JSON payloads (splice `at`/`delete`,
+selection `anchor`/`head`): malformed values (negative, non-integral) throw `InvalidPayload`
+with the `malformed splices` / `malformed selections` message, while well-formed integers
+above `u32::MAX` or beyond the document throw the ordinary `OutOfBounds` — identical names
+and messages on both cores.
 
-Three validation-refusal error names (v0.3):
+Validation-refusal error names (v0.3):
 
 - `InvalidArgs` — thrown by the wasm adapter/mock argument layer, before dispatch, when a raw
   argument is malformed (non-integer or negative numbers, a missing command argument, a
@@ -651,8 +666,18 @@ Three validation-refusal error names (v0.3):
   ``InvalidPayload: malformed splices: invalid value: integer `-1`, expected u32``; the mock
   mirrors the name and `malformed splices` / `malformed selections` prefixes), and text
   payloads carrying unpaired surrogates (see "Unpaired surrogates in payloads" below).
+- `InvalidOrigin` — thrown by `applyEdit` when the `origin` string is not a documented
+  `EditOrigin` value.
+- `InvalidBias` — thrown by `createAnchor` when the bias is not `"before"` / `"after"`.
+- `InvalidCommand` — thrown by `command` when the command name is unknown.
 
-All three are refusals thrown WITHOUT mutating the core; callers should treat them as consumed
+`applyEdit` validates in a pinned order (identical on mock and wasm): malformed
+`baseRevision` (`InvalidArgs`) → staleness (`StaleRevision`) → splice payload (surrogate
+inserts, malformed numbers, ordering, bounds) → origin (`InvalidOrigin`) → apply-time
+surrogate-split check (`SurrogateSplit`). A call that is simultaneously stale AND
+payload-malformed therefore throws `StaleRevision`.
+
+All of these are refusals thrown WITHOUT mutating the core; callers should treat them as consumed
 no-ops (log and move on — never fall back to a default action, never resync), per the
 Commands section's no-mutation-on-throw rule. This carve-out applies from EVERY entry point,
 `applyEdit` and `decorations` included: the desync-emergency rule above governs exceptions the
@@ -702,11 +727,12 @@ list:
 - **Undo-coalescing region rule** — v0.1 clarification 4 amended: a single-splice `user`/`ime`
   edit coalesces when it falls within (or touches the ends of) the top undo unit's undo
   region, not merely when it touches the previous edit's end position.
-- **Error names `InvalidArgs` / `InvalidArgument` / `InvalidPayload`** — argument-layer,
-  core-level-semantic, and payload-layer validation refusals; all consumed no-ops (no resync
-  obligation, from any entry point). Position arguments are bounded to `u32::MAX` at the wasm
-  boundary (over-u32 values throw the ordinary `OutOfBounds`, never a silent truncation).
-  See "Error handling".
+- **Error names `InvalidArgs` / `InvalidArgument` / `InvalidPayload` / `InvalidOrigin` /
+  `InvalidBias` / `InvalidCommand`** — argument-layer, core-level-semantic, payload-layer,
+  and per-call domain validation refusals; all consumed no-ops (no resync obligation, from
+  any entry point). Position arguments — direct AND payload-embedded — are bounded to
+  `u32::MAX` at the wasm boundary (over-u32 values throw the ordinary `OutOfBounds`, never a
+  silent truncation). `applyEdit` validation precedence is pinned. See "Error handling".
 - **`streamClose(id): CoreChange | null`** — previously `void`; the U+FFFD surrogate-flush
   change produced on close is now returned so the view can apply it (it was silently dropped,
   desyncing the mirror). The flush belongs to the stream's single undo unit. See the Streaming

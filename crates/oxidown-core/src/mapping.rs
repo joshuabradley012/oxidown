@@ -74,6 +74,13 @@ pub fn map_pos(p: usize, batch: &[ByteSplice], bias: Bias) -> usize {
 /// "typing at either edge of this span extends it" behavior for a block or
 /// node extent. Collapses to an empty range at `start` if the batch would
 /// otherwise invert it (e.g. the whole range was deleted).
+///
+/// NOTE: this is currently future surface — it has no in-crate production
+/// consumer (identity matching uses [`map_range_shrink`]; positions use
+/// [`map_pos`] directly), and its semantics are pinned by the unit tests
+/// below only. Kept `pub` deliberately: it is the documented
+/// extend-at-both-edges counterpart callers will want for tracked
+/// *extents* (as opposed to identity spans) when that need lands.
 pub fn map_range(range: &Range<usize>, batch: &[ByteSplice]) -> Range<usize> {
     let start = map_pos(range.start, batch, Bias::Before);
     let end = map_pos(range.end, batch, Bias::After).max(start);

@@ -203,7 +203,8 @@ enter the op log with origin `command`, never coalesce, and return
   than stacking `****`), touched nodes' delimiters strip, one canonical pair
   (`**`, `*`, `~~`) wraps the union. Inline code computes its backtick run
   as longest-run-in-content + 1, space-padded when content starts/ends with
-  a backtick (CommonMark). **Double-toggle byte-identity holds for canonical
+  a backtick or a space (but is not all spaces) — the shapes CommonMark
+  unpads at render time. **Double-toggle byte-identity holds for canonical
   flavors**; `__x__` re-wraps as `**x**` (normalization, deliberate).
 - **Empty range, nothing touched**: inserts an empty pair, cursor between
   the delimiters (standard toolbar behavior; the pair doesn't parse until
@@ -301,6 +302,14 @@ decorate — the same documented assumption as the tail fast path. Measured
 (native, release; research/08 "After" section): mid-document single-char
 `apply_edit` ~13µs at 100KB / ~31µs at 300KB; apply+decorations combined
 p95 ~56µs at 100KB; tail-path stream appends mean ~5-6µs per chunk.
+
+One caveat on the tail fast path: per-append cost is O(open tail block),
+so a stream that never closes its tail block (one long paragraph, or a
+single list with no blank lines) is quadratic in total streamed bytes —
+characterized by `tests/stream_perf.rs::
+stream_append_into_never_closing_tail_block_grows_per_append`, rationale
+in `reparse_tail`'s COST NOTE. A real fix needs incremental inline
+parsing (deferred past M1).
 
 ## Known deviations
 

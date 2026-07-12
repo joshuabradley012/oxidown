@@ -83,6 +83,51 @@ fn assert_well_formed(decos: &[Decoration], doc_len: usize, case: usize, doc: &s
     }
 }
 
+/// Corpus-wide viewport-seam losslessness: for every case, every single-line
+/// viewport window's output is a subset of the full-viewport set, and the
+/// union over the whole partition covers it — no decoration is lost at any
+/// line-aligned seam (regression: zero-width nodes, e.g. blank fence-body
+/// lines, used to vanish from a window starting exactly at them). Multi-line
+/// inline nodes legitimately emit in several windows, so the union is
+/// compared by containment, not multiset equality.
+#[test]
+fn corpus_line_aligned_viewport_windows_lose_nothing() {
+    for (i, doc) in cases::CASES.iter().enumerate() {
+        let mut ed = Editor::new(1);
+        let rev = ed.load(doc);
+        let full = ed.decorations(rev, 0, ed.doc_len_utf16(), &[]).unwrap();
+        // Window bounds in UTF-16 CU: every line start plus the doc end.
+        let mut bounds = vec![0usize];
+        let mut cu = 0usize;
+        for ch in doc.chars() {
+            cu += ch.len_utf16();
+            if ch == '\n' {
+                bounds.push(cu);
+            }
+        }
+        if *bounds.last().unwrap() != cu {
+            bounds.push(cu);
+        }
+        let mut union: Vec<Decoration> = Vec::new();
+        for w in bounds.windows(2) {
+            let window = ed.decorations(rev, w[0], w[1], &[]).unwrap();
+            for d in &window {
+                assert!(
+                    full.contains(d),
+                    "case {i}: window {w:?} invented {d:?} ({doc:?})"
+                );
+            }
+            union.extend(window);
+        }
+        for d in &full {
+            assert!(
+                union.contains(d),
+                "case {i}: {d:?} lost at a line-aligned viewport seam ({doc:?})"
+            );
+        }
+    }
+}
+
 // -------------------------------------------------- 2: differential block structure --
 
 /// Coarse, comparable block-kind vocabulary. Anything not in this list

@@ -354,6 +354,55 @@ fn toggle_code_off_strips_the_padding_pair_on_padded_spans() {
 }
 
 #[test]
+fn toggle_code_pads_space_edged_content_and_round_trips() {
+    // Space-edged content needs the same CommonMark pad pair as
+    // backtick-edged content: `` ` x ` `` renders as `x` (the renderer sheds
+    // one pad pair), so edge spaces survive rendering only under a pad. The
+    // pad also keeps ON→OFF byte-identical — before it, OFF's pad-shedding
+    // deleted the USER'S edge spaces ("a x b" → toggle " x " ON→OFF →
+    // "axb", data loss).
+
+    // Both edges.
+    let mut ed = Editor::new(1);
+    ed.load("a x b");
+    let change = run(&mut ed, Command::ToggleCode { from: 1, to: 4 }).unwrap();
+    assert_eq!(ed.get_text(), "a`  x  `b");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (3, 6), "selection covers the user content, not the pads");
+    run(&mut ed, Command::ToggleCode { from: sel.anchor, to: sel.head }).unwrap();
+    assert_eq!(ed.get_text(), "a x b", "ON→OFF byte-identical for space-edged content");
+
+    // Leading edge only.
+    let mut ed = Editor::new(1);
+    ed.load("a xb");
+    let change = run(&mut ed, Command::ToggleCode { from: 1, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "a`  x `b");
+    let sel = change.selection.unwrap();
+    run(&mut ed, Command::ToggleCode { from: sel.anchor, to: sel.head }).unwrap();
+    assert_eq!(ed.get_text(), "a xb", "ON→OFF byte-identical for leading-space content");
+
+    // Trailing edge only.
+    let mut ed = Editor::new(1);
+    ed.load("ax b");
+    let change = run(&mut ed, Command::ToggleCode { from: 1, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "a` x  `b");
+    let sel = change.selection.unwrap();
+    run(&mut ed, Command::ToggleCode { from: sel.anchor, to: sel.head }).unwrap();
+    assert_eq!(ed.get_text(), "ax b", "ON→OFF byte-identical for trailing-space content");
+
+    // Space-only content is NOT padded (CommonMark never unpads an all-space
+    // span, so a pad pair would become extra content bytes) and still
+    // round-trips: OFF's shed rule has the matching all-space exemption.
+    let mut ed = Editor::new(1);
+    ed.load("a b");
+    let change = run(&mut ed, Command::ToggleCode { from: 1, to: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "a` `b");
+    let sel = change.selection.unwrap();
+    run(&mut ed, Command::ToggleCode { from: sel.anchor, to: sel.head }).unwrap();
+    assert_eq!(ed.get_text(), "a b", "ON→OFF byte-identical for space-only content");
+}
+
+#[test]
 fn toggle_with_cjk_and_emoji_content() {
     let mut ed = Editor::new(1);
     ed.load("你好 😀 world");
@@ -1403,6 +1452,27 @@ fn enter_continue_ordered_grows_digit_width() {
     assert_list_item_at_line(&ed.get_text(), 1);
     let sel = change.selection.unwrap();
     assert_eq!((sel.anchor, sel.head), (9, 9), "cursor lands right after the inserted '10. '");
+}
+
+#[test]
+fn enter_continue_ordered_clamps_at_commonmarks_nine_digit_cap() {
+    // CommonMark caps ordered-list numbers at 9 digits: "1000000000. "
+    // would not parse as a list item at all, so CONTINUE clamps at the cap
+    // and repeats "999999999." rather than emit an unparseable marker.
+    let mut ed = Editor::new(1);
+    ed.load("999999999. a\n");
+    let pos = "999999999. a".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "999999999. a\n999999999. \n");
+    assert_list_item_at_line(&ed.get_text(), 1);
+
+    // One below the cap still increments normally.
+    let mut ed = Editor::new(1);
+    ed.load("999999998. a\n");
+    let pos = "999999998. a".len();
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert_eq!(ed.get_text(), "999999998. a\n999999999. \n");
+    assert_list_item_at_line(&ed.get_text(), 1);
 }
 
 #[test]

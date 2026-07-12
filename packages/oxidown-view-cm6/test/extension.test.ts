@@ -935,6 +935,139 @@ describe("history keymap error doctrine (undo/redo wrapped like every other core
   }
 });
 
+describe("composition call sites are guarded (desync-emergency discipline)", () => {
+  it("a throwing compositionBegin is logged and recovered via mirror re-load, never an uncaught crash", async () => {
+    const core = new MockCore();
+    const view = makeView("abc", core);
+    await flush();
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const loadSpy = vi.spyOn(core, "load");
+    const beginSpy = vi.spyOn(core, "compositionBegin").mockImplementation(() => {
+      throw new Error("boom");
+    });
+
+    expect(() =>
+      view.contentDOM.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })),
+    ).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalled();
+    // Unlike command() (transactional), compositionBegin may have partially
+    // mutated core state: desync emergency → re-load from the view buffer.
+    expect(loadSpy).toHaveBeenCalledWith(view.state.doc.toString());
+    expect(core.getText()).toBe(view.state.doc.toString());
+
+    beginSpy.mockRestore();
+    errSpy.mockRestore();
+    await flush();
+    view.destroy();
+  });
+
+  it("a throwing compositionEnd still recovers AND schedules the catch-up rebuild", async () => {
+    const core = new MockCore();
+    const view = makeView("**bold** text", core);
+    await flush();
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const loadSpy = vi.spyOn(core, "load");
+    const decoSpy = vi.spyOn(core, "decorations");
+    const endSpy = vi.spyOn(core, "compositionEnd").mockImplementation(() => {
+      throw new Error("boom");
+    });
+    const before = decoSpy.mock.calls.length;
+
+    expect(() =>
+      view.contentDOM.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true })),
+    ).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalled();
+    expect(loadSpy).toHaveBeenCalledWith(view.state.doc.toString());
+    // The throw must not skip the dirty flag / deferred flush: the catch-up
+    // rebuild still runs once the composition has settled.
+    await flush();
+    expect(decoSpy.mock.calls.length).toBeGreaterThan(before);
+    expect(core.getText()).toBe(view.state.doc.toString());
+
+    endSpy.mockRestore();
+    errSpy.mockRestore();
+    view.destroy();
+  });
+});
+
+describe("Mod-Shift-Enter keymap (keyboard path for the task-checkbox toggle)", () => {
+  const toggleKey = () =>
+    new KeyboardEvent("keydown", {
+      key: "Enter",
+      code: "Enter",
+      ctrlKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+  it("toggles the task on the cursor's line via core.command('toggleTask')", async () => {
+    const core = new MockCore();
+    const doc = "- [ ] buy milk\nelsewhere";
+    const view = makeView(doc, core);
+    // Cursor in the middle of the item's text — toggleTask resolves the
+    // whole line, exactly like the checkbox click path.
+    view.dispatch({ selection: { anchor: doc.indexOf("milk") } });
+    const applySpy = vi.spyOn(core, "applyEdit");
+
+    view.contentDOM.dispatchEvent(toggleKey());
+    await flush();
+
+    expect(view.state.doc.toString()).toBe("- [x] buy milk\nelsewhere");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    // Same core-driven-change path as the widget click: command →
+    // CoreChange → applyCoreChange, never echoed through applyEdit.
+    expect(applySpy).not.toHaveBeenCalled();
+
+    // And back: unchecking works from the same binding.
+    view.contentDOM.dispatchEvent(toggleKey());
+    await flush();
+    expect(view.state.doc.toString()).toBe("- [ ] buy milk\nelsewhere");
+    view.destroy();
+  });
+
+  it("does nothing on a non-task line (null falls through; no crash, no edit)", async () => {
+    const core = new MockCore();
+    const doc = "plain paragraph";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: 3 } });
+
+    view.contentDOM.dispatchEvent(toggleKey());
+    await flush();
+
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(core.getText()).toBe(doc);
+    view.destroy();
+  });
+
+  it("a thrown toggleTask is swallowed like every other command site (no resync, no edit)", async () => {
+    const core = new MockCore();
+    const doc = "- [ ] task\n";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: 2 } });
+
+    const loadSpy = vi.spyOn(core, "load");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cmdSpy = vi.spyOn(core, "command").mockImplementation(() => {
+      throw new Error("boom");
+    });
+
+    view.contentDOM.dispatchEvent(toggleKey());
+    await flush();
+
+    expect(errSpy).toHaveBeenCalled();
+    expect(loadSpy).not.toHaveBeenCalled();
+    expect(view.state.doc.toString()).toBe(doc);
+    cmdSpy.mockRestore();
+    errSpy.mockRestore();
+    view.destroy();
+  });
+});
+
 describe("FIX 6: skip-annotated dispatches are mirror-verified immediately", () => {
   it("detects and recovers when a host changeFilter alters a core-driven (skip-annotated) change", async () => {
     const core = new MockCore();

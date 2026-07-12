@@ -65,8 +65,9 @@ pub enum NodeKind {
     /// `None` for unordered (bullet/plus/asterisk) markers.
     ListMarker { task: bool, depth: u8, number: Option<u64>, delim: Option<u8> },
     /// The leading indentation whitespace of a NESTED list item (depth >= 2).
-    /// Emits a `line:list-item` decoration carrying the depth (the view
-    /// provides exact per-depth padding) and conceals the raw spaces.
+    /// Emits only a conceal over the raw spaces (`mark:delim` when revealed
+    /// or composing) — the `line:list-item` decoration carrying the depth is
+    /// emitted by the co-resident `ListMarker` node, not by this one.
     ListItemIndent { depth: u8 },
     /// A task item's checkbox span (`[ ]`/`[x]`), rendered as a widget
     /// unless revealed.
@@ -266,6 +267,32 @@ pub fn parse_document(src: &str) -> ParseResult {
     // only gives a list's `start` meaning, so the sequence is derived purely
     // from position-in-run, never from the item's own literal digits.
     let mut list_seq: Vec<Option<u64>> = Vec::new();
+    // Memoized per-physical-line state for `pending_item` resolution. k
+    // markers on ONE line (`"- - - … a"`) used to cost O(line) each —
+    // `line_bounds` + `blockquote_markers` rescanned the line per item, and
+    // a back-scan over `nodes` revisited every earlier same-line node per
+    // item — O(k²) overall (measured: 20k markers on one 40KB line took
+    // ~380ms in release vs ~2ms for the same markers on separate lines;
+    // gated by the ignored `single_line_marker_chain_parses_in_linearish_
+    // time` perf test). The cache is keyed by the line's bounds and
+    // recomputed whenever an item lands outside them; `claimed_end` replaces
+    // the back-scan with a running high-water mark (debug-asserted against
+    // the reference scan at every use).
+    struct ItemLine {
+        line: Range<usize>,
+        /// End of the line's LAST blockquote marker run
+        /// (`blockquote_markers(line).last().end`), if any.
+        bq_last_end: Option<usize>,
+        /// Running high-water mark over the extents already emitted on this
+        /// line by earlier `pending_item` resolutions (markers, task
+        /// checkboxes, nested indents) — the exclusive byte claims a later
+        /// same-line item's indent back-scan must not cross. Same-line items
+        /// resolve strictly left to right (a list item can only start in a
+        /// line's marker-prefix chain, before any of the line's content), so
+        /// every node this tracks starts before the next item's own start.
+        claimed_end: usize,
+    }
+    let mut item_line: Option<ItemLine> = None;
 
     for (event, range) in Parser::new_ext(src, options()).into_offset_iter() {
         // Top-level block collection (kind + full span at `Start`).
@@ -295,7 +322,17 @@ pub fn parse_document(src: &str) -> ParseResult {
             // brackets, and the nested leading indent all flip to source in
             // lockstep. (Replaces the earlier glyph-adjacency model: reveal
             // no longer depends on which character the caret touches.)
-            let line = line_bounds(bytes, item_start);
+            let cached = item_line
+                .as_ref()
+                .is_some_and(|c| c.line.start <= item_start && item_start <= c.line.end);
+            if !cached {
+                let line = line_bounds(bytes, item_start);
+                let bq_last_end = blockquote_markers(bytes, line.clone()).last().map(|m| m.end);
+                let claimed_end = line.start;
+                item_line = Some(ItemLine { line, bq_last_end, claimed_end });
+            }
+            let cache = item_line.as_mut().expect("populated just above");
+            let line = cache.line.clone();
             // Nested items (depth >= 2): the run of spaces/tabs immediately
             // before the marker is its own node — a `line:list-item` line
             // decoration (per-depth padding in the view) + concealed spaces.
@@ -304,22 +341,42 @@ pub fn parse_document(src: &str) -> ParseResult {
             // run (whose `> `'s trailing space is otherwise indistinguishable
             // from indent) and any earlier item's marker on the same line
             // (`"- - a"`) — because Conceal/Widget decorations are exclusive
-            // byte claims that must never overlap each other.
+            // byte claims that must never overlap each other. Both clamps
+            // come from the per-line cache (see `ItemLine`) instead of a
+            // per-item rescan.
             let mut ws_start = item_start;
             while ws_start > line.start && matches!(bytes[ws_start - 1], b' ' | b'\t') {
                 ws_start -= 1;
             }
-            if let Some(m) = blockquote_markers(bytes, line.clone()).last() {
-                ws_start = ws_start.max(m.end.min(item_start));
+            if let Some(m_end) = cache.bq_last_end {
+                ws_start = ws_start.max(m_end.min(item_start));
             }
-            for n in nodes.iter().rev() {
-                if n.extent.start < line.start {
-                    break; // earlier lines: nothing there shares this line
-                }
-                if n.extent.start < item_start {
-                    ws_start = ws_start.max(n.extent.end.min(item_start));
-                }
-            }
+            ws_start = ws_start.max(cache.claimed_end.min(item_start));
+            debug_assert_eq!(
+                ws_start,
+                {
+                    // Reference implementation (the pre-memoization scans),
+                    // evaluated in debug builds only.
+                    let mut r = item_start;
+                    while r > line.start && matches!(bytes[r - 1], b' ' | b'\t') {
+                        r -= 1;
+                    }
+                    if let Some(m) = blockquote_markers(bytes, line.clone()).last() {
+                        r = r.max(m.end.min(item_start));
+                    }
+                    for n in nodes.iter().rev() {
+                        if n.extent.start < line.start {
+                            break; // earlier lines: nothing there shares this line
+                        }
+                        if n.extent.start < item_start {
+                            r = r.max(n.extent.end.min(item_start));
+                        }
+                    }
+                    r
+                },
+                "memoized same-line claim high-water mark must agree with \
+                 the reference back-scan"
+            );
             if item_depth >= 2 && ws_start < item_start {
                 let mut indent = leaf(
                     NodeKind::ListItemIndent { depth: item_depth },
@@ -329,6 +386,7 @@ pub fn parse_document(src: &str) -> ParseResult {
                 );
                 indent.reveal_extent = Some(line.clone());
                 nodes.push(indent);
+                cache.claimed_end = cache.claimed_end.max(item_start);
             }
             if let Event::TaskListMarker(checked) = &event {
                 if range.start > item_start {
@@ -347,6 +405,7 @@ pub fn parse_document(src: &str) -> ParseResult {
                 task.reveal_extent = Some(line.clone());
                 task.item_extent = Some(item);
                 nodes.push(task);
+                cache.claimed_end = cache.claimed_end.max(range.end);
             } else {
                 // Marker end: normally the next event's start (pulldown's
                 // lookahead — the item's real content begins there). An
@@ -386,6 +445,7 @@ pub fn parse_document(src: &str) -> ParseResult {
                     );
                     marker.reveal_extent = Some(line);
                     nodes.push(marker);
+                    cache.claimed_end = cache.claimed_end.max(marker_end);
                 }
             }
         }
@@ -801,7 +861,10 @@ fn link_node(bytes: &[u8], range: Range<usize>, link_type: LinkType) -> Option<N
                 j += 1;
             }
             // Destination: angle-bracketed, or raw with balanced parens
-            // (ends at whitespace or at an unmatched ')').
+            // (ends at whitespace or at an unmatched ')'). An angle-bracketed
+            // destination unwraps to the INNER span only (matching the crate
+            // README): the `<`/`>` wrappers stay in the surrounding delimiter
+            // span and reveal as `mark:delim`, like the parens around them.
             let url = if bytes.get(j) == Some(&b'<') {
                 let mut k = j + 1;
                 while k < end - 1 && bytes[k] != b'>' {
@@ -813,7 +876,7 @@ fn link_node(bytes: &[u8], range: Range<usize>, link_type: LinkType) -> Option<N
                 if bytes.get(k) != Some(&b'>') {
                     return None;
                 }
-                let url = j..k + 1;
+                let url = (j + 1)..k;
                 j = k + 1;
                 url
             } else {
@@ -1355,6 +1418,98 @@ mod tests {
     fn inline_link_balanced_parens_in_raw_destination() {
         let n = one("[text](path/with/(parens)/in/it)");
         assert_eq!(n.url, Some(7..31));
+    }
+
+    #[test]
+    fn angle_bracketed_destination_unwraps_to_the_inner_span() {
+        // README: "A URL wrapped in `<...>` is unwrapped to just the inner
+        // span" — the `<`/`>` wrappers stay in the delimiter span (and
+        // reveal as `mark:delim`), exactly like the enclosing parens.
+        let n = one("[t](<u v>)");
+        assert_eq!(n.kind, NodeKind::Link { autolink: false });
+        assert_eq!(n.delims, vec![0..1, 2..10]);
+        assert_eq!(n.url, Some(5..8), "\"u v\" only — wrappers excluded");
+
+        let n = one("[t](<u>)");
+        assert_eq!(n.url, Some(5..6));
+
+        // Empty `<>`: a valid link whose destination span is empty.
+        let n = one("[t](<>)");
+        assert_eq!(n.url, Some(5..5));
+
+        // Angle destination plus a title: the title tail stays delimiter.
+        let n = one("[t](<u v> \"ti\")");
+        assert_eq!(n.url, Some(5..8));
+        assert_eq!(n.delims, vec![0..1, 2..15]);
+    }
+
+    #[test]
+    fn same_line_marker_chain_pins_exact_node_structure() {
+        // Pin for the memoized `pending_item` resolution (the per-line
+        // ItemLine cache): deeply nested SAME-LINE markers must produce
+        // exactly the nodes the pre-memoization per-item back-scans did
+        // (parse_document also debug_asserts every item against the
+        // reference scan).
+        let nodes = parse("- - - a\n");
+        assert_eq!(nodes.len(), 3, "{nodes:?}");
+        for (i, n) in nodes.iter().enumerate() {
+            let depth = i as u8 + 1;
+            assert_eq!(
+                n.kind,
+                NodeKind::ListMarker { task: false, depth, number: None, delim: None }
+            );
+            assert_eq!(n.extent, (2 * i)..(2 * i + 2));
+            assert_eq!(n.content, (2 * i + 2)..(2 * i + 2));
+            assert!(n.delims.is_empty());
+            assert_eq!(n.reveal_extent, Some(0..7), "whole first line");
+            assert_eq!(n.item_extent, None);
+        }
+
+        // Chain ending in a task item: the checkbox's claim is tracked too.
+        let nodes = parse("- - [ ] a\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 2, "{nodes:?}");
+        assert_eq!(markers[0].extent, 0..2);
+        assert!(matches!(markers[0].kind, NodeKind::ListMarker { task: false, depth: 1, .. }));
+        assert_eq!(markers[1].extent, 2..4);
+        assert!(matches!(markers[1].kind, NodeKind::ListMarker { task: true, depth: 2, .. }));
+        let task = nodes
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::TaskWidget { .. }))
+            .expect("checkbox node");
+        assert_eq!(task.extent, 4..7);
+
+        // Quote-prefixed chain: the cached blockquote-marker clamp holds.
+        let nodes = parse("> - - a\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0].extent, 2..4);
+        assert_eq!(markers[1].extent, 4..6);
+        assert!(
+            !nodes.iter().any(|n| matches!(n.kind, NodeKind::ListItemIndent { .. })),
+            "no indent nodes anywhere on the chain: {nodes:?}"
+        );
+    }
+
+    #[test]
+    fn long_same_line_marker_chain_keeps_adjacent_extents_and_depths() {
+        let k = 64usize;
+        let doc = "- ".repeat(k) + "a";
+        let nodes = parse(&doc);
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), k);
+        for (i, m) in markers.iter().enumerate() {
+            assert_eq!(m.extent, (2 * i)..(2 * i + 2));
+            assert!(
+                matches!(m.kind, NodeKind::ListMarker { depth, .. } if depth as usize == i + 1),
+                "marker {i}: {m:?}"
+            );
+            assert_eq!(m.reveal_extent, Some(0..doc.len()));
+        }
+        assert!(
+            !nodes.iter().any(|n| matches!(n.kind, NodeKind::ListItemIndent { .. })),
+            "adjacent markers leave no whitespace to claim as indent"
+        );
     }
 
     #[test]
@@ -1951,6 +2106,39 @@ mod tests {
                 .iter()
                 .any(|n| n.kind == NodeKind::BlockQuoteLine(u8::MAX)),
             "quote depth clamps at 255"
+        );
+    }
+
+    /// Perf characterization for the memoized `pending_item` resolution
+    /// (line-bounds/blockquote-marker cache + running same-line claim high-
+    /// water mark): k markers on ONE physical line used to cost O(line) each
+    /// (`line_bounds` rescan) plus an O(same-line nodes) back-scan — O(k²)
+    /// overall. Measured pre-fix: ~412ms for 20k markers on one 40KB line in
+    /// release; post-fix: single-digit ms. Ignored-by-default, release-mode
+    /// only, loose ceiling — same conventions as tests/perf_baseline.rs:
+    ///   cargo test -p oxidown-core --release -- --ignored --nocapture \
+    ///     single_line_marker_chain
+    #[test]
+    #[ignore = "perf characterization; run with --release --ignored --nocapture"]
+    fn single_line_marker_chain_parses_in_linearish_time() {
+        let doc = "- ".repeat(20_000) + "a";
+        // Warm-up (page-in, allocator warm) — excluded from the samples.
+        std::hint::black_box(parse(&doc));
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let nodes = parse(&doc);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(&nodes);
+            best = best.min(ms);
+        }
+        println!("20k same-line markers: best of 5 = {best:.2}ms");
+        // Loose ceiling: post-fix cost is single-digit ms; the pre-fix O(k²)
+        // cost (~412ms) exceeds it by ~4x even on much faster hardware.
+        assert!(
+            best < 100.0,
+            "20k same-line markers parsed in {best:.1}ms — the per-item \
+             line/claim memoization has regressed toward O(k²)"
         );
     }
 

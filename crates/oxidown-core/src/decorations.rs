@@ -168,9 +168,12 @@ fn touches(a: usize, b: usize, from: usize, to: usize) -> bool {
 
 /// Start of the last blank (whitespace-only) line at/before `from`, or 0 —
 /// the windowing FLOOR for `compute`'s viewport filter. Found by a backward
-/// byte scan (chunk-cached via [`SrcBytes`]: O(bytes back to the previous
+/// byte scan (chunk-cached via [`SrcBytes`]): O(bytes back to the previous
 /// blank line), which is exactly the region whose nodes can still overlap
-/// the viewport). A `\r\n` pair is ONE terminator — the empty "segment"
+/// the viewport — but on a document with NO blank line above the viewport
+/// (one giant paragraph/blockquote/code block) the scan degrades to O(doc),
+/// reaching all the way back to byte 0 (measured ~2.4ms/call on a 2MB
+/// blank-line-free blockquote). A `\r\n` pair is ONE terminator — the empty "segment"
 /// between `\r` and `\n` must not read as a blank line, or the floor could
 /// land where the spans-no-blank-line invariant doesn't hold.
 fn blank_line_floor(text: &TextBuffer, from: usize) -> usize {
@@ -213,8 +216,11 @@ pub fn compute(
     composition: Option<&Composition>,
 ) -> Vec<Decoration> {
     let mut out = Vec::new();
-    // Viewport window over the overlay — O(window + log n), not a linear
-    // scan of every node per call. `nodes` is sorted by `extent.start`
+    // Viewport window over the overlay — O(window + log n) node filtering
+    // plus the `blank_line_floor` byte scan: O(distance to the previous
+    // blank line), which degrades to O(doc) on a document with no blank
+    // line above the viewport (see `blank_line_floor`) — NOT a linear scan
+    // of every node per call. `nodes` is sorted by `extent.start`
     // (`parse_document` stable-sorts; the editor's tail/incremental splice
     // paths preserve the order), so the window END is a plain
     // `partition_point`. The START cannot be: a node may begin BEFORE the
@@ -248,8 +254,22 @@ pub fn compute(
          viewport (some extent spans a blank line?)"
     );
     for node in &nodes[lo..hi] {
-        // Half-open overlap with the viewport; nodes have non-empty extents.
-        if node.extent.start >= viewport.end || node.extent.end <= viewport.start {
+        // Half-open overlap with the viewport. Most nodes have non-empty
+        // extents, but a ZERO-WIDTH extent is legal (an empty fence-body
+        // line — see `parser::fenced_code_lines`) and must count as inside
+        // the viewport when it sits anywhere in [start, end), INCLUDING
+        // exactly at `viewport.start`: the general exclusive-end check
+        // (`extent.end <= viewport.start`) would otherwise drop it at the
+        // seam, losing its `line:code-block` decoration for exactly one
+        // viewport position. A zero-width node at `viewport.end` stays
+        // excluded (half-open: that position belongs to the next window),
+        // matching the `hi` partition bound above.
+        let inside = if node.extent.start == node.extent.end {
+            viewport.start <= node.extent.start && node.extent.start < viewport.end
+        } else {
+            node.extent.start < viewport.end && node.extent.end > viewport.start
+        };
+        if !inside {
             continue;
         }
 

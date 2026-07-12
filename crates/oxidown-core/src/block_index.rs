@@ -42,7 +42,12 @@
 //!    - the unclaimed old block with the greatest byte overlap donates its
 //!      ID (an edit *inside* a block, or a block merely shifting because
 //!      something above it changed, keeps its ID); a collapsed old span
-//!      scores by point-containment;
+//!      scores by point-containment, but strictly BELOW any real byte
+//!      overlap — a fully deleted block's collapsed point must never
+//!      outrank a surviving neighbor's genuine mapped bytes (else deleting
+//!      block B while rewriting its neighbor down to a 1-byte overlap would
+//!      hand B's ID to the unchanged neighbor and retire the neighbor's
+//!      own ID);
 //!    - a **split** (one old block overlapping two new blocks) gives the
 //!      larger-overlap piece the old ID (ties: the earlier piece) and
 //!      allocates exactly one fresh ID for the other piece;
@@ -164,7 +169,7 @@ fn match_spans(
     next_counter: &mut u64,
 ) -> Vec<Block> {
     // (new index, old index, overlap) edges from the two-pointer walk.
-    let mut edges: Vec<(usize, usize, usize)> = Vec::new();
+    let mut edges: Vec<(usize, usize, OverlapScore)> = Vec::new();
     let mut i = 0usize;
     for (n, (_, span)) in new_spans.iter().enumerate() {
         // Skip old spans entirely before `span`. A collapsed old span
@@ -183,7 +188,7 @@ fn match_spans(
         let mut j = i;
         while j < mapped_old.len() && mapped_old[j].0.start < span.end {
             let ov = overlap_score(&mapped_old[j].0, span);
-            if ov > 0 {
+            if ov.1 > 0 {
                 edges.push((n, j, ov));
             }
             j += 1;
@@ -191,13 +196,13 @@ fn match_spans(
     }
     // Strictly-greater comparisons make both passes keep the FIRST maximum
     // in document order (the tie rules above).
-    let mut donates_to: Vec<Option<(usize, usize)>> = vec![None; mapped_old.len()]; // (overlap, new idx)
+    let mut donates_to: Vec<Option<(OverlapScore, usize)>> = vec![None; mapped_old.len()]; // (overlap, new idx)
     for &(n, j, ov) in &edges {
         if donates_to[j].is_none_or(|(best, _)| ov > best) {
             donates_to[j] = Some((ov, n));
         }
     }
-    let mut taken: Vec<Option<(usize, usize)>> = vec![None; new_spans.len()]; // (overlap, old idx)
+    let mut taken: Vec<Option<(OverlapScore, usize)>> = vec![None; new_spans.len()]; // (overlap, old idx)
     for &(n, j, ov) in &edges {
         if donates_to[j] == Some((ov, n)) && taken[n].is_none_or(|(best, _)| ov > best) {
             taken[n] = Some((ov, j));
@@ -221,16 +226,30 @@ fn match_spans(
     result
 }
 
-/// Overlap in bytes; a collapsed old span (a block whose text was entirely
-/// deleted) scores 1 when the new span contains its point, so a
-/// full-text-replacement in one splice still keeps the block's ID.
-fn overlap_score(old: &Range<usize>, new: &Range<usize>) -> usize {
+/// Overlap score, ordered as a tuple: `(is_real_byte_overlap, byte_count)`.
+///
+/// A collapsed old span (a block whose text was entirely deleted) scores
+/// `(false, 1)` when the new span contains its point, so a
+/// full-text-replacement in one splice still keeps the block's ID — but the
+/// `false` first component ranks it strictly below ANY genuine byte overlap
+/// (`(true, n)`, n ≥ 1). Without that ranking, a fully deleted block's
+/// collapsed point would TIE a surviving neighbor whose real mapped overlap
+/// is exactly 1 byte, and the "earlier old block wins" tie rule would hand
+/// the deleted block's ID to the unchanged neighbor — violating the module
+/// invariant that deleted blocks simply retire. Real-overlap ties (and
+/// collapsed-vs-collapsed ties) keep the documented split/merge tie rules.
+///
+/// A score whose `byte_count` is 0 means "no match" regardless of the flag
+/// (callers filter on `.1 > 0`).
+type OverlapScore = (bool, usize);
+
+fn overlap_score(old: &Range<usize>, new: &Range<usize>) -> OverlapScore {
     if old.start == old.end {
-        return usize::from(new.start <= old.start && old.start < new.end);
+        return (false, usize::from(new.start <= old.start && old.start < new.end));
     }
     let start = old.start.max(new.start);
     let end = old.end.min(new.end);
-    end.saturating_sub(start)
+    (true, end.saturating_sub(start))
 }
 
 #[cfg(test)]

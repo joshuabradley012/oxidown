@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { EditorState } from "@codemirror/state";
 import { LanguageDescription } from "@codemirror/language";
 import { languages as languageRegistry } from "@codemirror/language-data";
@@ -173,6 +173,66 @@ describe("incremental re-parse (FIX 3: reuse across keystrokes)", () => {
     );
 
     expect(afterMs).toBeLessThan(beforeMs);
+  });
+});
+
+describe("failed language load: retried on the next rebuild, not a permanent page-wide miss", () => {
+  it("retries after a rejected load and paints once a later attempt succeeds", async () => {
+    const doc = "```flaky\nconst x = 1; // note\n```\n";
+    const state = stateOf(doc);
+    const from = doc.indexOf("const");
+    const to = doc.indexOf("\n```", from);
+    const regions = [{ lang: "flaky", from, to }];
+
+    // First attempt rejects (CDN outage); every later one resolves to the
+    // real js support. "flaky" is unique to this test, so the module-global
+    // load registry has no prior state for it.
+    const realDesc = LanguageDescription.matchLanguageName(languageRegistry, "js", true);
+    expect(realDesc).not.toBeNull();
+    let attempts = 0;
+    const flakyDesc = LanguageDescription.of({
+      name: "flaky",
+      load: () => {
+        attempts++;
+        return attempts === 1 ? Promise.reject(new Error("cdn down")) : realDesc!.load();
+      },
+    });
+    const spy = vi.spyOn(LanguageDescription, "matchLanguageName").mockReturnValue(flakyDesc);
+    try {
+      const hl = new FenceHighlighter();
+      // Rebuild 1 kicks off the load, which fails.
+      expect(hl.highlightRegions(state, regions, () => {})).toEqual([]);
+      for (let i = 0; i < 100 && attempts < 1; i++) await new Promise((r) => setTimeout(r, 10));
+      await new Promise((r) => setTimeout(r, 10)); // let the rejection handler run
+      expect(attempts).toBe(1);
+
+      // Rebuild 2: the failure was NOT cached as a permanent miss — the
+      // load is retried (the old behavior set supports=null here and never
+      // called load again until page reload).
+      let loaded = false;
+      expect(
+        hl.highlightRegions(state, regions, () => {
+          loaded = true;
+        }),
+      ).toEqual([]);
+      expect(attempts).toBe(2);
+      for (let i = 0; i < 100 && !loaded; i++) await new Promise((r) => setTimeout(r, 20));
+      expect(loaded).toBe(true);
+
+      // Rebuild 3 paints with the successfully loaded language.
+      expect(hl.highlightRegions(state, regions, () => {}).length).toBeGreaterThan(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("an UNKNOWN language stays a remembered miss (no registry match, no retry churn)", () => {
+    const doc = "```nosuchlang\nwords\n```\n";
+    const state = stateOf(doc);
+    const regions = [{ lang: "nosuchlang", from: 14, to: 19 }];
+    const hl = new FenceHighlighter();
+    expect(hl.highlightRegions(state, regions, () => {})).toEqual([]);
+    expect(hl.highlightRegions(state, regions, () => {})).toEqual([]);
   });
 });
 

@@ -101,6 +101,30 @@ function surrogateSplitError(pos: number): Error {
   return new Error(`SurrogateSplit: position ${pos} falls inside a surrogate pair`);
 }
 
+/** The origin vocabulary the boundary accepts (protocol.ts `EditOrigin`). */
+const EDIT_ORIGINS: ReadonlySet<string> = new Set([
+  "user",
+  "ime",
+  "paste",
+  "undo",
+  "redo",
+  "ai",
+  "command",
+]);
+
+/**
+ * Wasm parity (crates/oxidown-wasm/src/lib.rs `apply_edit`, where
+ * `EditOrigin::parse` failing throws): an unknown origin string is a
+ * caller/protocol bug, not an ignorable default — InvalidOrigin, thrown
+ * before anything mutates. Precedence matches the wasm layer: after the
+ * splice-payload checks, before the apply-time surrogate-split check.
+ */
+function checkEditOrigin(origin: EditOrigin): void {
+  if (!EDIT_ORIGINS.has(origin)) {
+    throw new Error(`InvalidOrigin: ${JSON.stringify(origin)}`);
+  }
+}
+
 /**
  * Minimal single-splice diff between two documents (common prefix/suffix trim).
  * Returns [] when the texts are identical. Trimming never leaves a splice
@@ -1011,6 +1035,18 @@ interface UndoUnit {
 
 interface RedoUnit {
   after: string;
+  /**
+   * The unit's EXACT forward splice batch (in the frame where the unit is
+   * redone — the doc state right before `redo()` applies it): applying it
+   * there yields `after`. Recorded by `undo()` as the inverse of the undo
+   * splices it just applied, so `redo()` can re-apply the multi-splice batch
+   * exactly instead of collapsing it through a whole-text diff (which would
+   * teleport anchors/composition/stream positions strictly inside the batch
+   * — the same hazard `UndoUnit.inverse` exists to avoid). Undefined only
+   * for units recorded before this field existed (none in practice); the
+   * diff remains as a defensive fallback.
+   */
+  forward?: Splice[];
   streamId?: number;
 }
 
@@ -1064,6 +1100,11 @@ export class MockCore implements OxidownCore {
   }
 
   applyEdit(baseRevision: number, splices: Splice[], origin: EditOrigin): number {
+    // Validation precedence is PINNED and mirrored by the wasm boundary
+    // (crates/oxidown-wasm/src/lib.rs `apply_edit` + the adapter in
+    // wasm-core.ts): malformed baseRevision → staleness → splice payload
+    // (surrogate inserts, malformed numbers, ordering, bounds) → origin →
+    // the apply-time surrogate-split check.
     checkNonNegInt("baseRevision", baseRevision);
     if (baseRevision !== this.rev) {
       throw new Error(
@@ -1071,6 +1112,8 @@ export class MockCore implements OxidownCore {
       );
     }
     this.validateSplices(splices);
+    checkEditOrigin(origin);
+    this.checkSpliceBoundaries(splices);
     // Drop no-op splices; an entirely empty/no-op batch changes nothing —
     // revision unchanged, no undo unit (editor.rs apply_edit's early return).
     const batch = splices.filter((s) => s.delete > 0 || s.insert.length > 0);
@@ -1148,11 +1191,26 @@ export class MockCore implements OxidownCore {
   undo(): CoreChange | null {
     const unit = this.undoStack.pop();
     if (!unit) return null;
+    // Use the unit's EXACT recorded inverse batch when it exists — the same
+    // discipline `applyStreamText`'s cascade uses, and for the same reason:
+    // mutateDoc maps every live anchor / the composition range / any open
+    // stream's internal anchor through these splices, and a collapsed
+    // whole-text diff teleports positions strictly inside a multi-splice
+    // batch to its first difference (verified divergence from the Rust
+    // core). The diff remains only as the fallback for units whose exact
+    // inverse was invalidated by coalescing (always single-splice, where it
+    // is equivalent).
+    const splices = unit.inverse ?? diffSplices(this.doc, unit.before);
     // Preserve the stream tag across the round trip: redo of a stream unit
     // re-establishes it as the stream's single merge target (history.rs
-    // `push_redo`/`push_undo_unit`).
-    this.redoStack.push({ after: this.doc, streamId: unit.streamId });
-    const splices = diffSplices(this.doc, unit.before);
+    // `push_redo`/`push_undo_unit`). The forward batch (the exact inverse of
+    // what this undo applies, in post-undo coordinates) is recorded so redo
+    // can re-apply it splice-exactly.
+    this.redoStack.push({
+      after: this.doc,
+      forward: invertSplices(this.doc, splices),
+      streamId: unit.streamId,
+    });
     this.mutateDoc(splices);
     this.hasOpenUnit = false;
     this.lastOrigin = null;
@@ -1168,7 +1226,9 @@ export class MockCore implements OxidownCore {
   redo(): CoreChange | null {
     const unit = this.redoStack.pop();
     if (!unit) return null;
-    const splices = diffSplices(this.doc, unit.after);
+    // Exact recorded forward batch (see `RedoUnit.forward`); diff fallback
+    // only for units without one — same discipline as undo().
+    const splices = unit.forward ?? diffSplices(this.doc, unit.after);
     this.undoStack.push({
       before: this.doc,
       inverse: invertSplices(this.doc, splices),
@@ -2186,11 +2246,23 @@ export class MockCore implements OxidownCore {
         );
       }
       if (end > this.doc.length) throw this.outOfBounds(end);
-      // Contract clarification 7: a splice boundary inside a surrogate pair
-      // would corrupt text — always an error, never snapped.
+      prevEnd = end;
+    }
+  }
+
+  /**
+   * Apply-time boundary check (contract clarification 7): a splice boundary
+   * inside a surrogate pair would corrupt text — always an error, never
+   * snapped. Runs AFTER origin validation (wasm parity: the Rust core
+   * performs this check inside `apply_edit`, after the boundary layer's
+   * payload and origin validation), which is why it is not part of
+   * `validateSplices`.
+   */
+  private checkSpliceBoundaries(splices: Splice[]): void {
+    for (const s of splices) {
+      const end = s.at + s.delete;
       if (splitsSurrogatePair(this.doc, s.at)) throw surrogateSplitError(s.at);
       if (splitsSurrogatePair(this.doc, end)) throw surrogateSplitError(end);
-      prevEnd = end;
     }
   }
 }

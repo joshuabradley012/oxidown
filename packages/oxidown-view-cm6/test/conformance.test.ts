@@ -29,7 +29,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { MockCore, applySplices } from "../src/mock-core";
 import { adaptWasmCore } from "../src/wasm-core";
-import type { CoreChange, Decoration, OxidownCore, RangeCommandName } from "../src/protocol";
+import type {
+  CoreChange,
+  Decoration,
+  EditOrigin,
+  OxidownCore,
+  RangeCommandName,
+} from "../src/protocol";
 
 type CoreFactory = () => OxidownCore;
 
@@ -267,6 +273,102 @@ for (const [coreName, makeCore] of factories) {
       expect(core.getText()).toBe("hello world"); // nothing mutated
     });
 
+    it("malformed positions INSIDE the splices payload throw InvalidPayload with the shared message", () => {
+      const core = boot("hello world"); // length 11
+      const rev = core.revision();
+      expect(
+        thrownMessage(() => core.applyEdit(rev, [{ at: -1, delete: 0, insert: "x" }], "user")),
+      ).toBe("InvalidPayload: malformed splices: splice #0 has at=-1 delete=0");
+      expect(
+        thrownMessage(() => core.applyEdit(rev, [{ at: 1.5, delete: 0, insert: "x" }], "user")),
+      ).toBe("InvalidPayload: malformed splices: splice #0 has at=1.5 delete=0");
+      expect(
+        thrownMessage(() => core.applyEdit(rev, [{ at: 0, delete: -2, insert: "x" }], "user")),
+      ).toBe("InvalidPayload: malformed splices: splice #0 has at=0 delete=-2");
+      expect(core.getText()).toBe("hello world");
+      expect(core.revision()).toBe(rev);
+    });
+
+    it("over-u32 and past-doc-end positions INSIDE the splices payload throw ordinary OutOfBounds", () => {
+      // These fields used to be u32-typed at the wasm serde layer, so an
+      // over-u32 `at` failed as InvalidPayload while the mock reached its
+      // bounds check and threw OutOfBounds — the contract pins OutOfBounds.
+      const core = boot("hello world"); // length 11
+      const rev = core.revision();
+      expect(
+        thrownMessage(() =>
+          core.applyEdit(rev, [{ at: 2 ** 32 + 6, delete: 0, insert: "x" }], "user"),
+        ),
+      ).toBe("OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)");
+      expect(
+        thrownMessage(() =>
+          core.applyEdit(rev, [{ at: 0, delete: 2 ** 32 + 6, insert: "x" }], "user"),
+        ),
+      ).toBe("OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)");
+      expect(
+        thrownMessage(() => core.applyEdit(rev, [{ at: 99, delete: 0, insert: "x" }], "user")),
+      ).toBe("OutOfBounds: position 99 beyond document length 11 (UTF-16 code units)");
+      expect(core.getText()).toBe("hello world");
+    });
+
+    it("malformed / over-u32 / past-doc-end positions INSIDE the selections payload validate identically", () => {
+      const core = boot("hello world"); // length 11
+      const rev = core.revision();
+      expect(
+        thrownMessage(() => core.decorations(rev, 0, 5, [{ anchor: -1, head: 0 }])),
+      ).toBe("InvalidPayload: malformed selections: anchor=-1 head=0");
+      expect(
+        thrownMessage(() => core.decorations(rev, 0, 5, [{ anchor: 0, head: 2.5 }])),
+      ).toBe("InvalidPayload: malformed selections: anchor=0 head=2.5");
+      expect(
+        thrownMessage(() => core.decorations(rev, 0, 5, [{ anchor: 2 ** 32 + 6, head: 0 }])),
+      ).toBe("OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)");
+      expect(
+        thrownMessage(() => core.decorations(rev, 0, 5, [{ anchor: 0, head: 99 }])),
+      ).toBe("OutOfBounds: position 99 beyond document length 11 (UTF-16 code units)");
+    });
+
+    it("a stale AND payload-malformed applyEdit throws StaleRevision (revision checks precede payload checks)", () => {
+      const core = boot("abc");
+      const rev = core.revision();
+      core.applyEdit(rev, [{ at: 0, delete: 0, insert: "x" }], "user"); // makes `rev` stale
+      const stale = `StaleRevision: core is at revision ${core.revision()}, caller passed ${rev}`;
+      // Malformed splice number — staleness must win (desync-resync class,
+      // never a consumed InvalidPayload no-op).
+      expect(
+        thrownMessage(() => core.applyEdit(rev, [{ at: -1, delete: 0, insert: "y" }], "user")),
+      ).toBe(stale);
+      // Lone-surrogate insert — the JS-side surrogate check (wasm adapter)
+      // must not preempt the staleness check either.
+      expect(
+        thrownMessage(() => core.applyEdit(rev, [{ at: 0, delete: 0, insert: HIGH }], "user")),
+      ).toBe(stale);
+      // Malformed baseRevision still beats staleness.
+      expect(
+        thrownMessage(() => core.applyEdit(-1, [{ at: -1, delete: 0, insert: "y" }], "user")),
+      ).toBe("InvalidArgs: baseRevision must be a non-negative integer, got -1");
+      expect(core.getText()).toBe("xabc");
+    });
+
+    it("an unknown edit origin throws InvalidOrigin without mutating; payload checks precede it", () => {
+      const core = boot("abc");
+      const rev = core.revision();
+      expect(
+        thrownMessage(() =>
+          core.applyEdit(rev, [{ at: 0, delete: 0, insert: "x" }], "bogus" as EditOrigin),
+        ),
+      ).toBe('InvalidOrigin: "bogus"');
+      expect(core.getText()).toBe("abc");
+      expect(core.revision()).toBe(rev);
+      // Aligned precedence: splice-payload validation runs before the origin
+      // check on both cores.
+      expect(
+        thrownMessage(() =>
+          core.applyEdit(rev, [{ at: -1, delete: 0, insert: "x" }], "bogus" as EditOrigin),
+        ),
+      ).toBe("InvalidPayload: malformed splices: splice #0 has at=-1 delete=0");
+    });
+
     it("setHeading level validation throws InvalidArgs", () => {
       const core = boot("Title");
       expect(
@@ -471,6 +573,20 @@ for (const [coreName, makeCore] of factories) {
       expect(() => core.streamClose(999)).not.toThrow();
     });
 
+    it("a pending stream surrogate does not survive load(): streamClose after load is a null no-op", () => {
+      // load() clears every stream core-side; the wasm adapter's per-stream
+      // surrogate buffer must be cleared with them — a stale pending unit
+      // would make streamClose flush a U+FFFD append into the dead stream
+      // and throw UnknownStream out of a contract-pinned no-op.
+      const core = boot("abc");
+      const id = core.streamOpen(3);
+      core.streamAppend(id, `a${HIGH}`); // trailing high surrogate withheld
+      core.load("fresh");
+      expect(core.streamClose(id)).toBeNull(); // no-op, never a throw
+      expect(core.getText()).toBe("fresh");
+      expect(core.getText()).not.toContain("�");
+    });
+
     // ---- stream undo grouping --------------------------------------------
 
     it("an uninterrupted stream session is exactly one undo unit", () => {
@@ -510,6 +626,26 @@ for (const [coreName, makeCore] of factories) {
       core.redo();
       expect(core.getText()).toBe("USERhead\n\ntailAB");
       expect(core.redo()).toBeNull();
+    });
+
+    // ---- anchors map through undo/redo via the exact recorded batches ----
+
+    it("anchors resolve identically across undo/redo of a multi-splice command", () => {
+      // The exact repro of the mock's collapsed-diff undo bug: toggleStrong
+      // records a two-splice batch (insertions at 2 and 6); mapping the
+      // anchor through a whole-text prefix/suffix diff instead teleports it
+      // to the diff's first difference (2) — the Rust core resolves 4.
+      const core = boot("a bold c");
+      const anchor = core.createAnchor(4, "before"); // inside "bold"
+      core.command("toggleStrong", 2, 6);
+      expect(core.getText()).toBe("a **bold** c");
+      expect(core.resolveAnchor(anchor)).toBe(6);
+      core.undo();
+      expect(core.getText()).toBe("a bold c");
+      expect(core.resolveAnchor(anchor)).toBe(4); // NOT 2
+      core.redo();
+      expect(core.getText()).toBe("a **bold** c");
+      expect(core.resolveAnchor(anchor)).toBe(6); // forward batch, splice-exact
     });
 
     // ---- undo splices never split surrogate pairs ------------------------

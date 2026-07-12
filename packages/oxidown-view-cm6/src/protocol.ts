@@ -24,6 +24,43 @@ export interface Splice {
 // ever coalesces (docs/boundary-v0.md "New edit origins").
 export type EditOrigin = "user" | "ime" | "paste" | "undo" | "redo" | "ai" | "command";
 
+/**
+ * Error names a core may refuse a call with (docs/boundary-v0.md "Error
+ * handling"): every thrown error's message starts with one of these names
+ * followed by ": ". Views route on the name — `StaleRevision` (and any
+ * exception from a call that may have mutated) is a mirror-desync emergency;
+ * the validation refusals are thrown BEFORE any mutation.
+ *
+ * - "StaleRevision"    — baseRevision/revision is not the core's current one
+ * - "OutOfBounds"      — a position beyond the document length (direct
+ *                        argument OR inside a splices/selections payload)
+ * - "InvalidRange"     — from > to on a query range
+ * - "InvalidArgs"      — malformed direct numeric argument / command arity
+ *                        (the Rust core's own guards spell one refusal
+ *                        "InvalidArgument"; assert by /^InvalidArg/ across
+ *                        cores)
+ * - "InvalidPayload"   — malformed splices/selections payload, or a text
+ *                        payload carrying an unpaired surrogate
+ * - "InvalidSplice"    — splices not ascending/non-overlapping
+ * - "InvalidOrigin"    — unknown EditOrigin string
+ * - "InvalidBias"      — createAnchor bias not "before"/"after"
+ * - "InvalidCommand"   — unknown command name
+ * - "SurrogateSplit"   — a mutation position inside a surrogate pair
+ * - "UnknownStream"    — streamAppend on a never-opened/closed stream id
+ */
+export type CoreErrorName =
+  | "StaleRevision"
+  | "OutOfBounds"
+  | "InvalidRange"
+  | "InvalidArgs"
+  | "InvalidPayload"
+  | "InvalidSplice"
+  | "InvalidOrigin"
+  | "InvalidBias"
+  | "InvalidCommand"
+  | "SurrogateSplit"
+  | "UnknownStream";
+
 export interface DecorationMark {
   kind: "mark";
   from: number;

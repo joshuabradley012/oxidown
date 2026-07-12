@@ -38,7 +38,6 @@
 //! deleting exactly the streamed spans (mapped through whatever else
 //! happened), without touching user edits made during the stream.
 
-use crate::mapping::{self, Bias};
 use crate::oplog::EditOrigin;
 use crate::text::ByteSplice;
 
@@ -143,13 +142,15 @@ impl History {
     /// invariant (each unit's inverse valid in the doc obtained by applying
     /// the inverses above it). The insertion is therefore *cascaded down*:
     /// for each unit above the stream unit, from top to bottom, (a) the
-    /// insertion position is translated into the next-deeper frame by
-    /// mapping it through that unit's (old) inverse, and (b) that unit's
-    /// inverse is rewritten as if the insertion had always been present in
-    /// its frame ([`map_batch_through_insertion`] — positions at/after the
-    /// insertion shift; a delete-span strictly containing it splits around
-    /// it so no unit ever deletes streamed text). At the stream unit's own
-    /// frame the same rewrite runs, and then the chunk's inverse (delete
+    /// insertion position is translated into the next-deeper frame through
+    /// that unit's (old) inverse ([`cascade_pos_through_inverse`], which is
+    /// exactly consistent with the rewrite in (b) — see its docs for why
+    /// plain `mapping::map_pos` is NOT), and (b) that unit's inverse is
+    /// rewritten as if the insertion had always been present in its frame
+    /// ([`map_batch_through_insertion`] — positions at/after the insertion
+    /// shift; a delete-span strictly containing it splits around it so no
+    /// unit ever deletes streamed text). At the stream unit's own frame the
+    /// same rewrite runs, and then the chunk's inverse (delete
     /// `[at', at'+len)`) merges into its splice list.
     pub fn record_stream_append(&mut self, stream_id: u64, at: usize, len: usize) {
         self.redo.clear();
@@ -172,10 +173,10 @@ impl History {
         let mut pos = at;
         for k in (idx + 1..self.undo.len()).rev() {
             let old_inverse = std::mem::take(&mut self.undo[k].inverse);
-            // Frame translation uses the OLD inverse (before rewriting).
-            // Bias::Before: if this unit's undo restores text exactly at the
-            // insertion point, the streamed chunk stays before it.
-            let deeper_pos = mapping::map_pos(pos, &old_inverse, Bias::Before);
+            // Frame translation uses the OLD inverse (before rewriting) and
+            // must agree splice-for-splice with map_batch_through_insertion's
+            // rewrite semantics — see cascade_pos_through_inverse's docs.
+            let deeper_pos = cascade_pos_through_inverse(pos, &old_inverse);
             self.undo[k].inverse = map_batch_through_insertion(old_inverse, pos, len);
             pos = deeper_pos;
         }
@@ -268,6 +269,53 @@ impl History {
             stream_id,
         });
     }
+}
+
+/// Translate the streamed chunk's insertion position from a unit's frame
+/// into the next-deeper frame (the document produced by applying that
+/// unit's OLD inverse), exactly consistent with how
+/// [`map_batch_through_insertion`] rewrites that unit.
+///
+/// This is `mapping::map_pos(p, batch, Bias::Before)` except in ONE case: a
+/// position STRICTLY INSIDE a delete-span. `map_pos` collapses such a
+/// position to the start of the splice's replacement (`s.at + delta`), but
+/// the rewrite splits the span around the chunk keeping the restore text
+/// with the FIRST piece — so after this unit's undo the surviving chunk
+/// sits immediately AFTER the restored text, at
+/// `s.at + delta + s.insert.len()`. Using `map_pos` here left the cascaded
+/// position short by `s.insert.len()` whenever an above unit's inverse was
+/// a REPLACEMENT (non-empty restore text — the inverse of a user
+/// delete+insert splice) covering the insertion point: the stream unit's
+/// merged delete then landed on the wrong bytes (undo corrupted text, and
+/// panicked inside ropey on a char boundary with multibyte text). Directed
+/// + fuzz regressions live in `tests/streaming.rs`.
+fn cascade_pos_through_inverse(p: usize, batch: &[ByteSplice]) -> usize {
+    let mut delta: isize = 0;
+    for s in batch {
+        if s.delete == 0 && s.at == p {
+            // Pure insertion exactly at the chunk: the rewrite's `at <=
+            // s.at` arm shifts the splice past the chunk, i.e. the chunk
+            // stays BEFORE the restored text (Bias::Before), unmoved.
+            break;
+        }
+        let del_end = s.at + s.delete;
+        if del_end < p || (del_end == p && s.delete > 0) {
+            // Splice entirely before the chunk (a delete-span ending
+            // exactly at it included: the rewrite leaves that splice
+            // unchanged, so the chunk lands after its full replacement).
+            delta += s.insert.len() as isize - s.delete as isize;
+        } else if s.at < p {
+            // Strictly inside a delete-span: the split places the restore
+            // text before the surviving chunk (see the rewrite's third
+            // arm), so the chunk's deeper-frame position is the
+            // replacement's start PLUS the restore text's length.
+            let start = usize::try_from(s.at as isize + delta).unwrap_or(0);
+            return start + s.insert.len();
+        } else {
+            break; // ascending batch: nothing further can affect p
+        }
+    }
+    usize::try_from(p as isize + delta).unwrap_or(0)
 }
 
 /// Rewrite an inverse batch as if a pure insertion of `len` bytes at `at`

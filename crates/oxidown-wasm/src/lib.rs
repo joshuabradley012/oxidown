@@ -33,7 +33,12 @@
 //! wrong place); an over-u32 position is necessarily beyond the document and
 //! fails with the core's own "OutOfBounds: ..." message, matching the mock,
 //! whose numeric layer has no u32 ceiling and reaches its document-bounds
-//! check instead. The constructor installs
+//! check instead. Positions INSIDE JSON payloads (splice `at`/`delete`,
+//! selection `anchor`/`head`) deserialize as f64 and get the same treatment
+//! via `convert_splices`/`convert_selections`: the mock's integer check
+//! ("InvalidPayload: malformed ...") first, then over-u32 and past-doc-end
+//! values flow to the ordinary OutOfBounds bounds check — never a serde
+//! range error, never a silent 32-bit truncation. The constructor installs
 //! `console_error_panic_hook` so any core panic surfaces its message on the
 //! JS console instead of an opaque `RuntimeError: unreachable`.
 //!
@@ -47,17 +52,24 @@ use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
+// Payload numbers deserialize as f64, NOT u32: serde would reject an
+// over-u32 (or negative/fractional) position with InvalidPayload, but the
+// contract (docs/boundary-v0.md) pins payload positions to the SAME
+// validation the mock applies — integer check (InvalidPayload with the
+// mock's message) first, then values above u32::MAX or beyond the document
+// flow to the ordinary OutOfBounds bounds check, exactly like the
+// direct-argument `check_pos` path.
 #[derive(Deserialize)]
 struct SpliceIn {
-    at: u32,
-    delete: u32,
+    at: f64,
+    delete: f64,
     insert: String,
 }
 
 #[derive(Deserialize)]
 struct SelectionIn {
-    anchor: u32,
-    head: u32,
+    anchor: f64,
+    head: f64,
 }
 
 fn core_err(e: CoreError) -> JsError {
@@ -127,6 +139,81 @@ fn check_query_range(from: f64, to: f64, doc_len: usize) -> Result<(usize, usize
         return Err(oob_msg(to, doc_len));
     }
     Ok((f as usize, t as usize))
+}
+
+/// A JSON-payload number (splice/selection field): the mock's integer check
+/// (`Number.isInteger(v) && v >= 0`), f64-flavored.
+fn payload_num_ok(v: f64) -> bool {
+    v.is_finite() && v.fract() == 0.0 && v >= 0.0
+}
+
+/// Validate and convert an `applyEdit` splice payload with the MOCK's exact
+/// semantics, message spellings, and error precedence (mock-core.ts
+/// `validateSplices`, minus the two checks that live elsewhere: the
+/// unpaired-surrogate insert check is the JS adapter's, and the
+/// surrogate-split boundary check is the core's own apply-time check). Per
+/// splice: malformed `at`/`delete` (InvalidPayload) → ordering
+/// (InvalidSplice) → document bounds (OutOfBounds — which also covers
+/// over-u32 values: `doc_len` always fits u32, so anything above the ceiling
+/// is beyond the document; without this, `as usize` on wasm32 would silently
+/// TRUNCATE, exactly the hazard `check_pos` guards for direct arguments).
+fn convert_splices(splices: Vec<SpliceIn>, doc_len: usize) -> Result<Vec<Splice>, String> {
+    let mut out = Vec::with_capacity(splices.len());
+    let mut prev_end = 0.0_f64;
+    for (i, s) in splices.into_iter().enumerate() {
+        if !payload_num_ok(s.at) || !payload_num_ok(s.delete) {
+            return Err(format!(
+                "InvalidPayload: malformed splices: splice #{i} has at={} delete={}",
+                s.at, s.delete
+            ));
+        }
+        let end = s.at + s.delete;
+        if i > 0 && s.at < prev_end {
+            return Err(format!(
+                "InvalidSplice: splice #{i}: splices must be ascending and non-overlapping \
+                 (at {} < previous end {prev_end})",
+                s.at
+            ));
+        }
+        if end > doc_len as f64 {
+            return Err(oob_msg(end, doc_len));
+        }
+        prev_end = end;
+        out.push(Splice {
+            at: s.at as usize,
+            delete: s.delete as usize,
+            insert: s.insert,
+        });
+    }
+    Ok(out)
+}
+
+/// Validate and convert a `decorations` selections payload (mock-core.ts
+/// `decorations`): per selection — malformed anchor/head (InvalidPayload,
+/// the mock's message) → bounds on `max(anchor, head)` (OutOfBounds; covers
+/// over-u32 values like `convert_splices`).
+fn convert_selections(
+    sels: Vec<SelectionIn>,
+    doc_len: usize,
+) -> Result<Vec<SelectionRange>, String> {
+    let mut out = Vec::with_capacity(sels.len());
+    for s in sels {
+        if !payload_num_ok(s.anchor) || !payload_num_ok(s.head) {
+            return Err(format!(
+                "InvalidPayload: malformed selections: anchor={} head={}",
+                s.anchor, s.head
+            ));
+        }
+        let hi = s.anchor.max(s.head);
+        if hi > doc_len as f64 {
+            return Err(oob_msg(hi, doc_len));
+        }
+        out.push(SelectionRange {
+            anchor: s.anchor as usize,
+            head: s.head as usize,
+        });
+    }
+    Ok(out)
 }
 
 /// Parse a JsValue (array of objects) by stringifying once and deserializing.
@@ -359,18 +446,27 @@ impl OxidownCore {
         splices: JsValue,
         origin: &str,
     ) -> Result<f64, JsError> {
+        // Validation precedence mirrors the mock (mock-core.ts `applyEdit`):
+        // malformed baseRevision → staleness → splice payload (the
+        // unpaired-surrogate insert check runs JS-side in the adapter,
+        // which replicates the two revision checks ahead of it) → origin →
+        // the core's own apply-time surrogate-split check. A doubly-invalid
+        // call (stale AND malformed payload) must be StaleRevision on both
+        // cores — opposite handling classes otherwise (desync-resync vs
+        // consumed no-op).
+        let base_revision = arg(base_revision, "baseRevision")?;
+        let current = self.inner.revision();
+        if base_revision != current {
+            return Err(core_err(CoreError::StaleRevision {
+                current,
+                requested: base_revision,
+            }));
+        }
         let splices: Vec<SpliceIn> = from_js(&splices, "splices")?;
+        let core_splices = convert_splices(splices, self.inner.doc_len_utf16())
+            .map_err(|msg| JsError::new(&msg))?;
         let origin = EditOrigin::parse(origin)
             .ok_or_else(|| JsError::new(&format!("InvalidOrigin: {origin:?}")))?;
-        let core_splices: Vec<Splice> = splices
-            .into_iter()
-            .map(|s| Splice {
-                at: s.at as usize,
-                delete: s.delete as usize,
-                insert: s.insert,
-            })
-            .collect();
-        let base_revision = arg(base_revision, "baseRevision")?;
         let now_ms = js_sys::Date::now();
         self.inner
             .apply_edit(base_revision, &core_splices, origin, now_ms)
@@ -414,13 +510,8 @@ impl OxidownCore {
         }
         let (from, to) = self.query_range(from, to)?;
         let selections: Vec<SelectionIn> = from_js(&selections, "selections")?;
-        let sels: Vec<SelectionRange> = selections
-            .into_iter()
-            .map(|s| SelectionRange {
-                anchor: s.anchor as usize,
-                head: s.head as usize,
-            })
-            .collect();
+        let sels = convert_selections(selections, self.inner.doc_len_utf16())
+            .map_err(|msg| JsError::new(&msg))?;
         let decos = self
             .inner
             .decorations(revision, from, to, &sels)
@@ -807,5 +898,99 @@ mod pos_validation {
         assert_eq!(check_query_range(2.0, 9.0, 11), Ok((2, 9)));
         assert_eq!(check_query_range(9.0, 2.0, 11), Ok((9, 2)));
         assert_eq!(check_query_range(0.0, 99.0, 11), Ok((0, 99)));
+    }
+}
+
+#[cfg(test)]
+mod payload_validation {
+    //! `convert_splices`/`convert_selections` guard positions INSIDE JSON
+    //! payloads with the mock's exact messages and precedence (mock-core.ts
+    //! `validateSplices` / `decorations`): integer check (InvalidPayload) →
+    //! ordering (InvalidSplice, splices only) → document bounds
+    //! (OutOfBounds, which also covers over-u32 values — previously these
+    //! fields were u32-typed and serde failed them as InvalidPayload,
+    //! diverging from the mock's OutOfBounds).
+
+    use super::{convert_selections, convert_splices, SelectionIn, SpliceIn};
+
+    fn splice(at: f64, delete: f64) -> SpliceIn {
+        SpliceIn { at, delete, insert: String::new() }
+    }
+
+    #[test]
+    fn splices_convert_when_well_formed() {
+        let out = convert_splices(
+            vec![
+                SpliceIn { at: 1.0, delete: 2.0, insert: "x".into() },
+                SpliceIn { at: 5.0, delete: 0.0, insert: "y".into() },
+            ],
+            11,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].at, out[0].delete, out[0].insert.as_str()), (1, 2, "x"));
+        assert_eq!((out[1].at, out[1].delete, out[1].insert.as_str()), (5, 0, "y"));
+    }
+
+    #[test]
+    fn malformed_splice_numbers_are_invalid_payload_with_the_mock_message() {
+        assert_eq!(
+            convert_splices(vec![splice(-1.0, 0.0)], 11).unwrap_err(),
+            "InvalidPayload: malformed splices: splice #0 has at=-1 delete=0"
+        );
+        assert_eq!(
+            convert_splices(vec![splice(1.5, 0.0)], 11).unwrap_err(),
+            "InvalidPayload: malformed splices: splice #0 has at=1.5 delete=0"
+        );
+        assert_eq!(
+            convert_splices(vec![splice(0.0, -2.0)], 11).unwrap_err(),
+            "InvalidPayload: malformed splices: splice #0 has at=0 delete=-2"
+        );
+    }
+
+    #[test]
+    fn over_u32_and_past_doc_end_splices_are_out_of_bounds_not_invalid_payload() {
+        // 2^32 + 6: a well-formed integer that must reach the bounds check
+        // (the old u32-typed field made serde throw InvalidPayload here).
+        assert_eq!(
+            convert_splices(vec![splice(4294967302.0, 0.0)], 11).unwrap_err(),
+            "OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)"
+        );
+        // Ordinary in-u32 past-doc-end value: the same check.
+        assert_eq!(
+            convert_splices(vec![splice(2.0, 5.0)], 3).unwrap_err(),
+            "OutOfBounds: position 7 beyond document length 3 (UTF-16 code units)"
+        );
+    }
+
+    #[test]
+    fn splice_ordering_beats_bounds_like_the_mock() {
+        assert_eq!(
+            convert_splices(vec![splice(1.0, 2.0), splice(2.0, 4294967296.0)], 11).unwrap_err(),
+            "InvalidSplice: splice #1: splices must be ascending and non-overlapping (at 2 < previous end 3)"
+        );
+    }
+
+    #[test]
+    fn selections_validate_with_the_mock_message_and_bounds() {
+        assert_eq!(
+            convert_selections(vec![SelectionIn { anchor: -1.0, head: 0.0 }], 11).unwrap_err(),
+            "InvalidPayload: malformed selections: anchor=-1 head=0"
+        );
+        assert_eq!(
+            convert_selections(vec![SelectionIn { anchor: 0.0, head: 2.5 }], 11).unwrap_err(),
+            "InvalidPayload: malformed selections: anchor=0 head=2.5"
+        );
+        assert_eq!(
+            convert_selections(vec![SelectionIn { anchor: 4294967302.0, head: 0.0 }], 11)
+                .unwrap_err(),
+            "OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)"
+        );
+        assert_eq!(
+            convert_selections(vec![SelectionIn { anchor: 0.0, head: 99.0 }], 11).unwrap_err(),
+            "OutOfBounds: position 99 beyond document length 11 (UTF-16 code units)"
+        );
+        let ok = convert_selections(vec![SelectionIn { anchor: 2.0, head: 9.0 }], 11).unwrap();
+        assert_eq!((ok[0].anchor, ok[0].head), (2, 9));
     }
 }

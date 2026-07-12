@@ -21,11 +21,11 @@ The one place the fast path *is* wired up (`stream_append`) proves the mechanism
 
 ## 1. Method
 
-- New file: `crates/oxidown-core/tests/perf_baseline.rs` — 6 `#[ignore]`d tests, run via:
+- New file: `crates/oxidown-core/tests/perf_baseline.rs` — 8 `#[ignore]`d tests, run via:
   ```
   cargo test -p oxidown-core --release --test perf_baseline -- --ignored --nocapture
   ```
-  Iteration counts default to fast/CI-friendly values (80-300 depending on test) and scale up via `OXIDOWN_PERF_ITERS=<n>` for a deeper local run. All assertions are loose ceilings (10-40x the observed p95), matching `perf_smoke.rs`/`stream_perf.rs` convention — they exist so the suite stays a runnable regression trip-wire, not a tight gate.
+  Iteration counts default to fast values (30-300 depending on test) and scale up via `OXIDOWN_PERF_ITERS=<n>` for a deeper local run. All assertions are loose ceilings (10-40x the observed p95), matching `perf_smoke.rs`/`stream_perf.rs` convention — they exist so the suite stays a runnable regression trip-wire for **local** runs, not a tight gate. (CI runs the `--ignored` perf tests informationally with `|| true` — see `.github/workflows/ci.yml`'s "Perf smoke test (informational, non-fatal)" step — so these asserts never gate CI; they only trip when a developer runs the suite locally.)
 - Doc generation: `generate_mixed_doc(target_bytes)`, a richer sibling of `perf_smoke.rs`'s `generate_doc` — cycles through ATX headings, mixed-inline paragraphs (bold/italic both flavors, code, strike, link, autolink, CJK, emoji), plain paragraphs, nested blockquotes, fenced code blocks, and lists (nested bullets, ordered, tasks), matching the shape of `apps/web-demo/src/sample-doc.ts`'s `SAMPLE_DOC` without depending on it (constraint: don't touch `apps/`). A small nested-list snippet containing a `PERF_INDENT_TARGET` marker is spliced in at the document's midpoint for the `indentList` benchmark.
 - Four sizes tested throughout: **~3KB** (demo-sample shape), **~30KB**, **~100KB** (the contract's reference size), **~300KB**.
 - **No `src/` file was modified.** Every API used (`parser::parse_document`, `parser::ParseResult.nodes`, `Editor::apply_edit`/`decorations`/`command`, `Decoration`/`BlockStyle`/`MarkStyle`/`WidgetKind`) was already `pub`. The only non-test change anywhere is a `serde_json` **dev-dependency** added to `crates/oxidown-core/Cargo.toml`, needed to replicate `oxidown-wasm`'s exact JSON-serialization step natively (§7) — `oxidown-wasm` itself depends on `wasm-bindgen`/`js-sys`, which don't link off `wasm32`, so that crate's code cannot run in a native test; the JSON-shape logic is small enough to faithfully duplicate (field names/shapes copied 1:1 from `crates/oxidown-wasm/src/lib.rs`'s `decoration_json`).
@@ -350,7 +350,10 @@ byte-identical payload.
   pin tests); old `Value` path kept under `#[cfg(test)]` as the oracle.
 * `crates/oxidown-core/tests/perf_baseline.rs` — regression asserts tightened: 300KB mid-doc
   `apply_edit` p95 < 500µs, 100KB combined p95 < 1ms (release); both ≥10x above measured so
-  CI noise cannot flake them, both well below what any full-reparse regression would cost.
+  machine noise cannot flake them, both well below what any full-reparse regression would
+  cost. Note these are **local trip-wires, not CI gates**: CI runs the `--ignored` perf
+  tests non-fatally (`|| true` in ci.yml's perf-smoke step), so a tripped assert only fails
+  a developer's local `--ignored` run.
 
 ---
 

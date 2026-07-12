@@ -209,6 +209,41 @@ fn link_title_containing_parens_keeps_decorations_and_reveals_url() {
 }
 
 #[test]
+fn angle_bracketed_link_destination_reveals_wrappers_as_delim() {
+    // README: a `<...>`-wrapped destination unwraps to the INNER span only.
+    // Revealed, the `](<` and `>)` pieces are `mark:delim` and just "u v"
+    // is `mark:url`.
+    let d = decos("[t](<u v>)", &[(1, 1)]);
+    assert_eq!(
+        d,
+        vec![
+            mark(0, 1, MarkStyle::Delim),
+            mark(1, 2, MarkStyle::Link),
+            mark(2, 5, MarkStyle::Delim),  // "](<"
+            mark(5, 8, MarkStyle::Url),    // "u v"
+            mark(8, 10, MarkStyle::Delim), // ">)"
+        ]
+    );
+    // Concealed: the whole tail conceals as before, wrappers included.
+    let d = decos("[t](<u v>)", &[]);
+    assert_eq!(
+        d,
+        vec![conceal(0, 1), mark(1, 2, MarkStyle::Link), conceal(2, 10)]
+    );
+    // Empty `<>`: an empty destination span emits no mark:url — the whole
+    // tail reveals as one delim mark, same as raw-empty "[t]()".
+    let d = decos("[t](<>)", &[(1, 1)]);
+    assert_eq!(
+        d,
+        vec![
+            mark(0, 1, MarkStyle::Delim),
+            mark(1, 2, MarkStyle::Link),
+            mark(2, 7, MarkStyle::Delim),
+        ]
+    );
+}
+
+#[test]
 fn link_text_utf16_offsets() {
     // "[你好](url)": text is 2 CJK chars = 2 CU (6 bytes), so byte/CU spans
     // diverge but the decorator must report CU throughout.
@@ -729,6 +764,46 @@ fn task_item_composition_over_checkbox_withholds_widget() {
 }
 
 #[test]
+fn ordered_task_item_renders_number_and_checkbox_widgets_together() {
+    // DECISION (M1 review): an ordered task item emits BOTH widgets when
+    // concealed — the computed-number marker widget AND the task checkbox
+    // (number + checkbox, matching Obsidian). Only the bullet flavor
+    // conceals its marker in lockstep with the checkbox; an ordered task
+    // marker never conceals.
+    let d = decos("1. [ ] a", &[]);
+    assert_eq!(
+        d,
+        vec![li(0, 1), ordered(0, 3, 1, b'.'), widget(3, 6, false)]
+    );
+    let d = decos("1. [x] a", &[]);
+    assert_eq!(
+        d,
+        vec![li(0, 1), ordered(0, 3, 1, b'.'), widget(3, 6, true)]
+    );
+    // Revealed (LINE-level: cursor anywhere on the line): both widgets are
+    // withheld — raw source digits as mark:list-marker, checkbox as
+    // mark:delim.
+    let d = decos("1. [ ] a", &[(7, 7)]);
+    assert_eq!(
+        d,
+        vec![
+            li_rev(0, 1),
+            mark(0, 3, MarkStyle::ListMarker),
+            mark(3, 6, MarkStyle::Delim),
+        ]
+    );
+    let d = decos("1. [x] a", &[(0, 0)]);
+    assert_eq!(
+        d,
+        vec![
+            li_rev(0, 1),
+            mark(0, 3, MarkStyle::ListMarker),
+            mark(3, 6, MarkStyle::Delim),
+        ]
+    );
+}
+
+#[test]
 fn list_inside_blockquote_gets_marker_and_blockquote_line() {
     let doc = "> - item\n";
     let d = decos(doc, &[]);
@@ -784,6 +859,77 @@ fn m1_constructs_never_error_on_stale_or_oob_queries() {
             .name(),
         "OutOfBounds"
     );
+}
+
+#[test]
+fn blank_code_block_line_keeps_its_line_style_at_the_viewport_seam() {
+    // The blank fence-body line is a ZERO-WIDTH node (extent 8..8). A
+    // viewport starting exactly at it must still see its line:code-block
+    // decoration — the general exclusive-end overlap check
+    // (`extent.end <= viewport.start`) used to drop it at the seam.
+    let doc = "```\naaa\n\nbbb\n```\n";
+    let (ed, rev) = editor(doc);
+    let d = ed.decorations(rev, 8, 9, &[]).unwrap();
+    assert_eq!(d, vec![block(8, BlockStyle::CodeBlock)]);
+    // Half-open at the other seam: a window ENDING at the blank line does
+    // not claim it (it belongs to the next window)...
+    let d = ed.decorations(rev, 4, 8, &[]).unwrap();
+    assert_eq!(d, vec![block(4, BlockStyle::CodeBlock), mark(4, 7, MarkStyle::Code)]);
+    // ...and the full viewport still contains it exactly once.
+    let full = ed.decorations(rev, 0, ed.doc_len_utf16(), &[]).unwrap();
+    assert_eq!(
+        full.iter().filter(|d| **d == block(8, BlockStyle::CodeBlock)).count(),
+        1
+    );
+}
+
+/// Whether `d` belongs to the line-aligned window `[from, to)` under the
+/// same half-open semantics `compute` uses: point decorations (`at`) and
+/// zero-width spans belong to the window containing their position; spans
+/// belong to every window they overlap.
+fn belongs(d: &Decoration, from: usize, to: usize) -> bool {
+    match *d {
+        Decoration::Line { at, .. } | Decoration::Block { at, .. } => from <= at && at < to,
+        Decoration::Mark { from: f, to: t, .. }
+        | Decoration::Conceal { from: f, to: t }
+        | Decoration::Widget { from: f, to: t, .. } => {
+            if f == t {
+                from <= f && f < to
+            } else {
+                f < to && t > from
+            }
+        }
+    }
+}
+
+#[test]
+fn every_line_aligned_viewport_window_is_lossless_over_blank_code_block_lines() {
+    // Sweep every line-aligned window [b[i], b[j]) over a doc whose fenced
+    // block contains blank (zero-width) body lines: each window's output
+    // must be EXACTLY the full set filtered to that window — nothing lost
+    // at any seam, nothing invented.
+    let doc = "```\naaa\n\nbbb\n\n\nccc\n```\n";
+    let (ed, rev) = editor(doc);
+    let full = ed.decorations(rev, 0, ed.doc_len_utf16(), &[]).unwrap();
+    // All-ASCII: byte == CU. Window bounds = every line start + doc end.
+    let mut bounds: Vec<usize> = std::iter::once(0)
+        .chain(doc.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    if *bounds.last().unwrap() != doc.len() {
+        bounds.push(doc.len());
+    }
+    for i in 0..bounds.len() - 1 {
+        for j in (i + 1)..bounds.len() {
+            let (from, to) = (bounds[i], bounds[j]);
+            let window = ed.decorations(rev, from, to, &[]).unwrap();
+            let expected: Vec<Decoration> = full
+                .iter()
+                .filter(|d| belongs(d, from, to))
+                .cloned()
+                .collect();
+            assert_eq!(window, expected, "window {from}..{to}");
+        }
+    }
 }
 
 #[test]

@@ -63,7 +63,12 @@
  *     when nothing was pending) so the view can apply it and stay in sync
  *     with the core document. A lone surrogate anywhere else in a
  *     chunk throws "InvalidPayload: ..."; the stream's buffer is cleared
- *     whenever an append throws.
+ *     whenever an append throws, and ALL streams' buffers are cleared by
+ *     `load` (the core clears its streams then, and the buffer must follow).
+ *     `applyEdit` replicates the mock's malformed-baseRevision and staleness
+ *     checks ahead of its surrogate check so the cross-core validation
+ *     precedence (revision checks before payload checks) holds even though
+ *     the surrogate check itself cannot cross the boundary.
  *   - `destroy()`: frees the underlying wasm-bindgen instance (its `free()`
  *     releases the Rust-side allocation); idempotent, guards double-free.
  */
@@ -182,6 +187,17 @@ export class StreamSurrogateBuffer {
   clear(id: number): void {
     this.pending.delete(id);
   }
+
+  /**
+   * Drop EVERY stream's pending unit. Called on `load()`: the core clears
+   * all streams when the document is replaced, so the adapter's buffer must
+   * die with them — otherwise a later `streamClose` on a pre-load id would
+   * flush a stale U+FFFD append into a dead stream and throw UnknownStream
+   * out of a call the contract pins as a no-op returning null.
+   */
+  clearAll(): void {
+    this.pending.clear();
+  }
 }
 
 /** Method surface we expect on the wasm-bindgen class instance. */
@@ -221,9 +237,35 @@ export function adaptWasmCore(inner: WasmCoreInstance): OxidownCore {
   return {
     load: (text: string) => {
       assertNoUnpairedSurrogates(text, "text");
+      // Core-side load clears every stream; the adapter's per-stream
+      // surrogate buffer must be cleared in the same breath (see
+      // StreamSurrogateBuffer.clearAll) — a stale pending unit would turn a
+      // post-load streamClose (contract: no-op returning null) into an
+      // UnknownStream throw via its U+FFFD flush.
+      streamBuffer.clearAll();
       return inner.load(text);
     },
     applyEdit: (baseRevision: number, splices: Splice[], origin: EditOrigin) => {
+      // Validation precedence parity with the mock (mock-core.ts
+      // `applyEdit`): malformed baseRevision → staleness → payload checks.
+      // The unpaired-surrogate check MUST run JS-side (before the strings
+      // cross the boundary, where lone surrogates silently corrupt), so the
+      // two revision checks it must not preempt are replicated here, message
+      // parity included; the wasm entry point re-runs both harmlessly. A
+      // simultaneously-stale AND payload-malformed call must be
+      // StaleRevision (desync-resync class), never InvalidPayload (consumed
+      // no-op class), on both cores.
+      if (!Number.isInteger(baseRevision) || baseRevision < 0) {
+        throw new Error(
+          `InvalidArgs: baseRevision must be a non-negative integer, got ${baseRevision}`,
+        );
+      }
+      const current = inner.revision();
+      if (baseRevision !== current) {
+        throw new Error(
+          `StaleRevision: core is at revision ${current}, caller passed ${baseRevision}`,
+        );
+      }
       for (const splice of splices) {
         assertNoUnpairedSurrogates(splice.insert, "splice insert");
       }

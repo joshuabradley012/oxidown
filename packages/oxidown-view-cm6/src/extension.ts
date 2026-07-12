@@ -836,10 +836,34 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         },
         compositionstart(_event, view) {
           const r = view.state.selection.main;
-          core.compositionBegin(r.from, r.to);
+          try {
+            core.compositionBegin(r.from, r.to);
+          } catch (err) {
+            // Contract "Error handling": like the applyEdit/decorations call
+            // sites (and unlike command(), which is transactional), any
+            // exception here is a mirror-desync emergency — log loudly and
+            // re-load the core from the view buffer.
+            console.error(
+              "[oxidown] core error during compositionBegin — re-loading core from view buffer:",
+              err,
+            );
+            core.load(view.state.doc.toString());
+            this.dirty = true; // rebuilt after the composition settles
+          }
         },
-        compositionend() {
-          core.compositionEnd();
+        compositionend(_event, view) {
+          try {
+            core.compositionEnd();
+          } catch (err) {
+            // Same desync-emergency discipline as compositionstart above.
+            console.error(
+              "[oxidown] core error during compositionEnd — re-loading core from view buffer:",
+              err,
+            );
+            core.load(view.state.doc.toString());
+          }
+          // Runs whether or not compositionEnd threw: the catch-up rebuild
+          // must still be scheduled (and after a resync, doubly so).
           this.dirty = true;
           // view.composing stays true until CM has processed the final
           // composition transaction; flush once it has settled.
@@ -963,6 +987,21 @@ function commandKeymap(core: OxidownCore): Extension {
     applyCoreChange(view, outcome.change, "oxidown.command");
     return true;
   };
+  // Mod-Shift-Enter: keyboard path for the task-checkbox toggle (a11y — the
+  // widget's click handler must not be the only way to toggle). Same
+  // core.command("toggleTask") path as the checkbox click, targeted at the
+  // cursor's line (toggleTask resolves leniently from anywhere in the item).
+  // `null` (not a task line) falls through so a host binding may claim the
+  // key. Not bound by defaultKeymap (which uses Mod-Enter for
+  // insertBlankLine) nor elsewhere in this file.
+  const runToggleTask = (view: EditorView): boolean => {
+    const pos = view.state.selection.main.head;
+    const outcome = runCoreCommand("toggleTask", () => core.command("toggleTask", pos));
+    if (!outcome.ok) return true; // thrown: handled-and-ignored, never "doesn't apply"
+    if (outcome.change === null) return false;
+    applyCoreChange(view, outcome.change, "oxidown.command");
+    return true;
+  };
   return keymap.of([
     { key: "Mod-b", run: runToggle("toggleStrong"), preventDefault: true },
     { key: "Mod-i", run: runToggle("toggleEm"), preventDefault: true },
@@ -990,13 +1029,24 @@ function commandKeymap(core: OxidownCore): Extension {
     // defaultKeymap in the host's extension array — the documented setup).
     { key: "Mod-]", run: runIndent("indentList", indentMore), preventDefault: true },
     { key: "Mod-[", run: runIndent("outdentList", indentLess), preventDefault: true },
+    // Keyboard path for the task checkbox (see runToggleTask above).
+    { key: "Mod-Shift-Enter", run: runToggleTask, preventDefault: true },
   ]);
 }
 
 /**
- * Mod-b / Mod-i / Mod-Shift-x / Mod-e keymap for toggleStrong/toggleEm/
- * toggleStrike/toggleCode over the current selection. Exported standalone so
- * it can be composed elsewhere; included in `oxidown()` by default.
+ * The core-driven command keymap:
+ * - Mod-b / Mod-i / Mod-Shift-x / Mod-e toggle strong/em/strike/code over
+ *   the current selection;
+ * - Enter continues/exits list markers and quote prefixes (falling through
+ *   to the default newline when neither applies);
+ * - Tab / Shift-Tab and Mod-] / Mod-[ run marker-width-aware
+ *   indentList/outdentList (falling back to CM6's indentMore/indentLess
+ *   outside list context);
+ * - Mod-Shift-Enter toggles the task checkbox on the cursor's line (the
+ *   keyboard-accessible counterpart of the widget click).
+ * Exported standalone so it can be composed elsewhere; included in
+ * `oxidown()` by default.
  */
 export function oxidownCommands(core: OxidownCore): Extension {
   return commandKeymap(core);
@@ -1012,9 +1062,10 @@ export function oxidownCommands(core: OxidownCore): Extension {
  *   composition or mouse drag-selection (the anti-flicker playbook, research/01 §4).
  * - Binds Mod-z / Mod-y / Mod-Shift-z to CORE-DRIVEN undo/redo,
  *   Mod-b / Mod-i / Mod-Shift-x / Mod-e to CORE-DRIVEN formatting commands,
- *   Tab / Shift-Tab / Mod-] / Mod-[ to marker-width-aware list nesting, and
+ *   Tab / Shift-Tab / Mod-] / Mod-[ to marker-width-aware list nesting,
  *   Enter to construct-aware list/quote continuation (single-press exit on
- *   empty items; plain paragraphs fall through to the default newline).
+ *   empty items; plain paragraphs fall through to the default newline), and
+ *   Mod-Shift-Enter to the task-checkbox toggle on the cursor's line.
  *
  * IMPORTANT: do NOT include CM6's own history extension
  * (`@codemirror/commands` `history()` / `historyKeymap`) alongside this one —
