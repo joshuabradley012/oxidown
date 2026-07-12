@@ -75,33 +75,47 @@ export function collectFenceRegions(
 }
 
 // -- language loading (lazy, cached, misses remembered) ----------------------
+// Deliberately MODULE-GLOBAL (unlike the parse caches below): a language only
+// needs to load once per page, however many editor instances want it.
 
 /** lang (lowercased) -> loaded support, or null for a known miss. */
 const supports = new Map<string, LanguageSupport | null>();
-const loading = new Set<string>();
+/**
+ * In-flight loads: key -> EVERY requester's onLoad. All of them are notified
+ * on resolution — a second editor (or plugin instance) requesting a language
+ * while another's load is still in flight must get repainted too, not just
+ * the instance that initiated the load.
+ */
+const loading = new Map<string, Set<() => void>>();
 
 function supportFor(lang: string, onLoad: () => void): LanguageSupport | null | undefined {
   const key = lang.toLowerCase();
   if (supports.has(key)) return supports.get(key);
-  if (!loading.has(key)) {
-    const desc = LanguageDescription.matchLanguageName(languageRegistry, key, true);
-    if (!desc) {
-      supports.set(key, null);
-      return null;
-    }
-    loading.add(key);
-    desc.load().then(
-      (s) => {
-        supports.set(key, s);
-        loading.delete(key);
-        onLoad();
-      },
-      () => {
-        supports.set(key, null);
-        loading.delete(key);
-      },
-    );
+  const pending = loading.get(key);
+  if (pending) {
+    pending.add(onLoad);
+    return undefined; // still loading; notified with the initiator
   }
+  const desc = LanguageDescription.matchLanguageName(languageRegistry, key, true);
+  if (!desc) {
+    supports.set(key, null);
+    return null;
+  }
+  const callbacks = new Set<() => void>([onLoad]);
+  loading.set(key, callbacks);
+  desc.load().then(
+    (s) => {
+      supports.set(key, s);
+      loading.delete(key);
+      for (const cb of callbacks) cb();
+    },
+    () => {
+      // A failed load is a known miss: there is nothing to repaint, so the
+      // pending callbacks are dropped, not invoked.
+      supports.set(key, null);
+      loading.delete(key);
+    },
+  );
   return undefined; // still loading
 }
 
@@ -113,33 +127,17 @@ interface CachedSpan {
   cls: string;
 }
 
-/** `${lang} ${text}` -> spans relative to the region text (exact full-text hits). */
-const parseCache = new Map<string, CachedSpan[]>();
 const PARSE_CACHE_MAX = 64;
 
-/**
- * Incremental-parse support: the last Tree (+ the text it was parsed from)
- * per fence, so a keystroke inside a large fence reuses Lezer's own
- * incremental machinery (TreeFragment.applyChanges) instead of a
- * from-scratch parse of the whole fence body on every call. Keyed by
- * `${index in this call's region list}:${lang}` — a cheap, not-perfectly-
- * stable "which fence is this" identity (it can point at the wrong prior
- * entry when fences are added/removed/reordered above it in the same edit).
- * That's fine for CORRECTNESS: the diff below (common prefix/suffix between
- * the cached old text and the current text) is a mathematically valid
- * description of an unchanged-prefix/unchanged-suffix edit for WHATEVER two
- * strings are compared — a wrong-identity mismatch just yields a smaller
- * reusable region (more re-parsing), never a wrong tree. Only efficiency is
- * at stake, matching this module's existing "bounded cache, cheap eviction"
- * discipline.
- */
 interface TreeCacheEntry {
   text: string;
   tree: Tree;
 }
-const treeCache = new Map<string, TreeCacheEntry>();
 const TREE_CACHE_MAX = 64;
 
+// markCache stays module-global: Decoration.mark values are immutable and
+// keyed purely by class name, so sharing them across instances is safe (and
+// lets CM6 see identical decorations across editors).
 const markCache = new Map<string, Decoration>();
 function markFor(cls: string): Decoration {
   let m = markCache.get(cls);
@@ -167,93 +165,125 @@ function commonPrefixSuffix(a: string, b: string): { prefix: number; suffix: num
 }
 
 /**
- * Parse `text` with `support`'s Lezer parser, reusing the previous parse for
- * this `cacheKey` (via TreeFragment.applyChanges) when one exists — unchanged
- * parts of the fence (everything outside the common prefix/suffix diff
- * against the previously cached text) are reused rather than re-tokenized.
- * Falls back to a full from-scratch parse when there's no previous tree for
- * this key, or the computed change range is degenerate.
+ * Per-view-plugin-instance highlighter: the parse/tree caches live here (one
+ * FenceHighlighter per plugin instance, created with it and released with
+ * it) rather than at module scope — module-global caches would outlive every
+ * editor AND collide across concurrent instances, whose `${regionIndex}:
+ * ${lang}` keys would steal each other's slots (correct output, but the
+ * incremental reuse constantly thrashes). The language-load registry above
+ * stays global on purpose (a language loads once per page).
  */
-function parseIncremental(support: LanguageSupport, text: string, cacheKey: string): Tree {
-  const parser = support.language.parser;
-  const prev = treeCache.get(cacheKey);
-  let tree: Tree;
-  if (!prev) {
-    tree = parser.parse(text);
-  } else if (prev.text === text) {
-    tree = prev.tree;
-  } else {
-    const { prefix, suffix } = commonPrefixSuffix(prev.text, text);
-    const fromA = prefix;
-    const toA = prev.text.length - suffix;
-    const fromB = prefix;
-    const toB = text.length - suffix;
-    // Guard against a degenerate/overlapping range (shouldn't happen given
-    // prefix+suffix <= min(len), but never feed Lezer a malformed change).
-    if (fromA <= toA && fromB <= toB) {
-      const fragments = TreeFragment.applyChanges(TreeFragment.addTree(prev.tree), [
-        { fromA, toA, fromB, toB },
-      ]);
-      tree = parser.parse(text, fragments);
-    } else {
+export class FenceHighlighter {
+  /** `${lang} ${text}` -> spans relative to the region text (exact full-text hits). */
+  private readonly parseCache = new Map<string, CachedSpan[]>();
+
+  /**
+   * Incremental-parse support: the last Tree (+ the text it was parsed from)
+   * per fence, so a keystroke inside a large fence reuses Lezer's own
+   * incremental machinery (TreeFragment.applyChanges) instead of a
+   * from-scratch parse of the whole fence body on every call. Keyed by
+   * `${index in this call's region list}:${lang}` — a cheap, not-perfectly-
+   * stable "which fence is this" identity (it can point at the wrong prior
+   * entry when fences are added/removed/reordered above it in the same edit).
+   * That's fine for CORRECTNESS: the diff below (common prefix/suffix between
+   * the cached old text and the current text) is a mathematically valid
+   * description of an unchanged-prefix/unchanged-suffix edit for WHATEVER two
+   * strings are compared — a wrong-identity mismatch just yields a smaller
+   * reusable region (more re-parsing), never a wrong tree. Only efficiency is
+   * at stake, matching this module's existing "bounded cache, cheap eviction"
+   * discipline.
+   */
+  private readonly treeCache = new Map<string, TreeCacheEntry>();
+
+  /**
+   * Parse `text` with `support`'s Lezer parser, reusing the previous parse for
+   * this `cacheKey` (via TreeFragment.applyChanges) when one exists — unchanged
+   * parts of the fence (everything outside the common prefix/suffix diff
+   * against the previously cached text) are reused rather than re-tokenized.
+   * Falls back to a full from-scratch parse when there's no previous tree for
+   * this key, or the computed change range is degenerate.
+   */
+  private parseIncremental(support: LanguageSupport, text: string, cacheKey: string): Tree {
+    const parser = support.language.parser;
+    const prev = this.treeCache.get(cacheKey);
+    let tree: Tree;
+    if (!prev) {
       tree = parser.parse(text);
+    } else if (prev.text === text) {
+      tree = prev.tree;
+    } else {
+      const { prefix, suffix } = commonPrefixSuffix(prev.text, text);
+      const fromA = prefix;
+      const toA = prev.text.length - suffix;
+      const fromB = prefix;
+      const toB = text.length - suffix;
+      // Guard against a degenerate/overlapping range (shouldn't happen given
+      // prefix+suffix <= min(len), but never feed Lezer a malformed change).
+      if (fromA <= toA && fromB <= toB) {
+        const fragments = TreeFragment.applyChanges(TreeFragment.addTree(prev.tree), [
+          { fromA, toA, fromB, toB },
+        ]);
+        tree = parser.parse(text, fragments);
+      } else {
+        tree = parser.parse(text);
+      }
     }
-  }
-  if (!treeCache.has(cacheKey) && treeCache.size >= TREE_CACHE_MAX) {
-    // Drop the oldest entry (Map preserves insertion order).
-    const oldest = treeCache.keys().next().value;
-    if (oldest !== undefined) treeCache.delete(oldest);
-  }
-  treeCache.set(cacheKey, { text, tree });
-  return tree;
-}
-
-function highlightText(
-  support: LanguageSupport,
-  lang: string,
-  text: string,
-  cacheKey: string,
-): CachedSpan[] {
-  const key = `${lang} ${text}`;
-  const hit = parseCache.get(key);
-  if (hit) return hit;
-  const spans: CachedSpan[] = [];
-  const tree = parseIncremental(support, text, cacheKey);
-  highlightTree(tree, classHighlighter, (from, to, cls) => {
-    spans.push({ from, to, cls });
-  });
-  if (parseCache.size >= PARSE_CACHE_MAX) {
-    // Drop the oldest entry (Map preserves insertion order).
-    const oldest = parseCache.keys().next().value;
-    if (oldest !== undefined) parseCache.delete(oldest);
-  }
-  parseCache.set(key, spans);
-  return spans;
-}
-
-/**
- * Produce highlight mark ranges for every region whose language is already
- * loaded, and kick off loads (reporting via `onLoad`) for those that aren't.
- */
-export function highlightRegions(
-  state: EditorState,
-  regions: readonly FenceRegion[],
-  onLoad: () => void,
-): Range<Decoration>[] {
-  const out: Range<Decoration>[] = [];
-  for (let i = 0; i < regions.length; i++) {
-    const region = regions[i];
-    const support = supportFor(region.lang, onLoad);
-    if (!support) continue; // miss or still loading
-    const text = state.doc.sliceString(region.from, region.to);
-    // See treeCache's doc comment: this key need not be a perfectly stable
-    // fence identity for correctness, only for how much gets reused.
-    const cacheKey = `${i}:${region.lang}`;
-    for (const span of highlightText(support, region.lang, text, cacheKey)) {
-      const from = region.from + span.from;
-      const to = region.from + span.to;
-      if (to > from && to <= region.to) out.push(markFor(span.cls).range(from, to));
+    if (!this.treeCache.has(cacheKey) && this.treeCache.size >= TREE_CACHE_MAX) {
+      // Drop the oldest entry (Map preserves insertion order).
+      const oldest = this.treeCache.keys().next().value;
+      if (oldest !== undefined) this.treeCache.delete(oldest);
     }
+    this.treeCache.set(cacheKey, { text, tree });
+    return tree;
   }
-  return out;
+
+  private highlightText(
+    support: LanguageSupport,
+    lang: string,
+    text: string,
+    cacheKey: string,
+  ): CachedSpan[] {
+    const key = `${lang} ${text}`;
+    const hit = this.parseCache.get(key);
+    if (hit) return hit;
+    const spans: CachedSpan[] = [];
+    const tree = this.parseIncremental(support, text, cacheKey);
+    highlightTree(tree, classHighlighter, (from, to, cls) => {
+      spans.push({ from, to, cls });
+    });
+    if (this.parseCache.size >= PARSE_CACHE_MAX) {
+      // Drop the oldest entry (Map preserves insertion order).
+      const oldest = this.parseCache.keys().next().value;
+      if (oldest !== undefined) this.parseCache.delete(oldest);
+    }
+    this.parseCache.set(key, spans);
+    return spans;
+  }
+
+  /**
+   * Produce highlight mark ranges for every region whose language is already
+   * loaded, and kick off loads (reporting via `onLoad`) for those that aren't.
+   */
+  highlightRegions(
+    state: EditorState,
+    regions: readonly FenceRegion[],
+    onLoad: () => void,
+  ): Range<Decoration>[] {
+    const out: Range<Decoration>[] = [];
+    for (let i = 0; i < regions.length; i++) {
+      const region = regions[i];
+      const support = supportFor(region.lang, onLoad);
+      if (!support) continue; // miss or still loading
+      const text = state.doc.sliceString(region.from, region.to);
+      // See treeCache's doc comment: this key need not be a perfectly stable
+      // fence identity for correctness, only for how much gets reused.
+      const cacheKey = `${i}:${region.lang}`;
+      for (const span of this.highlightText(support, region.lang, text, cacheKey)) {
+        const from = region.from + span.from;
+        const to = region.from + span.to;
+        if (to > from && to <= region.to) out.push(markFor(span.cls).range(from, to));
+      }
+    }
+    return out;
+  }
 }

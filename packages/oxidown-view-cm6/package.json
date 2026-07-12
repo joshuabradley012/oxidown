@@ -19,16 +19,23 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest run"
   },
-  "dependencies": {
-    "@codemirror/commands": "6.10.4",
+  "peerDependencies": {
+    "@codemirror/commands": "^6.10.4",
     "@codemirror/language": "^6.12.4",
     "@codemirror/language-data": "^6.5.2",
-    "@codemirror/state": "6.7.0",
-    "@codemirror/view": "6.43.4",
+    "@codemirror/state": "^6.7.0",
+    "@codemirror/view": "^6.43.4",
     "@lezer/common": "^1.5.2",
     "@lezer/highlight": "^1.2.3"
   },
   "devDependencies": {
+    "@codemirror/commands": "6.10.4",
+    "@codemirror/language": "6.12.4",
+    "@codemirror/language-data": "6.5.2",
+    "@codemirror/state": "6.7.0",
+    "@codemirror/view": "6.43.4",
+    "@lezer/common": "1.5.2",
+    "@lezer/highlight": "1.2.3",
     "jsdom": "28.0.0",
     "typescript": "5.9.3",
     "vitest": "4.1.9"

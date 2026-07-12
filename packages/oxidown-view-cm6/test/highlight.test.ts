@@ -4,7 +4,7 @@ import { EditorState } from "@codemirror/state";
 import { LanguageDescription } from "@codemirror/language";
 import { languages as languageRegistry } from "@codemirror/language-data";
 import { classHighlighter, highlightTree } from "@lezer/highlight";
-import { collectFenceRegions, highlightRegions } from "../src/highlight";
+import { collectFenceRegions, FenceHighlighter } from "../src/highlight";
 import type { Decoration } from "../src/protocol";
 
 function stateOf(doc: string) {
@@ -43,9 +43,10 @@ describe("highlightRegions (async language load)", () => {
     const doc = "```js\nconst x = \"hi\"; // note\n```\n";
     const state = stateOf(doc);
     const regions = [{ lang: "js", from: 6, to: 29 }];
+    const hl = new FenceHighlighter();
     // First pass: language not loaded yet -> no marks, load kicked off.
     let loaded = false;
-    const first = highlightRegions(state, regions, () => {
+    const first = hl.highlightRegions(state, regions, () => {
       loaded = true;
     });
     if (first.length === 0) {
@@ -53,7 +54,7 @@ describe("highlightRegions (async language load)", () => {
       for (let i = 0; i < 100 && !loaded; i++) await new Promise((r) => setTimeout(r, 20));
       expect(loaded).toBe(true);
     }
-    const second = highlightRegions(state, regions, () => {});
+    const second = hl.highlightRegions(state, regions, () => {});
     expect(second.length).toBeGreaterThan(0);
     // Every mark must lie inside the region body.
     for (const r of second) {
@@ -83,9 +84,11 @@ describe("incremental re-parse (FIX 3: reuse across keystrokes)", () => {
     const before = `function total() {\n  let total = 0;\n${lines.join("\n")}\n  return total;\n}\n`;
     const region0 = { lang: "js", from: 6, to: 6 + before.length };
     const stateBefore = EditorState.create({ doc: "```js\n" + before + "```\n" });
-    // Warm the module's tree cache at index 0 for "js" with the BEFORE text
-    // (a cold, from-scratch parse — there's nothing to reuse yet).
-    highlightRegions(stateBefore, [region0], () => {});
+    // Warm this INSTANCE's tree cache at index 0 for "js" with the BEFORE
+    // text (a cold, from-scratch parse — there's nothing to reuse yet). The
+    // caches are per-FenceHighlighter, so both calls must share `hl`.
+    const hl = new FenceHighlighter();
+    hl.highlightRegions(stateBefore, [region0], () => {});
 
     // A single mid-fence edit deep in the body (well past any reasonable
     // common-prefix/suffix window), like one keystroke while typing.
@@ -98,7 +101,7 @@ describe("incremental re-parse (FIX 3: reuse across keystrokes)", () => {
 
     // Same index (0) as the warm cache above -> this call takes the
     // incremental path (TreeFragment.applyChanges against the cached tree).
-    const incremental = highlightRegions(stateAfter, [region1], () => {}).map((r) => ({
+    const incremental = hl.highlightRegions(stateAfter, [region1], () => {}).map((r) => ({
       from: r.from,
       to: r.to,
       cls: (r.value.spec as { class: string }).class,
@@ -151,13 +154,14 @@ describe("incremental re-parse (FIX 3: reuse across keystrokes)", () => {
     for (const t of texts) support!.language.parser.parse(t);
     const beforeMs = Date.now() - beforeStart;
 
-    // AFTER (the fix): highlightRegions reusing the same cache slot across
-    // the run, so each call after the first is an incremental re-parse.
+    // AFTER (the fix): one highlighter instance reusing the same cache slot
+    // across the run, so each call after the first is an incremental re-parse.
+    const hl = new FenceHighlighter();
     const afterStart = Date.now();
     for (const t of texts) {
       const state = EditorState.create({ doc: "```javascript\n" + t + "```\n" });
       const region = { lang: "javascript", from: 13, to: 13 + t.length };
-      highlightRegions(state, [region], () => {});
+      hl.highlightRegions(state, [region], () => {});
     }
     const afterMs = Date.now() - afterStart;
 
@@ -169,5 +173,46 @@ describe("incremental re-parse (FIX 3: reuse across keystrokes)", () => {
     );
 
     expect(afterMs).toBeLessThan(beforeMs);
+  });
+});
+
+describe("language-load multi-requester (two editors, one in-flight load)", () => {
+  it("notifies EVERY requester's onLoad when the shared load resolves", async () => {
+    // Two separate highlighter instances (two editors) request the same
+    // language back-to-back: the first call initiates the async load, the
+    // second arrives while it is still in flight. BOTH onLoad callbacks must
+    // fire on resolution — the in-flight requester used to be silently
+    // dropped, leaving that editor unhighlighted until an unrelated rebuild.
+    // "python" is untouched by the js/javascript tests above, so it is
+    // guaranteed to still be un-loaded (and in-flight) here.
+    const doc = "```python\ndef f(x):\n    return x\n```\n";
+    const state = stateOf(doc);
+    const from = doc.indexOf("def");
+    const to = doc.indexOf("\n```");
+    const regions = [{ lang: "python", from, to }];
+
+    const a = new FenceHighlighter();
+    const b = new FenceHighlighter();
+    let loadedA = false;
+    let loadedB = false;
+    const firstA = a.highlightRegions(state, regions, () => {
+      loadedA = true;
+    });
+    const firstB = b.highlightRegions(state, regions, () => {
+      loadedB = true;
+    });
+    // Neither can paint yet: the load is in flight for both.
+    expect(firstA).toEqual([]);
+    expect(firstB).toEqual([]);
+
+    for (let i = 0; i < 100 && !(loadedA && loadedB); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(loadedA).toBe(true);
+    expect(loadedB).toBe(true);
+
+    // And on their rebuild passes, both editors actually get marks.
+    expect(a.highlightRegions(state, regions, () => {}).length).toBeGreaterThan(0);
+    expect(b.highlightRegions(state, regions, () => {}).length).toBeGreaterThan(0);
   });
 });

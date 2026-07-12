@@ -26,7 +26,7 @@ import type {
 } from "./protocol.js";
 import { indentLess, indentMore } from "@codemirror/commands";
 import { changesToSplices } from "./splices.js";
-import { collectFenceRegions, highlightRegions } from "./highlight.js";
+import { collectFenceRegions, FenceHighlighter } from "./highlight.js";
 import { oxidownTheme } from "./theme.js";
 
 export { changesToSplices, endOfLastSplice } from "./splices.js";
@@ -131,8 +131,9 @@ const defaultVerifyMirror = (() => {
   }
 })();
 
-// Decoration builders (marks/conceals are `mark` decorations — characters are
-// NEVER removed or replaced in the DOM; conceal is a visual collapse only).
+// Decoration builders. Marks are `mark` decorations; conceal is a `replace`
+// decoration (see concealDeco below) — either way the characters stay in the
+// DOCUMENT; conceal is a visual collapse only.
 // v0.2 adds strike/link/url/list-marker mark styles and blockquote/code-fence/
 // code-block/hr line styles — same technique, new vocabulary (docs/boundary-v0.md
 // "Expanded decoration vocabulary"). Unknown styles are ignored (forward compat).
@@ -217,14 +218,19 @@ function blockquoteLineDeco(depth: number, gap: boolean): Decoration {
 class TaskCheckboxWidget extends WidgetType {
   constructor(
     private readonly checked: boolean,
-    private readonly pos: number,
     private readonly core: OxidownCore,
   ) {
     super();
   }
 
+  // Deliberately position-independent (matching OrderedMarkerWidget): the
+  // click handler resolves its target from the DOM at click time (posAtDOM
+  // below), so `checked` is this widget's entire identity. Comparing a
+  // construction-time position here would make every edit above a task line
+  // (d.from shifts) destroy and recreate every checkbox below it — DOM
+  // churn, lost hover state, dropped clicks — for no correctness gain.
   eq(other: TaskCheckboxWidget): boolean {
-    return other.checked === this.checked && other.pos === this.pos;
+    return other.checked === this.checked;
   }
 
   toDOM(view: EditorView): HTMLElement {
@@ -240,14 +246,14 @@ class TaskCheckboxWidget extends WidgetType {
       // only source of truth for `checked` — the next decoration rebuild
       // reflects whatever the core returns, not the DOM's own click default.
       event.preventDefault();
-      // Resolve the CURRENT position from the DOM at click time — never
-      // `this.pos`, which was captured at CONSTRUCTION. RangeSet.map
-      // repositions this widget's decoration range on every doc change
-      // without touching this instance's own fields (and rebuilds are
-      // microtask-deferred, frozen during composition/drag), so a click
-      // that lands after an edit above this task line — especially
-      // mid-composition — could toggle the WRONG task (or silently no-op)
-      // if we used the stale constructor value. `posAtDOM` reads the
+      // Resolve the CURRENT position from the DOM at click time — never a
+      // position captured at CONSTRUCTION. RangeSet.map repositions this
+      // widget's decoration range on every doc change without touching
+      // this instance's own fields (and rebuilds are microtask-deferred,
+      // frozen during composition/drag), so a click that lands after an
+      // edit above this task line — especially mid-composition — could
+      // toggle the WRONG task (or silently no-op)
+      // if we used a stale constructor value. `posAtDOM` reads the
       // widget's LIVE position from the view's current decoration set
       // instead; toggleTask resolves leniently from "anywhere in the list
       // item" so this doesn't need to be exact, just on the right line.
@@ -397,21 +403,33 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
     class OxidownView {
       decorations: DecorationSet = Decoration.none;
       private readonly view: EditorView;
-      /** True between mousedown and mouseup: reveal recomputation is frozen. */
+      /** True between mousedown and the gesture's end (mouseup, or dragend/
+       * drop for a native drag-and-drop): reveal recomputation is frozen. */
       dragging = false;
       /**
-       * True during a run of vertical cursor motion (Arrow/Page Up/Down).
+       * True during a run of vertical cursor motion (ArrowUp/ArrowDown).
        * Reveal recomputation is frozen so line geometry stays stable and
        * CM6's goal column (a remembered visual X) keeps mapping to the same
        * document positions — otherwise conceal/reveal width changes between
        * an ArrowUp and the following ArrowDown make the cursor drift.
+       * Page keys are deliberately NOT included: decorations only cover the
+       * previously-fetched viewport, so freezing a PageUp/PageDown that jumps
+       * past the render margin shows raw undecorated text for the freeze
+       * window, and the goal-column rationale doesn't apply to page motion.
        */
       verticalMotion = false;
       private verticalTimer: ReturnType<typeof setTimeout> | null = null;
       /** A rebuild is wanted (set by triggers, cleared by a successful rebuild). */
       dirty = false;
-      /** Microtask guard: at most one rebuild flush per microtask batch/frame. */
+      /** Microtask guard: rebuild triggers within one task coalesce into a
+       * single flush (queueMicrotask coalesces per task, not per frame). */
       private scheduled = false;
+      /**
+       * Fenced-code parse/tree caches, PER plugin instance (created with it,
+       * released with it) — see FenceHighlighter's doc for why these must
+       * not be module-global. Only the language-load registry is shared.
+       */
+      private readonly highlighter = new FenceHighlighter();
       private destroyed = false;
       /**
        * The core payload behind the current `decorations` set. Cursor-only
@@ -437,7 +455,15 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
        */
       private lastPayloadRevision: number | null = null;
 
-      private readonly onWindowMouseUp = () => {
+      /**
+       * Releases the mousedown freeze and flushes the deferred rebuild.
+       * Registered window-level for "mouseup" AND "dragend"/"drop": dragging
+       * an EXISTING selection hands the gesture to native HTML5 drag-and-drop,
+       * which ends with dragend/drop and never fires mouseup — without those
+       * two, the freeze would persist (flushRebuild early-returns) until the
+       * next click.
+       */
+      private readonly onDragGestureEnd = () => {
         if (this.dragging) {
           this.dragging = false;
           this.dirty = true;
@@ -454,7 +480,9 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         if (core.getText() !== text) core.load(text);
         if (renderDecorations) this.decorations = this.buildDecorations();
         if (typeof window !== "undefined") {
-          window.addEventListener("mouseup", this.onWindowMouseUp);
+          window.addEventListener("mouseup", this.onDragGestureEnd);
+          window.addEventListener("dragend", this.onDragGestureEnd);
+          window.addEventListener("drop", this.onDragGestureEnd);
         }
       }
 
@@ -529,13 +557,15 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         this.destroyed = true;
         if (this.verticalTimer !== null) clearTimeout(this.verticalTimer);
         if (typeof window !== "undefined") {
-          window.removeEventListener("mouseup", this.onWindowMouseUp);
+          window.removeEventListener("mouseup", this.onDragGestureEnd);
+          window.removeEventListener("dragend", this.onDragGestureEnd);
+          window.removeEventListener("drop", this.onDragGestureEnd);
         }
       }
 
       /**
-       * Called (from the vertical-motion keymap) BEFORE each Arrow/Page
-       * Up/Down command runs. Freezes rebuilds for the duration of the run;
+       * Called (from the vertical-motion keymap) BEFORE each ArrowUp/
+       * ArrowDown command runs. Freezes rebuilds for the duration of the run;
        * a trailing timer performs one rebuild shortly after the run ends so
        * reveal state catches up with wherever the cursor stopped.
        */
@@ -699,13 +729,16 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
               if (!deco) continue; // unrecognized mark style: ignore
               if (d.to > d.from) ranges.push(deco.range(d.from, d.to));
             } else if (d.kind === "conceal") {
-              // conceal: mark decoration — never a replace; chars stay in the DOM
+              // conceal: a replace decoration — the chars stay in the
+              // DOCUMENT (positions/copy/edit intact) but their DOM
+              // rendering collapses. See concealDeco's rationale block for
+              // why replace, not a CSS-hidden mark.
               if (d.to > d.from) ranges.push(concealDeco.range(d.from, d.to));
             } else if (d.kind === "widget") {
               if (d.widget === "task" && d.to > d.from) {
                 ranges.push(
                   Decoration.replace({
-                    widget: new TaskCheckboxWidget(d.checked ?? false, d.from, core),
+                    widget: new TaskCheckboxWidget(d.checked ?? false, core),
                   }).range(d.from, d.to),
                 );
               } else if (d.widget === "bullet" && d.to > d.from) {
@@ -728,7 +761,7 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
           const regions = collectFenceRegions(decos, state);
           if (regions.length > 0) {
             ranges.push(
-              ...highlightRegions(state, regions, () => {
+              ...this.highlighter.highlightRegions(state, regions, () => {
                 this.dirty = true;
                 this.scheduleRebuild();
               }),
@@ -742,11 +775,35 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
       }
     },
     {
+      // KNOWN TRADEOFF (evaluated, deliberately kept): height-affecting line
+      // decorations (.ox-h1's 1.6em font, .ox-bq-gap padding, .ox-li-*
+      // padding) are provided from this ViewPlugin, and CM6 reads plugin
+      // decorations only AFTER viewport/height estimation — so on heading-
+      // heavy documents, estimated line heights are corrected in the
+      // post-paint measure cycle (scroll-position estimation jitter). The
+      // canonical placement for height-affecting decorations is a StateField
+      // (read before estimation). Converting is NOT contained here, because
+      // the machinery is built around plugin-owned decorations:
+      //   - the constructor builds the first set synchronously against the
+      //     freshly-loaded mirror and the LIVE viewport; a StateField's
+      //     create() runs at state creation, before either exists, so the
+      //     first paint would be undecorated and flash in a microtask later;
+      //   - fetchPayload is viewport-scoped, so the field would still only
+      //     be populated by plugin-dispatched StateEffects (the flushRebuild
+      //     dispatch at the bottom of this class carrying the new set), and
+      //     every freeze path (composition/drag/vertical-motion) plus the
+      //     identical-payload skip and the "decos === this.decorations"
+      //     short-circuit would need re-plumbing onto effect dispatches.
+      // The conversion would take: a StateEffect<DecorationSet> + StateField
+      // mapping through changes, provided via EditorView.decorations.from(
+      // field), the flushRebuild dispatch carrying the effect instead of
+      // being empty, and a deferred (post-construction) initial dispatch.
       decorations: (v) => v.decorations,
       eventHandlers: {
         mousedown() {
-          // Freeze reveal recomputation for the duration of a drag-selection;
-          // window mouseup (registered in the constructor) unfreezes.
+          // Freeze reveal recomputation for the duration of a drag gesture;
+          // window mouseup/dragend/drop (registered in the constructor)
+          // unfreeze — see onDragGestureEnd.
           this.dragging = true;
         },
         compositionstart(_event, view) {
@@ -766,9 +823,10 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
 
   // Observe vertical cursor motion BEFORE the default commands run (Prec.high),
   // and return false so they still execute. Freezing rebuilds for the duration
-  // of an Arrow/Page Up/Down run keeps line geometry stable, so CM6's goal
+  // of an ArrowUp/ArrowDown run keeps line geometry stable, so CM6's goal
   // column (a remembered visual X) round-trips to the same document position.
-  const verticalKeys = ["ArrowUp", "ArrowDown", "PageUp", "PageDown"];
+  // PageUp/PageDown are NOT frozen (see the `verticalMotion` field's doc).
+  const verticalKeys = ["ArrowUp", "ArrowDown"];
   const observeVertical = (view: EditorView): boolean => {
     view.plugin(plugin)?.noteVerticalMotion();
     return false; // never consume — the default motion command runs next

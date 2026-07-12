@@ -6,7 +6,7 @@
 // and decoration rebuild scheduling.
 
 import { describe, expect, it, vi } from "vitest";
-import { EditorState } from "@codemirror/state";
+import { EditorState, type Transaction } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { defaultKeymap } from "@codemirror/commands";
 import { MockCore } from "../src/mock-core";
@@ -931,6 +931,233 @@ describe("FIX 6: skip-annotated dispatches are mirror-verified immediately", () 
     expect(errSpy).not.toHaveBeenCalled();
     expect(loadSpy).not.toHaveBeenCalled();
     errSpy.mockRestore();
+    view.destroy();
+  });
+});
+
+describe("widget DOM identity across unrelated edits", () => {
+  it("keeps the SAME checkbox <input> node after typing above the task line", async () => {
+    const core = new MockCore();
+    const doc = "line one\n- [ ] task\n";
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        // Cursor away from the task line (reveal is line-level) so the task
+        // stays concealed (widget rendered) throughout.
+        selection: { anchor: doc.length },
+        extensions: [oxidown(core, { verifyMirror: true })],
+      }),
+    });
+    await flush();
+    const before = view.contentDOM.querySelector("input.ox-task-checkbox");
+    expect(before).not.toBeNull();
+
+    // Type on the FIRST line (shifts the widget's document position) and let
+    // the deferred rebuild flush completely. The rebuilt widget compares
+    // eq() to the mounted one — `checked` unchanged — so CM6 must reuse the
+    // existing DOM node rather than destroy/recreate it (which would drop
+    // hover state and swallow an in-flight click).
+    view.dispatch({ changes: { from: 0, to: 0, insert: "x" }, userEvent: "input.type" });
+    await flush();
+    await flush();
+
+    const after = view.contentDOM.querySelector("input.ox-task-checkbox");
+    expect(after).toBe(before);
+    view.destroy();
+  });
+});
+
+describe("CoreChange selection placement", () => {
+  function makeCapturingView(doc: string, core: MockCore) {
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const trs: Transaction[] = [];
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        extensions: [
+          oxidown(core, { verifyMirror: true }),
+          EditorView.updateListener.of((u) => trs.push(...u.transactions)),
+        ],
+      }),
+    });
+    return { view, trs };
+  }
+
+  it("a CoreChange WITH a selection moves the cursor there and requests scrollIntoView", async () => {
+    const core = new MockCore();
+    const { view, trs } = makeCapturingView("abcdef", core);
+    view.dispatch({ changes: { from: 6, to: 6, insert: "XYZ" }, userEvent: "input.type" });
+    // Park the cursor somewhere the undo's mapped position would NOT land,
+    // so the selection placement is distinguishable from default mapping.
+    view.dispatch({ selection: { anchor: 1 } });
+
+    const change = core.undo(); // deletes "XYZ"; selection at the deletion site (6)
+    expect(change).not.toBeNull();
+    expect(change!.selection).not.toBeNull();
+    trs.length = 0;
+    applyCoreChange(view, change!, "undo");
+
+    expect(view.state.doc.toString()).toBe("abcdef");
+    expect(view.state.selection.main.anchor).toBe(change!.selection!.anchor);
+    expect(view.state.selection.main.head).toBe(change!.selection!.head);
+    expect(view.state.selection.main.anchor).not.toBe(1); // not the parked cursor
+    expect(trs.length).toBe(1);
+    expect(trs[0].scrollIntoView).toBe(true);
+    await flush();
+    view.destroy();
+  });
+
+  it("a CoreChange WITHOUT a selection leaves the user's mapped cursor alone (no scrollIntoView)", async () => {
+    const core = new MockCore();
+    const doc = "- [ ] task\nelsewhere";
+    const { view, trs } = makeCapturingView(doc, core);
+    view.dispatch({ selection: { anchor: doc.length } });
+
+    const change = core.command("toggleTask", 2); // selection: null
+    expect(change).not.toBeNull();
+    expect(change!.selection).toBeNull();
+    trs.length = 0;
+    applyCoreChange(view, change!, "oxidown.command");
+
+    expect(view.state.doc.toString()).toBe("- [x] task\nelsewhere");
+    // Same-length replacement above the cursor: the mapped position is the
+    // original one — the change must not have moved it.
+    expect(view.state.selection.main.anchor).toBe(doc.length);
+    expect(trs.length).toBe(1);
+    expect(trs[0].scrollIntoView).toBe(false);
+    await flush();
+    view.destroy();
+  });
+});
+
+describe("streaming cursor preservation (AT / AFTER the insertion point, interleaved typing)", () => {
+  it("cursor AT the insertion point does not ride the appended text", async () => {
+    const core = new MockCore();
+    const view = makeView("top\nbottom", core);
+    const end = view.state.doc.length;
+    view.dispatch({ selection: { anchor: end } });
+
+    const id = core.streamOpen(end);
+    applyCoreChange(view, core.streamAppend(id, " more"), "oxidown.stream");
+    core.streamClose(id);
+
+    expect(view.state.doc.toString()).toBe("top\nbottom more");
+    // CM6's default mapping keeps an empty selection BEFORE text inserted
+    // exactly at it: the cursor must not be dragged to the chunk's end.
+    expect(view.state.selection.main.anchor).toBe(end);
+    await flush();
+    view.destroy();
+  });
+
+  it("cursor AFTER the insertion point shifts by exactly the chunk length", async () => {
+    const core = new MockCore();
+    const view = makeView("start\nend", core);
+    const cursor = "start\nen".length; // inside "end", after the stream point
+    view.dispatch({ selection: { anchor: cursor } });
+
+    const id = core.streamOpen("start".length);
+    applyCoreChange(view, core.streamAppend(id, "XYZ"), "oxidown.stream");
+    core.streamClose(id);
+
+    expect(view.state.doc.toString()).toBe("startXYZ\nend");
+    expect(view.state.selection.main.anchor).toBe(cursor + "XYZ".length);
+    await flush();
+    view.destroy();
+  });
+
+  it("user typing during the stream interleaves: both edits land, cursor stays with the user", async () => {
+    const core = new MockCore();
+    const view = makeView("top\nbottom", core);
+    view.dispatch({ selection: { anchor: 3 } }); // end of "top"
+
+    const id = core.streamOpen(view.state.doc.length);
+    applyCoreChange(view, core.streamAppend(id, " one"), "oxidown.stream");
+
+    // The user keeps typing at THEIR cursor while the stream is open — an
+    // ordinary forwarded edit (applyEdit) that the stream's anchor must map
+    // through. Real keyboard input places the cursor after the inserted
+    // character explicitly, so this dispatch does too.
+    view.dispatch({
+      changes: { from: 3, to: 3, insert: "!" },
+      selection: { anchor: 4 },
+      userEvent: "input.type",
+    });
+    expect(core.getText()).toBe("top!\nbottom one");
+
+    applyCoreChange(view, core.streamAppend(id, " two"), "oxidown.stream");
+    core.streamClose(id);
+
+    expect(view.state.doc.toString()).toBe("top!\nbottom one two");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    // The cursor sits after the "!" the user typed, untouched by the stream.
+    expect(view.state.selection.main.anchor).toBe(4);
+    await flush();
+    view.destroy();
+  });
+});
+
+describe("formatting keymap happy path (Mod-b / Mod-i / Mod-Shift-x / Mod-e)", () => {
+  const cases: Array<[key: string, shift: boolean, delim: string]> = [
+    ["b", false, "**"],
+    ["i", false, "*"],
+    ["x", true, "~~"],
+    ["e", false, "`"],
+  ];
+  for (const [key, shift, delim] of cases) {
+    it(`Mod-${shift ? "Shift-" : ""}${key} wraps the selection in ${delim}`, async () => {
+      const core = new MockCore();
+      const view = makeView("hello world", core);
+      view.dispatch({ selection: { anchor: 6, head: 11 } });
+
+      view.contentDOM.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key,
+          code: `Key${key.toUpperCase()}`,
+          ctrlKey: true,
+          shiftKey: shift,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      await flush();
+
+      expect(view.state.doc.toString()).toBe(`hello ${delim}world${delim}`);
+      expect(core.getText()).toBe(view.state.doc.toString());
+      // The CoreChange's selection keeps the (shifted) content selected.
+      expect(view.state.selection.main.anchor).toBe(6 + delim.length);
+      expect(view.state.selection.main.head).toBe(11 + delim.length);
+      view.destroy();
+    });
+  }
+});
+
+describe("drag freeze released by dragend (native drag-and-drop, no mouseup)", () => {
+  it("defers the rebuild during the drag and flushes it on dragend", async () => {
+    const core = new MockCore();
+    const spy = vi.spyOn(core, "decorations");
+    const view = makeView("hello **world**", core);
+    await flush(); // settle the constructor build + any initial rebuild
+    const before = spy.mock.calls.length;
+
+    // Dragging an existing selection: mousedown freezes rebuilds...
+    view.contentDOM.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+
+    // ...a core change arrives mid-drag (e.g. a streamed append)...
+    const id = core.streamOpen(view.state.doc.length);
+    applyCoreChange(view, core.streamAppend(id, " x"), "oxidown.stream");
+    core.streamClose(id);
+    await flush();
+    expect(spy.mock.calls.length).toBe(before); // frozen: rebuild deferred
+
+    // ...and the native HTML5 drag ends with dragend — mouseup NEVER fires.
+    window.dispatchEvent(new Event("dragend"));
+    await flush();
+    expect(spy.mock.calls.length).toBe(before + 1); // deferred rebuild flushed
     view.destroy();
   });
 });
