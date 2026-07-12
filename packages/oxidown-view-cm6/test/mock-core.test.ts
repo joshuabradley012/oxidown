@@ -1632,3 +1632,347 @@ describe("MockCore streaming (v0.2)", () => {
     expect(core.getText()).toBe("XXXXhead\nZ");
   });
 });
+
+// ---------------------------------------------------------------------------
+// M1 review fixes (fix-spec S1–S5, S13) — pulldown-cmark parser fidelity and
+// the command/history semantics pinned identically on the Rust core.
+// ---------------------------------------------------------------------------
+
+describe("MockCore parser fidelity (S13a–c): flanking rules and code spans", () => {
+  const ds = (doc: string, sel: SelectionRange[] = []) => {
+    const { core } = makeCore(doc);
+    return core.decorations(core.revision(), 0, doc.length, sel);
+  };
+
+  it("intraword `_` never emphasizes: a_snake_case_word", () => {
+    const d = ds("a_snake_case_word");
+    expect(marks(d)).toEqual([]);
+    expect(conceals(d)).toEqual([]);
+  });
+
+  it("space-flanked ** is inert: `a ** b ** c` has no strong (corpus parity, cases.rs:45)", () => {
+    const d = ds("a ** b ** c");
+    expect(marks(d)).toEqual([]);
+    expect(conceals(d)).toEqual([]);
+  });
+
+  it("intraword `*` still emphasizes (only `_` has the intraword rule)", () => {
+    const d = ds("a*b*c");
+    expect(marks(d, "em")).toEqual([{ kind: "mark", from: 2, to: 3, style: "em" }]);
+  });
+
+  it("intraword `__` never strongs, word-edged `__` does", () => {
+    expect(marks(ds("a__b__c"))).toEqual([]);
+    expect(marks(ds("__b__ c"), "strong")).toEqual([
+      { kind: "mark", from: 2, to: 3, style: "strong" },
+    ]);
+  });
+
+  it("punctuation before a closer still closes: **foo.** and *(em)*", () => {
+    expect(marks(ds("**foo.** x"), "strong")).toEqual([
+      { kind: "mark", from: 2, to: 6, style: "strong" },
+    ]);
+    expect(marks(ds("*(em)* x"), "em")).toEqual([{ kind: "mark", from: 1, to: 5, style: "em" }]);
+  });
+
+  it("space-flanked ~~ is inert; word-edged ~~ still strikes; 3+ tildes never strike", () => {
+    expect(marks(ds("a ~~ b ~~ c"))).toEqual([]);
+    expect(marks(ds("~~s~~ x"), "strike")).toEqual([
+      { kind: "mark", from: 2, to: 3, style: "strike" },
+    ]);
+    expect(marks(ds("a ~~~x~~~ b"))).toEqual([]);
+  });
+
+  it("em spans a nested strong instead of closing on its opener: *foo **bar** baz*", () => {
+    const d = ds("*foo **bar** baz*");
+    expect(marks(d, "em")).toEqual([{ kind: "mark", from: 1, to: 16, style: "em" }]);
+    expect(marks(d, "strong")).toEqual([{ kind: "mark", from: 7, to: 10, style: "strong" }]);
+  });
+
+  it("S13b: multi-backtick delimiters pair EQUAL-length runs — say ``x`` ok is ONE span", () => {
+    const d = ds("say ``x`` ok");
+    expect(marks(d, "code")).toEqual([{ kind: "mark", from: 6, to: 7, style: "code" }]);
+    expect(conceals(d)).toEqual([
+      { kind: "conceal", from: 4, to: 6 },
+      { kind: "conceal", from: 7, to: 9 },
+    ]);
+  });
+
+  it("S13b: a shorter run inside stays content: ``code with ` backtick``", () => {
+    const d = ds("``code with ` backtick``");
+    expect(marks(d, "code")).toEqual([{ kind: "mark", from: 2, to: 22, style: "code" }]);
+    expect(conceals(d)).toEqual([
+      { kind: "conceal", from: 0, to: 2 },
+      { kind: "conceal", from: 22, to: 24 },
+    ]);
+  });
+
+  it("S13b: an unmatched backtick run is literal text", () => {
+    const d = ds("text `unterminated code");
+    expect(marks(d)).toEqual([]);
+    expect(conceals(d)).toEqual([]);
+  });
+
+  it("S13c: code spans scan first — emphasis delimiters inside are inert: *a `b*` c*", () => {
+    const d = ds("*a `b*` c*");
+    expect(marks(d, "code")).toEqual([{ kind: "mark", from: 4, to: 6, style: "code" }]);
+    expect(marks(d, "em")).toEqual([{ kind: "mark", from: 1, to: 9, style: "em" }]);
+    expect(conceals(d)).toEqual([
+      { kind: "conceal", from: 0, to: 1 },
+      { kind: "conceal", from: 3, to: 4 },
+      { kind: "conceal", from: 6, to: 7 },
+      { kind: "conceal", from: 9, to: 10 },
+    ]);
+  });
+});
+
+describe("MockCore list marker span (S13d, v0.4): glyphs plus ALL following spaces/tabs", () => {
+  const widgets = (doc: string) => {
+    const { core } = makeCore(doc);
+    return core
+      .decorations(core.revision(), 0, doc.length, [])
+      .filter((x) => x.kind === "widget");
+  };
+
+  it("single space: `- item` → bullet widget [0, 2)", () => {
+    expect(widgets("- item")).toEqual([{ kind: "widget", from: 0, to: 2, widget: "bullet" }]);
+  });
+
+  it("`-   spaced item`: ALL post-marker spaces are marker territory → [0, 4)", () => {
+    expect(widgets("-   spaced item")).toEqual([
+      { kind: "widget", from: 0, to: 4, widget: "bullet" },
+    ]);
+  });
+
+  it("five spaces → [0, 6); six spaces cap at 5 whitespace chars → still [0, 6)", () => {
+    expect(widgets("-     five spaces")).toEqual([
+      { kind: "widget", from: 0, to: 6, widget: "bullet" },
+    ]);
+    expect(widgets("-      six spaces")).toEqual([
+      { kind: "widget", from: 0, to: 6, widget: "bullet" },
+    ]);
+  });
+
+  it("tabs count as marker whitespace: `- \\t tab item` → [0, 4)", () => {
+    expect(widgets("- \t tab item")).toEqual([
+      { kind: "widget", from: 0, to: 4, widget: "bullet" },
+    ]);
+  });
+
+  it("`1.   spaced ordered`: the ordered widget covers `1.   ` → [0, 5)", () => {
+    expect(widgets("1.   spaced ordered")).toEqual([
+      { kind: "widget", from: 0, to: 5, widget: "ordered", number: 1, delim: "." },
+    ]);
+  });
+
+  it("spaced task `- [ ]   x`: marker conceal ends at `[`; post-checkbox spaces are content", () => {
+    const doc = "- [ ]   spaced task";
+    const { core } = makeCore(doc);
+    const d = core.decorations(core.revision(), 0, doc.length, []);
+    expect(d.filter((x) => x.kind === "widget")).toEqual([
+      { kind: "widget", from: 2, to: 5, widget: "task", checked: false },
+    ]);
+    expect(conceals(d)).toEqual([{ kind: "conceal", from: 0, to: 2 }]);
+  });
+
+  it("an EMPTY item keeps glyphs + ONE trailing space: `-   ` → [0, 2)", () => {
+    expect(widgets("-   ")).toEqual([{ kind: "widget", from: 0, to: 2, widget: "bullet" }]);
+  });
+
+  it("Enter treats the whole whitespace run as marker prefix (contentStart rule)", () => {
+    const { core } = makeCore("-   spaced\n");
+    expect(core.command("enter", 3, 3)).toBeNull(); // inside the marker's ws run
+    core.command("enter", 10, 10); // at the item's end: continues the list
+    expect(core.getText()).toBe("-   spaced\n- \n");
+  });
+});
+
+describe("MockCore toggle whitespace trimming (S1)", () => {
+  it("a whitespace-edged selection trims before wrapping, double-toggle is byte-identical", () => {
+    const { core } = makeCore("a b");
+    const c1 = core.command("toggleStrong", 0, 2);
+    expect(core.getText()).toBe("**a** b");
+    expect(c1!.splices).toEqual([
+      { at: 0, delete: 0, insert: "**" },
+      { at: 1, delete: 0, insert: "**" },
+    ]);
+    expect(c1!.selection).toEqual({ anchor: 2, head: 3 });
+    const c2 = core.command("toggleStrong", c1!.selection!.anchor, c1!.selection!.head);
+    expect(c2).not.toBeNull();
+    expect(core.getText()).toBe("a b");
+    expect(c2!.selection).toEqual({ anchor: 0, head: 1 });
+  });
+
+  it("a selection over a trailing newline trims onto the line: 'ab\\ncd' 0..3", () => {
+    const { core } = makeCore("ab\ncd");
+    core.command("toggleStrong", 0, 3);
+    expect(core.getText()).toBe("**ab**\ncd");
+  });
+
+  it("a whitespace-only selection does not apply: null, no undo unit, no revision bump", () => {
+    const { core } = makeCore("a   b");
+    const rev = core.revision();
+    expect(core.command("toggleStrong", 1, 4)).toBeNull();
+    expect(core.command("toggleEm", 2, 3)).toBeNull();
+    expect(core.command("toggleStrike", 1, 4)).toBeNull();
+    expect(core.getText()).toBe("a   b");
+    expect(core.revision()).toBe(rev);
+    expect(core.undo()).toBeNull();
+  });
+
+  it("OFF detection operates on the trimmed range", () => {
+    const { core } = makeCore("x **a** y");
+    core.command("toggleStrong", 1, 8); // " **a** " — trims to the whole node
+    expect(core.getText()).toBe("x a y");
+  });
+
+  it("exotic contract whitespace (NBSP, ideographic space) trims too", () => {
+    const { core } = makeCore(" a　");
+    core.command("toggleEm", 0, 3);
+    expect(core.getText()).toBe(" *a*　");
+  });
+
+  it("toggleCode does NOT trim (padding behavior unchanged)", () => {
+    const { core } = makeCore("a b");
+    core.command("toggleCode", 0, 2);
+    expect(core.getText()).toBe("`a `b");
+  });
+
+  it("cursor-only toggles are unchanged (no trimming path)", () => {
+    const { core } = makeCore("ab");
+    const c = core.command("toggleStrong", 1, 1);
+    expect(core.getText()).toBe("a****b");
+    expect(c!.selection).toEqual({ anchor: 3, head: 3 });
+  });
+});
+
+describe("MockCore CRLF split guard (S2)", () => {
+  it("a command position between \\r and \\n throws the pinned InvalidArgument, mutating nothing", () => {
+    const { core } = makeCore("one\r\ntwo");
+    const rev = core.revision();
+    const msg = "InvalidArgument: position 4 splits a CRLF sequence";
+    for (const run of [
+      () => core.command("toggleStrong", 4, 8),
+      () => core.command("toggleStrong", 0, 4),
+      () => core.command("toggleEm", 4, 4),
+      () => core.command("toggleCode", 4, 6),
+      () => core.command("toggleStrike", 4, 6),
+      () => core.command("setHeading", 4, 2),
+      () => core.command("toggleTask", 4),
+      () => core.command("indentList", 4, 4),
+      () => core.command("outdentList", 4, 4),
+      () => core.command("enter", 4, 4),
+    ]) {
+      expect(run).toThrow(msg);
+    }
+    expect(core.getText()).toBe("one\r\ntwo");
+    expect(core.revision()).toBe(rev);
+    expect(core.undo()).toBeNull();
+  });
+
+  it("positions on either side of a CRLF pair still work", () => {
+    const { core } = makeCore("one\r\ntwo");
+    core.command("setHeading", 5, 1);
+    expect(core.getText()).toBe("one\r\n# two");
+  });
+});
+
+describe("MockCore setHeading block gate and level-0 removal (S3)", () => {
+  it("S3a: refuses a list item inside a blockquote: '> - item'", () => {
+    const { core } = makeCore("> - item");
+    const rev = core.revision();
+    expect(core.command("setHeading", 5, 2)).toBeNull();
+    expect(core.getText()).toBe("> - item");
+    expect(core.revision()).toBe(rev);
+  });
+
+  it("S3a: refuses list items / hr / fences / blank lines at top level the same way", () => {
+    for (const doc of ["- item", "1. item", "---", "```js", "   "]) {
+      const { core } = makeCore(doc);
+      expect(core.command("setHeading", 1, 2), doc).toBeNull();
+      expect(core.getText()).toBe(doc);
+    }
+  });
+
+  it("S3a: blockquote CONTENT promotes after the quote markers", () => {
+    const { core } = makeCore("> text");
+    core.command("setHeading", 4, 1);
+    expect(core.getText()).toBe("> # text");
+  });
+
+  it("S3b: level 0 deletes the closing hash run too: '# foo #' → 'foo'", () => {
+    const { core } = makeCore("# foo #");
+    const change = core.command("setHeading", 3, 0);
+    expect(core.getText()).toBe("foo");
+    expect(change!.splices).toEqual([
+      { at: 0, delete: 2, insert: "" },
+      { at: 5, delete: 2, insert: "" },
+    ]);
+    expect(change!.selection).toEqual({ anchor: 1, head: 1 });
+  });
+
+  it("S3b: '## x ##' → 'x'", () => {
+    const { core } = makeCore("## x ##");
+    core.command("setHeading", 4, 0);
+    expect(core.getText()).toBe("x");
+  });
+
+  it("S3b: releveling is unchanged — only the opening delimiter is rewritten", () => {
+    const { core } = makeCore("# foo #");
+    core.command("setHeading", 3, 3);
+    expect(core.getText()).toBe("### foo #");
+  });
+});
+
+describe("MockCore undo depth cap (S4)", () => {
+  it("caps at 100 units, dropping the OLDEST: 101 units → 100 undos, first unit gone", () => {
+    const { core } = makeCore("");
+    core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "A" }], "paste");
+    for (let k = 0; k < 100; k++) {
+      core.applyEdit(core.revision(), [{ at: core.docLength(), delete: 0, insert: "x" }], "paste");
+    }
+    let undos = 0;
+    while (core.undo() !== null) undos++;
+    expect(undos).toBe(100);
+    expect(core.getText()).toBe("A"); // the oldest unit fell off the stack
+  });
+
+  it("exactly 100 units still undo all the way back", () => {
+    const { core } = makeCore("");
+    for (let k = 0; k < 100; k++) {
+      core.applyEdit(core.revision(), [{ at: core.docLength(), delete: 0, insert: "x" }], "paste");
+    }
+    let undos = 0;
+    while (core.undo() !== null) undos++;
+    expect(undos).toBe(100);
+    expect(core.getText()).toBe("");
+  });
+});
+
+describe("MockCore heading trailing whitespace + closing run (S5)", () => {
+  it("'# foo   ': trailing spaces are not heading content", () => {
+    const doc = "# foo   ";
+    const { core } = makeCore(doc);
+    const d = core.decorations(core.revision(), 0, doc.length, []);
+    expect(lines(d)).toEqual([{ kind: "line", at: 0, style: "h1" }]);
+    expect(conceals(d)).toEqual([{ kind: "conceal", from: 0, to: 2 }]);
+    expect(marks(d)).toEqual([]);
+  });
+
+  it("inline content still parses inside the trimmed span: '# foo **b**   '", () => {
+    const doc = "# foo **b**   ";
+    const { core } = makeCore(doc);
+    const d = core.decorations(core.revision(), 0, doc.length, []);
+    expect(marks(d, "strong")).toEqual([{ kind: "mark", from: 8, to: 9, style: "strong" }]);
+  });
+
+  it("an ATX closing hash run conceals as a second delimiter span", () => {
+    const doc = "# foo #\ntail";
+    const { core } = makeCore(doc);
+    const d = core.decorations(core.revision(), 0, doc.length, cursor(10));
+    expect(conceals(d)).toEqual([
+      { kind: "conceal", from: 0, to: 2 },
+      { kind: "conceal", from: 5, to: 7 },
+    ]);
+  });
+});

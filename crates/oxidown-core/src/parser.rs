@@ -138,6 +138,14 @@ impl Node {
     /// edit, so the result never underflows.
     pub fn offset_signed(&mut self, by: isize) {
         let shift = |r: &mut Range<usize>| {
+            debug_assert!(
+                r.start as isize + by >= 0,
+                "offset_signed underflows start of {r:?} by {by}"
+            );
+            debug_assert!(
+                r.end as isize + by >= 0,
+                "offset_signed underflows end of {r:?} by {by}"
+            );
             r.start = (r.start as isize + by) as usize;
             r.end = (r.end as isize + by) as usize;
         };
@@ -684,6 +692,17 @@ fn heading_node(bytes: &[u8], range: Range<usize>, level: HeadingLevel) -> Optio
         }
         close_start = p;
     }
+    // Heading CONTENT excludes trailing spaces/tabs (CommonMark: the
+    // heading's inlines are the line minus the leading/closing sequences
+    // and surrounding whitespace) — `"# foo   "`'s content is `foo`; the
+    // trailing run belongs to neither content nor delimiter, so it carries
+    // no heading mark at all. The closing-run branch above already left
+    // `close_start` past its own preceding spaces, so this loop only moves
+    // for the no-closing-run shape.
+    let mut content_end = close_start;
+    while content_end > delim_end && matches!(bytes[content_end - 1], b' ' | b'\t') {
+        content_end -= 1;
+    }
     let mut delims = vec![Range {
         start,
         end: delim_end,
@@ -694,7 +713,7 @@ fn heading_node(bytes: &[u8], range: Range<usize>, level: HeadingLevel) -> Optio
     Some(leaf(
         NodeKind::Heading(heading_level_u8(level)),
         start..extent_end,
-        delim_end..close_start,
+        delim_end..content_end,
         delims,
     ))
 }
@@ -2150,5 +2169,95 @@ mod tests {
         assert!(nodes.is_empty());
         let nodes = parse("text[^1]\n\n[^1]: note\n");
         assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn heading_content_excludes_trailing_spaces_and_tabs() {
+        // Contract v0.3 consolidation: the content span ends at the last
+        // non-space/tab byte (CommonMark strips the surrounding whitespace
+        // from a heading's inlines); the trailing run belongs to neither
+        // content nor delimiter.
+        let n = one("# foo   \n");
+        assert_eq!(n.kind, NodeKind::Heading(1));
+        assert_eq!(n.content, 2..5, "just \"foo\"");
+        assert_eq!(n.delims, vec![0..2], "trailing spaces join no delimiter");
+        assert_eq!(n.extent, 0..8, "extent still covers the whole line");
+
+        let n = one("## bar\t\n");
+        assert_eq!(n.content, 3..6, "trailing tab excluded too");
+
+        // The closing-run shape is unchanged: `close_start` already sits
+        // past the spaces preceding the run.
+        let n = one("# Title ##\n");
+        assert_eq!(n.content, 2..7);
+        assert_eq!(n.delims, vec![0..2, 7..10]);
+    }
+
+    #[test]
+    fn inline_delim_node_defensively_drops_on_source_mismatch() {
+        // Reachable only if an event span disagrees with the source bytes
+        // (never observed from pulldown itself): the contract is drop the
+        // node, never emit wrong spans.
+        assert!(
+            inline_delim_node(b"abcdef", 0..6, NodeKind::Strong, b'*', 2).is_none(),
+            "no delimiter bytes at either edge"
+        );
+        assert!(
+            inline_delim_node(b"**a~~", 0..5, NodeKind::Strong, b'*', 2).is_none(),
+            "closing run is the wrong character"
+        );
+        assert!(
+            inline_delim_node(b"~~a**", 0..5, NodeKind::Strike, b'~', 2).is_none(),
+            "closing run mismatches for the tilde family too"
+        );
+        assert!(
+            inline_delim_node(b"**a**", 0..3, NodeKind::Strong, b'*', 2).is_none(),
+            "span too short to hold two delimiter runs"
+        );
+        assert!(
+            inline_delim_node(b"**a**", 0..9, NodeKind::Strong, b'*', 2).is_none(),
+            "span runs past the source's end"
+        );
+        // Control: `_` is a legal flavor of the `*` family; `~` is not.
+        assert!(inline_delim_node(b"__a__", 0..5, NodeKind::Strong, b'*', 2).is_some());
+        assert!(inline_delim_node(b"~~a~~", 0..5, NodeKind::Strong, b'*', 2).is_none());
+    }
+
+    #[test]
+    fn code_node_defensively_drops_on_source_mismatch() {
+        assert!(code_node(b"abc", 0..3).is_none(), "no backtick run at the span start");
+        assert!(code_node(b"`a", 0..2).is_none(), "no closing run at all");
+        assert!(code_node(b"``a`", 0..4).is_none(), "closing run shorter than opening");
+        assert!(code_node(b"`a`", 0..0).is_none(), "empty span");
+        assert!(code_node(b"`a`", 0..7).is_none(), "span runs past the source's end");
+        // Control: a well-formed span still yields the node.
+        assert!(code_node(b"``a``", 0..5).is_some());
+    }
+
+    #[test]
+    fn deeper_than_255_multiline_list_keeps_marker_extents_sane() {
+        // 300 properly indented nesting levels, one item per line: depths
+        // saturate at the u8 cap (never wrap) and every marker's extent
+        // still covers exactly its own "- " glyphs.
+        let levels = 300usize;
+        let mut doc = String::new();
+        for i in 0..levels {
+            doc.push_str(&"  ".repeat(i));
+            doc.push_str("- x\n");
+        }
+        let nodes = parse(&doc);
+        let markers: Vec<_> = nodes
+            .iter()
+            .filter_map(|n| match n.kind {
+                NodeKind::ListMarker { depth, .. } => Some((depth, n.extent.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers.len(), levels, "every level keeps its own marker");
+        for (i, (depth, extent)) in markers.iter().enumerate() {
+            assert_eq!(*depth, (i + 1).min(255) as u8, "level {i} depth clamps at 255");
+            assert!(extent.end <= doc.len(), "level {i} extent in bounds");
+            assert_eq!(&doc[extent.clone()], "- ", "level {i} extent covers its glyphs");
+        }
     }
 }

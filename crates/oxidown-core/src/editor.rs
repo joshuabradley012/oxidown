@@ -276,6 +276,7 @@ impl Editor {
         }
         Ok(decorations::compute(
             &self.overlay,
+            self.block_index.blocks(),
             &self.text,
             from_b..to_b,
             &sels_b,
@@ -336,10 +337,48 @@ impl Editor {
 
     // ---- commands (boundary v0.2) ---------------------------------------
 
+    /// Strict UTF-16 → byte conversion for a command position, plus the
+    /// CRLF split guard (contract v0.3 consolidation): a position between
+    /// the `\r` and `\n` of a CRLF pair is a valid UTF-16 (and char)
+    /// boundary, yet a splice landing there would break the one logical
+    /// terminator in two — and the planners' line arithmetic with it.
+    /// Refused as `InvalidArgument` with the exact message the cross-core
+    /// conformance suite pins, reporting `pos` exactly as passed. Positions
+    /// are checked in argument order (`from` before `to`).
+    fn command_pos(&self, pos: usize) -> Result<usize, CoreError> {
+        let byte = self.text.utf16_to_byte(pos)?;
+        self.check_crlf_split(pos, byte)?;
+        Ok(byte)
+    }
+
+    /// Floor-snapping variant of [`Self::command_pos`] for the query-like
+    /// command positions (`setHeading`/`toggleTask`). Same CRLF guard: a
+    /// position between `\r` and `\n` IS a char boundary, so the floor
+    /// conversion returns it unmoved and the guard sees it exactly.
+    fn command_pos_floor(&self, pos: usize) -> Result<usize, CoreError> {
+        let byte = self.text.utf16_to_byte_floor(pos)?;
+        self.check_crlf_split(pos, byte)?;
+        Ok(byte)
+    }
+
+    fn check_crlf_split(&self, pos: usize, byte: usize) -> Result<(), CoreError> {
+        if byte > 0
+            && self.text.byte_at(byte) == Some(b'\n')
+            && self.text.byte_at(byte - 1) == Some(b'\r')
+        {
+            return Err(CoreError::InvalidArgument {
+                detail: format!("position {pos} splits a CRLF sequence"),
+            });
+        }
+        Ok(())
+    }
+
     /// Run a command against the overlay. Returns `Ok(None)` when the
     /// command doesn't apply at the target (per the contract), `Ok(Some)`
     /// with the applied change otherwise. Command edits enter the op log
     /// with origin `command` and form single, never-coalescing undo units.
+    /// Every position argument passes the CRLF split guard (see
+    /// [`Self::command_pos`]) before any planner runs.
     pub fn command(&mut self, cmd: Command) -> Result<Option<CoreChange>, CoreError> {
         // Chunk-cached byte reader — the planners only ever read a handful
         // of local lines, so the old whole-document `String` materialization
@@ -356,9 +395,11 @@ impl Editor {
                     Command::ToggleStrike { .. } => commands::InlineKind::Strike,
                     _ => commands::InlineKind::Code,
                 };
-                let (lo, hi) = (from.min(to), from.max(to));
-                let from_b = self.text.utf16_to_byte(lo)?;
-                let to_b = self.text.utf16_to_byte(hi)?;
+                // Convert (and CRLF-check) in argument order, then
+                // normalize: byte order matches UTF-16 order (monotonic).
+                let a = self.command_pos(from)?;
+                let b = self.command_pos(to)?;
+                let (from_b, to_b) = (a.min(b), a.max(b));
                 commands::toggle_inline(&self.overlay, &src, kind, from_b, to_b)?
             }
             Command::SetHeading { pos, level } => {
@@ -367,7 +408,7 @@ impl Editor {
                         detail: format!("setHeading level {level} is out of range 0..=6"),
                     });
                 }
-                let pos_b = self.text.utf16_to_byte_floor(pos)?;
+                let pos_b = self.command_pos_floor(pos)?;
                 let line = self.text.line_range_at(pos_b);
                 let block_kind = self
                     .block_index
@@ -378,13 +419,13 @@ impl Editor {
                 commands::set_heading(&self.overlay, &src, block_kind, line, pos_b, level)
             }
             Command::ToggleTask { pos } => {
-                let pos_b = self.text.utf16_to_byte_floor(pos)?;
+                let pos_b = self.command_pos_floor(pos)?;
                 commands::toggle_task(&self.overlay, self.text.len_bytes(), pos_b)
             }
             Command::IndentList { from, to } | Command::OutdentList { from, to } => {
-                let (lo, hi) = (from.min(to), from.max(to));
-                let from_b = self.text.utf16_to_byte(lo)?;
-                let to_b = self.text.utf16_to_byte(hi)?;
+                let a = self.command_pos(from)?;
+                let b = self.command_pos(to)?;
+                let (from_b, to_b) = (a.min(b), a.max(b));
                 if matches!(cmd, Command::IndentList { .. }) {
                     commands::indent_list(&self.overlay, &src, from_b, to_b)
                 } else {
@@ -392,9 +433,9 @@ impl Editor {
                 }
             }
             Command::Enter { from, to } => {
-                let (lo, hi) = (from.min(to), from.max(to));
-                let from_b = self.text.utf16_to_byte(lo)?;
-                let to_b = self.text.utf16_to_byte(hi)?;
+                let a = self.command_pos(from)?;
+                let b = self.command_pos(to)?;
+                let (from_b, to_b) = (a.min(b), a.max(b));
                 commands::enter(&self.overlay, &src, from_b, to_b)
             }
         };

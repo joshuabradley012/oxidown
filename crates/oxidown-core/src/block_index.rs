@@ -134,11 +134,10 @@ impl BlockIndex {
         tail_spans: Vec<(BlockKind, Range<usize>)>,
         batch: &[ByteSplice],
     ) {
-        let split = self
-            .blocks
-            .iter()
-            .position(|b| b.span.end > region_start)
-            .unwrap_or(self.blocks.len());
+        // Spans are document-ordered and non-overlapping, so `span.end` is
+        // strictly increasing — the first block reaching past `region_start`
+        // is a partition_point (O(log blocks); this runs per stream append).
+        let split = self.blocks.partition_point(|b| b.span.end <= region_start);
         let mapped_old: Vec<(Range<usize>, BlockId)> = self.blocks[split..]
             .iter()
             .map(|b| (mapping::map_range_shrink(&b.span, batch), b.id))
@@ -392,6 +391,34 @@ mod tests {
             after[0].1 == before[0].1 || after[0].1 == before[1].1,
             "the merged block keeps one of the two original ids"
         );
+    }
+
+    #[test]
+    fn merge_gives_the_larger_overlap_donor_the_id_and_ties_go_to_the_earlier_block() {
+        // MERGE direction (two old blocks -> one new block) of the
+        // split/merge tie/size rule, pinned specifically: the donor with
+        // the larger mapped overlap wins REGARDLESS of document order.
+        // Here the SECOND paragraph is larger ("aa\n" maps to 3 bytes,
+        // "bbbb bbbb\n" to 10), so a document-order greedy would be wrong.
+        let mut idx = BlockIndex::new(1);
+        reparse(&mut idx, "aa\n\nbbbb bbbb\n", &[]);
+        let (first, second) = (idx.blocks()[0].id, idx.blocks()[1].id);
+        let batch = [sp(3, 1, "")]; // delete the separating blank line
+        reparse(&mut idx, "aa\nbbbb bbbb\n", &batch);
+        assert_eq!(idx.blocks().len(), 1);
+        assert_eq!(idx.blocks()[0].id, second, "larger donor wins the merge");
+        assert_ne!(idx.blocks()[0].id, first, "the smaller donor retires");
+
+        // Tie: equal mapped overlaps (3 bytes each) — the EARLIER old block
+        // donates, per the documented tie rule.
+        let mut idx = BlockIndex::new(1);
+        reparse(&mut idx, "aa\n\nbb\n", &[]);
+        let (first, second) = (idx.blocks()[0].id, idx.blocks()[1].id);
+        let batch = [sp(3, 1, "")];
+        reparse(&mut idx, "aa\nbb\n", &batch);
+        assert_eq!(idx.blocks().len(), 1);
+        assert_eq!(idx.blocks()[0].id, first, "tie goes to the earlier block");
+        assert_ne!(idx.blocks()[0].id, second);
     }
 
     #[test]

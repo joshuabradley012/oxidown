@@ -8,7 +8,19 @@
  * (incl. autolinks), blockquotes (depth tracked, "depth 1" is the well-tested
  * case), fenced code blocks, list markers + task-list checkboxes, and
  * thematic breaks. Full GFM breadth lives in the Rust core; this mock only
- * needs to be obviously correct on simple, single-level cases.
+ * needs to be obviously correct on simple, single-level cases — but within
+ * that scope it follows CommonMark/pulldown-cmark semantics faithfully:
+ * left/right-FLANKING rules gate every emphasis/strong/strike delimiter (an
+ * intraword `_` never emphasizes; `a ** b ** c` has no strong), code spans
+ * pair equal-length backtick runs and are scanned FIRST (delimiters inside
+ * them are inert), a NON-EMPTY list item's marker consumes its glyphs plus
+ * ALL immediately following spaces/tabs — pulldown's first-content lookahead,
+ * approximated with a 5-char whitespace cap (the indented-code boundary;
+ * matches the wasm probes at up to 6 spaces) — an EMPTY item's marker keeps
+ * glyphs + a single trailing space, and ATX heading content excludes
+ * trailing spaces/tabs. Known simplifications remain around delimiter-stack
+ * corner cases (e.g. partial-run consumption like `**a*`), single-tilde
+ * strikethrough, and indented-code interactions past the 5-space cap.
  *
  * It is NOT fast (it reparses the whole document per decorations() call and
  * stores whole-text snapshots per undo unit) and it does NOT handle general
@@ -28,6 +40,38 @@ import type {
 import { endOfLastSplice } from "./splices.js";
 
 const COALESCE_MS = 500;
+
+/**
+ * S4: undo depth cap — at most this many undo units; pushing past it drops
+ * the OLDEST unit. Identical constant in the Rust core (history depth cap).
+ * The redo stack needs no cap of its own: it is bounded by undo.
+ */
+const MAX_UNDO_DEPTH = 100;
+
+/**
+ * Contract-pinned whitespace set (S1 toggle trimming + S13a flanking) —
+ * deliberately NOT JS `\s` or Rust `char::is_whitespace()`, which disagree
+ * with this set at U+0085/U+FEFF. Exact members, both cores: U+0009, U+000A,
+ * U+000C, U+000D, U+0020, U+00A0, U+1680, U+2000–U+200A, U+2028, U+2029,
+ * U+202F, U+205F, U+3000.
+ */
+function isContractWs(code: number): boolean {
+  return (
+    code === 0x09 ||
+    code === 0x0a ||
+    code === 0x0c ||
+    code === 0x0d ||
+    code === 0x20 ||
+    code === 0xa0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000
+  );
+}
 
 export interface MockCoreOptions {
   /** Injectable clock for deterministic coalescing tests. Defaults to Date.now. */
@@ -306,54 +350,203 @@ function runLength(src: string, i: number, ch: string): number {
   return n;
 }
 
-/** Find the next run of `ch` with length >= minLen, starting at or after `from`. */
-function findRun(src: string, from: number, ch: string, minLen: number): [number, number] | null {
-  let j = from;
-  while (j < src.length) {
-    if (src[j] === ch) {
-      const r = runLength(src, j, ch);
-      if (r >= minLen) return [j, r];
-      j += r;
-    } else {
-      j++;
-    }
-  }
-  return null;
-}
-
 const AUTOLINK_RE = /^<((?:https?|ftp):\/\/[^\s<>]+)>/;
 
-/** Parse inline constructs of `src` (positions offset by `base`) into `nodes`. */
+/**
+ * CommonMark's "Unicode punctuation character" (spec 2.1, as pulldown-cmark
+ * implements it): the Unicode P (punctuation) and S (symbol) general
+ * categories. ASCII punctuation is a subset of these.
+ */
+const PUNCT_RE = /[\p{P}\p{S}]/u;
+
+type CharClass = "ws" | "punct" | "other";
+
+/**
+ * Parse inline constructs of `src` (positions offset by `base`) into `nodes`.
+ *
+ * Fidelity notes (S13, pinned against pulldown-cmark):
+ *  - Code spans are scanned FIRST over the whole field (CommonMark
+ *    precedence): a backtick run pairs with the next run of EXACTLY equal
+ *    length; emphasis/strike delimiters inside a code span are inert.
+ *  - Emphasis/strong/strike delimiter runs are gated by CommonMark's
+ *    left/right-flanking rules (using the contract WS set + the P/S
+ *    punctuation classes), including `_`'s stricter intraword rules — so
+ *    `a_snake_case_word` and `a ** b ** c` produce nothing.
+ *  - Field edges (start/end of the parsed slice) classify as whitespace.
+ */
 function parseInline(src: string, base: number, nodes: ParsedNode[]): void {
-  let i = 0;
   const n = src.length;
+
+  // ---- pass 1: code spans (S13b/S13c) -------------------------------------
+  // CommonMark: an opener backtick run pairs with the NEXT run of exactly the
+  // same length; runs of other lengths in between are literal content. An
+  // unmatched opener run is literal text, and scanning resumes after it.
+  interface CodeSpan {
+    open: number;
+    len: number;
+    close: number;
+  }
+  const codeSpans = new Map<number, CodeSpan>(); // keyed by `open`
+  const inCode = new Uint8Array(n); // 1 for every position covered by a span
+  {
+    let j = 0;
+    while (j < n) {
+      if (src[j] !== "`") {
+        j++;
+        continue;
+      }
+      const len = runLength(src, j, "`");
+      let k = j + len;
+      let close = -1;
+      while (k < n) {
+        if (src[k] === "`") {
+          const r = runLength(src, k, "`");
+          if (r === len) {
+            close = k;
+            break;
+          }
+          k += r;
+        } else {
+          k++;
+        }
+      }
+      if (close !== -1) {
+        codeSpans.set(j, { open: j, len, close });
+        inCode.fill(1, j, close + len);
+        j = close + len;
+      } else {
+        j += len; // literal backticks; later runs may still open
+      }
+    }
+  }
+
+  // ---- flanking classification (S13a) --------------------------------------
+  const classOf = (s: string): CharClass =>
+    isContractWs(s.codePointAt(0) ?? 0x20) ? "ws" : PUNCT_RE.test(s) ? "punct" : "other";
+  /** Class of the character STARTING at `idx` (field edge = whitespace). */
+  const classAt = (idx: number): CharClass => {
+    if (idx < 0 || idx >= n) return "ws";
+    const c = src.charCodeAt(idx);
+    const s = c >= 0xd800 && c <= 0xdbff && idx + 1 < n ? src.slice(idx, idx + 2) : src[idx];
+    return classOf(s);
+  };
+  /** Class of the character ENDING at `idx` (field edge = whitespace). */
+  const classBefore = (idx: number): CharClass => {
+    if (idx <= 0) return "ws";
+    const c = src.charCodeAt(idx - 1);
+    const s = c >= 0xdc00 && c <= 0xdfff && idx >= 2 ? src.slice(idx - 2, idx) : src[idx - 1];
+    return classOf(s);
+  };
+  /** CommonMark left/right-flanking for the delimiter run [start, start+len). */
+  const flanks = (
+    start: number,
+    len: number,
+  ): { before: CharClass; after: CharClass; left: boolean; right: boolean } => {
+    const before = classBefore(start);
+    const after = classAt(start + len);
+    const left = after !== "ws" && (after !== "punct" || before === "ws" || before === "punct");
+    const right = before !== "ws" && (before !== "punct" || after === "ws" || after === "punct");
+    return { before, after, left, right };
+  };
+  /** Can the run open emphasis/strong/strike? (`_` adds the intraword rule.) */
+  const canOpen = (start: number, len: number, ch: string): boolean => {
+    const f = flanks(start, len);
+    if (ch === "_") return f.left && (!f.right || f.before === "punct");
+    return f.left;
+  };
+  /** Can the run close emphasis/strong/strike? (`_` adds the intraword rule.) */
+  const canClose = (start: number, len: number, ch: string): boolean => {
+    const f = flanks(start, len);
+    if (ch === "_") return f.right && (!f.left || f.after === "punct");
+    return f.right;
+  };
+
+  /**
+   * Next run of `ch` (length >= minLen) at/after `from` that CAN CLOSE.
+   * Runs inside code spans are inert (S13c) — a delimiter-char run can never
+   * straddle a code-span boundary (those are backticks), so testing the
+   * run's first position suffices.
+   */
+  const findCloserRun = (from: number, ch: string, minLen: number): [number, number] | null => {
+    let j = from;
+    while (j < n) {
+      if (src[j] === ch && !inCode[j]) {
+        const r = runLength(src, j, ch);
+        if (r >= minLen && canClose(j, r, ch)) return [j, r];
+        j += r;
+      } else {
+        j++;
+      }
+    }
+    return null;
+  };
+
+  /**
+   * Closer for a SINGLE-char emphasis: like `findCloserRun(…, 1)`, but a run
+   * that would OPEN a nested strong (length >= 2, can-open, with its own
+   * strong closer ahead) is skipped past that closer first — so
+   * `*foo **bar** baz*` keeps the em spanning the whole phrase with the
+   * strong nested inside (CommonMark example semantics), instead of the em
+   * closing on the strong opener's trailing char.
+   */
+  const findEmCloser = (from: number, ch: string): [number, number] | null => {
+    let j = from;
+    while (j < n) {
+      if (src[j] === ch && !inCode[j]) {
+        const r = runLength(src, j, ch);
+        if (r >= 2 && canOpen(j, r, ch)) {
+          const nested = findCloserRun(j + r, ch, 2);
+          if (nested) {
+            j = nested[0] + nested[1];
+            continue;
+          }
+        }
+        if (canClose(j, r, ch)) return [j, r];
+        j += r;
+      } else {
+        j++;
+      }
+    }
+    return null;
+  };
+
+  let i = 0;
   while (i < n) {
     const ch = src[i];
     if (ch === "`") {
-      const close = src.indexOf("`", i + 1);
-      if (close !== -1) {
-        nodes.push({
-          start: base + i,
-          end: base + close + 1,
-          conceals: [
-            [base + i, base + i + 1],
-            [base + close, base + close + 1],
-          ],
-          marks: [{ from: base + i + 1, to: base + close, style: "code" }],
-        });
-        i = close + 1;
+      const span = codeSpans.get(i);
+      if (!span) {
+        i += runLength(src, i, "`"); // unmatched run: literal text
         continue;
       }
-      i++;
+      const contentFrom = span.open + span.len;
+      nodes.push({
+        start: base + span.open,
+        end: base + span.close + span.len,
+        conceals: [
+          [base + span.open, base + contentFrom],
+          [base + span.close, base + span.close + span.len],
+        ],
+        marks:
+          span.close > contentFrom
+            ? [{ from: base + contentFrom, to: base + span.close, style: "code" }]
+            : [],
+      });
+      i = span.close + span.len;
       continue;
     }
     if (ch === "*" || ch === "_") {
       const run = runLength(src, i, ch);
+      if (!canOpen(i, run, ch)) {
+        i += run;
+        continue;
+      }
       if (run >= 2) {
         // Strong: opener = first 2 chars of the run, closer = last 2 chars of
-        // the next run of length >= 2. A run of 3 leaves one delimiter char on
-        // each side inside the content, so `***x***` parses as strong(em(x)).
-        const close = findRun(src, i + run, ch, 2);
+        // the next CAN-CLOSE run of length >= 2. A run of 3 leaves one
+        // delimiter char on each side inside the content, so `***x***`
+        // parses as strong(em(x)).
+        const close = findCloserRun(i + run, ch, 2);
         if (close) {
           const [cs, cl] = close;
           const contentFrom = i + 2;
@@ -374,7 +567,7 @@ function parseInline(src: string, base: number, nodes: ParsedNode[]): void {
       }
       {
         // Emphasis: single-char delimiters.
-        const close = findRun(src, i + run, ch, 1);
+        const close = findEmCloser(i + run, ch);
         if (close) {
           const [cs, cl] = close;
           const closerAt = cs + cl - 1;
@@ -400,8 +593,10 @@ function parseInline(src: string, base: number, nodes: ParsedNode[]): void {
     }
     if (ch === "~") {
       const run = runLength(src, i, "~");
-      if (run >= 2) {
-        const close = findRun(src, i + run, "~", 2);
+      // GFM/pulldown: strikethrough delimiters are `~~` (this mock does not
+      // model single-tilde strike); 3+ tildes never parse as strikethrough.
+      if (run === 2 && canOpen(i, run, "~")) {
+        const close = findCloserRun(i + run, "~", 2);
         if (close) {
           const [cs, cl] = close;
           const contentFrom = i + 2;
@@ -475,14 +670,46 @@ const HR_RE = /^ {0,3}([-*_])(?: *\1){2,}[ \t]*$/;
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const CLOSE_FENCE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/;
 const BQ_MARKER_RE = /^ {0,3}>[ \t]?/;
-const LIST_MARKER_RE = /^(\s{0,3})([-*+]|\d{1,9}[.)])(?:[ \t]+)/;
+// S13d (contract v0.4 note on v0.2 clarification 3): a NON-EMPTY item's
+// marker token runs from its glyphs through ALL immediately following
+// spaces/tabs on the line — pulldown's first-content lookahead, so `-   x`'s
+// marker is the whole `-   ` — capped at 5 whitespace chars (past that,
+// upstream treats the remainder as indented-code CONTENT of the item; the
+// cap reproduces the wasm probe at 6 spaces: marker `[0, 6)`). An EMPTY item
+// keeps glyphs + a single trailing space (parser.rs `empty_item_marker_end`
+// — the one place its single-space comment really applies).
+const LIST_MARKER_RE = /^(\s{0,3})([-*+]|\d{1,9}[.)])[ \t]{1,5}/;
 const TASK_RE = /^\[([ xX])\] /;
+
+/**
+ * Start of the optional ATX CLOSING hash run of a heading line — spaces/tabs,
+ * a run of `#`, then only spaces/tabs to the line's end, preceded by a
+ * space/tab (or abutting the opening delimiter). Returns `line.length` when
+ * there is none. A direct transcription of parser.rs `heading_node`'s
+ * close-run scan; `delimEnd` is the end of the opening `#…# ` delimiter.
+ */
+function atxClosingRun(line: string, delimEnd: number): number {
+  let p = line.length;
+  while (p > delimEnd && (line[p - 1] === " " || line[p - 1] === "\t")) p--;
+  const runEnd = p;
+  while (p > delimEnd && line[p - 1] === "#") p--;
+  if (p < runEnd && (p === delimEnd || line[p - 1] === " " || line[p - 1] === "\t")) {
+    while (p > delimEnd && (line[p - 1] === " " || line[p - 1] === "\t")) p--;
+    return p;
+  }
+  return line.length;
+}
 
 interface ListMarkerMatch {
   markerFrom: number;
   /** End of the marker GLYPHS (`-`, `1.`) — reveal adjacency stops here. */
   glyphTo: number;
-  /** End of the WHOLE matched marker run, e.g. "- " or "1. " (glyph + required space) — matches the spec's literal examples. */
+  /**
+   * The item's CONTENT START = end of the whole marker token: glyphs + ALL
+   * following spaces/tabs (capped at 5, S13d), e.g. "- ", "-   ", "1. ".
+   * For an EMPTY item (only whitespace follows the glyphs) this is glyphs +
+   * ONE space instead.
+   */
   contentFrom: number;
 }
 
@@ -491,8 +718,13 @@ function matchListMarker(line: string): ListMarkerMatch | null {
   const m = LIST_MARKER_RE.exec(line);
   if (!m) return null;
   const markerFrom = m[1].length;
-  const contentFrom = m[0].length;
   const glyphTo = markerFrom + m[2].length; // end of `-`/`1.` (no trailing ws)
+  let contentFrom = m[0].length;
+  // EMPTY item: nothing but whitespace follows the glyphs — the marker is
+  // glyphs + a single trailing space (parser.rs empty_item_marker_end).
+  if (/^[ \t]*$/.test(line.slice(contentFrom))) {
+    contentFrom = Math.min(glyphTo + 1, line.length);
+  }
   return { markerFrom, contentFrom, glyphTo };
 }
 
@@ -751,14 +983,27 @@ function parseLineContent(
   const headingM = HEADING_RE.exec(content);
   if (headingM) {
     const level = headingM[1].length;
+    const delimEnd = level + 1;
+    // Optional ATX closing hash run: a SECOND delimiter span (parser.rs
+    // heading_node), concealing/revealing with the same line-level semantics
+    // as the opening run.
+    const closeStart = atxClosingRun(content, delimEnd);
+    // S5: heading CONTENT excludes trailing spaces/tabs (U+0020/U+0009 only),
+    // matching CommonMark — `"# foo   "`'s content is exactly `foo`.
+    let contentEnd = closeStart;
+    while (contentEnd > delimEnd && (content[contentEnd - 1] === " " || content[contentEnd - 1] === "\t")) {
+      contentEnd--;
+    }
+    const conceals: Array<[number, number]> = [[base, base + delimEnd]];
+    if (closeStart < content.length) conceals.push([base + closeStart, base + content.length]);
     nodes.push({
       start: base,
       end: base + content.length,
-      conceals: [[base, base + level + 1]],
+      conceals,
       marks: [],
       line: { kind: "line", at: base, style: `h${level}` as DecorationLine["style"] },
     });
-    parseInline(content.slice(level + 1), base + level + 1, nodes);
+    parseInline(content.slice(delimEnd, contentEnd), base + delimEnd, nodes);
     // A heading interrupts any open list run at this quote depth.
     seq.clear();
     return;
@@ -1077,6 +1322,18 @@ export class MockCore implements OxidownCore {
     this.now = opts.now ?? Date.now;
   }
 
+  /**
+   * S4: every undo-stack push goes through here — depth is capped at
+   * MAX_UNDO_DEPTH units, dropping the OLDEST unit when exceeded (identical
+   * constant and behavior in the Rust core). Dropping never disturbs the
+   * open-unit/coalescing state (that tracks the TOP of the stack), and a
+   * dropped stream unit simply means a later append re-creates a fresh one.
+   */
+  private pushUndo(unit: UndoUnit): void {
+    this.undoStack.push(unit);
+    if (this.undoStack.length > MAX_UNDO_DEPTH) this.undoStack.shift();
+  }
+
   load(text: string): number {
     // Document invariant: the mirror never holds an unpaired surrogate (the
     // wasm boundary rejects such payloads before the core sees them).
@@ -1131,7 +1388,7 @@ export class MockCore implements OxidownCore {
         // break a group while an IME session is open.
         (this.composing || t - this.lastEditTime <= COALESCE_MS);
       if (!coalesce) {
-        this.undoStack.push({ before: this.doc, inverse: invertSplices(this.doc, batch) });
+        this.pushUndo({ before: this.doc, inverse: invertSplices(this.doc, batch) });
         // A paste is a closed unit: nothing may coalesce into it.
         this.hasOpenUnit = origin !== "paste";
       } else {
@@ -1147,7 +1404,7 @@ export class MockCore implements OxidownCore {
       // "undo"/"redo" origins are not expected through applyEdit when the
       // view uses core-driven history. Defensively record them as isolated,
       // non-coalescing units — new edit origins never coalesce (v0.2).
-      this.undoStack.push({ before: this.doc, inverse: invertSplices(this.doc, batch) });
+      this.pushUndo({ before: this.doc, inverse: invertSplices(this.doc, batch) });
       this.hasOpenUnit = false;
       this.redoStack = [];
     }
@@ -1229,7 +1486,7 @@ export class MockCore implements OxidownCore {
     // Exact recorded forward batch (see `RedoUnit.forward`); diff fallback
     // only for units without one — same discipline as undo().
     const splices = unit.forward ?? diffSplices(this.doc, unit.after);
-    this.undoStack.push({
+    this.pushUndo({
       before: this.doc,
       inverse: invertSplices(this.doc, splices),
       streamId: unit.streamId,
@@ -1646,7 +1903,7 @@ export class MockCore implements OxidownCore {
       // tagged so later appends merge into it. It is never coalescible by
       // user/ime edits. Its exact inverse is the chunk's deletion (in the
       // top frame, where this unit now sits).
-      this.undoStack.push({
+      this.pushUndo({
         before: this.doc,
         inverse: [{ at: pos, delete: text.length, insert: "" }],
         streamId: id,
@@ -1698,7 +1955,7 @@ export class MockCore implements OxidownCore {
 
   /** Called with the command's forward splices, BEFORE they are applied. */
   private pushCommandUndoUnit(splices: Splice[]): void {
-    this.undoStack.push({ before: this.doc, inverse: invertSplices(this.doc, splices) });
+    this.pushUndo({ before: this.doc, inverse: invertSplices(this.doc, splices) });
     this.redoStack = [];
     this.hasOpenUnit = false;
     this.lastOrigin = "command";
@@ -1724,6 +1981,23 @@ export class MockCore implements OxidownCore {
     this.checkDocPos(what, pos);
     if (splitsSurrogatePair(this.doc, pos)) throw surrogateSplitError(pos);
     return pos;
+  }
+
+  /**
+   * S2: a COMMAND position argument between the `\r` and `\n` of a CRLF pair
+   * is a validation refusal — no mutation, no revision bump. Error name and
+   * message are contract-pinned, byte-identical on the Rust core; `pos` is
+   * reported AS PASSED (before any normalization or snapping).
+   */
+  private checkCrlfSplit(pos: number): void {
+    if (
+      pos > 0 &&
+      pos < this.doc.length &&
+      this.doc.charCodeAt(pos - 1) === 0x0d &&
+      this.doc.charCodeAt(pos) === 0x0a
+    ) {
+      throw new Error(`InvalidArgument: position ${pos} splits a CRLF sequence`);
+    }
   }
 
   /** QUERY positions snap outward to code-point boundaries instead of erroring. */
@@ -1770,9 +2044,26 @@ export class MockCore implements OxidownCore {
   ): CoreChange | null {
     this.checkDocPos("from", fromArg);
     this.checkDocPos("to", toArg);
+    this.checkCrlfSplit(fromArg); // S2: positions as passed
+    this.checkCrlfSplit(toArg);
     // Reversed ranges normalize (editor.rs command dispatch: from.min(to)).
-    const from = this.strictDocPos(Math.min(fromArg, toArg), "from");
-    const to = this.strictDocPos(Math.max(fromArg, toArg), "to");
+    let from = this.strictDocPos(Math.min(fromArg, toArg), "from");
+    let to = this.strictDocPos(Math.max(fromArg, toArg), "to");
+    // S1: before planning, a NON-EMPTY selection trims its edges over the
+    // contract WS set — for every toggle except toggleCode (code spans keep
+    // their padding behavior, no flanking concerns). OFF/EXTEND detection
+    // below then operates on the trimmed range, and the returned selection
+    // covers the trimmed content so double-toggle stays byte-identical.
+    // Cursor-only (from == to) behavior is deliberately UNCHANGED. Trimming
+    // only skips BMP whitespace code units, so it can never land inside a
+    // surrogate pair.
+    if (delim !== "`" && from !== to) {
+      while (from < to && isContractWs(this.doc.charCodeAt(from))) from++;
+      while (to > from && isContractWs(this.doc.charCodeAt(to - 1))) to--;
+      // A whitespace-only selection means the toggle does not apply — null,
+      // like every other doesn't-apply case: no undo unit, no revision bump.
+      if (from === to) return null;
+    }
     this.assertSingleLeafBlock(name, from, to);
     const len = delim.length;
 
@@ -1821,25 +2112,62 @@ export class MockCore implements OxidownCore {
       throw new Error(`InvalidArgs: setHeading level must be an integer 0..=6, got ${level}`);
     }
     this.checkDocPos("pos", posArg);
+    this.checkCrlfSplit(posArg); // S2
     const pos = this.snapFloor(posArg); // query position: snaps, never errors
     const { start: lineStart, end: lineEnd } = lineRangeContaining(this.doc, pos);
     const line = this.doc.slice(lineStart, lineEnd);
-    const m = HEADING_RE.exec(line);
+    // S3a: inside a blockquote the hashes live AFTER the line's `> ` markers,
+    // and the block gate below applies to the content PAST them — the same
+    // gate as at top level (commands.rs set_heading's BlockKind gate).
+    const quote = quotePrefixInfo(line);
+    const rest = line.slice(quote.length);
+    // Block gate (Rust-core parity): setHeading applies only on paragraph /
+    // ATX-heading / blockquote-content lines. A list item, thematic break,
+    // fence line, or blank remainder refuses identically at any quote depth
+    // (`"> - item"` + setHeading → no-op).
+    if (
+      LIST_MARKER_ANY_INDENT_RE.test(rest) ||
+      HR_RE.test(rest) ||
+      FENCE_RE.test(rest) ||
+      /^[ \t]*$/.test(rest)
+    ) {
+      return null;
+    }
+    const contentStart = lineStart + quote.length;
+    const m = HEADING_RE.exec(rest);
     const currentLevel = m ? m[1].length : 0;
     if (currentLevel === level) return null; // already at the requested level: no-op
 
-    const prefixLen = m ? m[1].length + 1 : 0; // "#".repeat(n) + " "
-    const newPrefix = level === 0 ? "" : "#".repeat(level) + " ";
-    const splice: Splice = { at: lineStart, delete: prefixLen, insert: newPrefix };
-    this.pushCommandUndoUnit([splice]);
-    this.mutateDoc([splice]);
-    const shift = newPrefix.length - prefixLen;
-    const cursor = Math.max(lineStart, pos + shift);
-    return { revision: this.rev, splices: [splice], selection: { anchor: cursor, head: cursor } };
+    let splices: Splice[];
+    if (level === 0) {
+      // S3b: heading REMOVAL deletes ALL delimiter spans — the opening run
+      // AND an ATX closing hash run (heading_node's second delimiter span,
+      // preceding spaces included): `"# foo #"` → `"foo"`. `m` is non-null
+      // here (level 0 with no heading hit the equal-level no-op above).
+      const delimEnd = m![1].length + 1;
+      const closeStart = atxClosingRun(rest, delimEnd);
+      splices = [{ at: contentStart, delete: delimEnd, insert: "" }];
+      if (closeStart < rest.length) {
+        splices.push({
+          at: contentStart + closeStart,
+          delete: rest.length - closeStart,
+          insert: "",
+        });
+      }
+    } else {
+      // Releveling/promotion: only the opening delimiter is rewritten.
+      const prefixLen = m ? m[1].length + 1 : 0; // "#".repeat(n) + " "
+      splices = [{ at: contentStart, delete: prefixLen, insert: "#".repeat(level) + " " }];
+    }
+    this.pushCommandUndoUnit(splices);
+    this.mutateDoc(splices);
+    const cursor = mapPos(pos, splices, -1); // Bias::Before (core parity)
+    return { revision: this.rev, splices, selection: { anchor: cursor, head: cursor } };
   }
 
   private toggleTaskCmd(posArg: number): CoreChange | null {
     this.checkDocPos("pos", posArg);
+    this.checkCrlfSplit(posArg); // S2
     const pos = this.snapFloor(posArg); // query position: snaps, never errors
     const { start: lineStart, end: lineEnd } = lineRangeContaining(this.doc, pos);
     const line = this.doc.slice(lineStart, lineEnd);
@@ -1867,6 +2195,8 @@ export class MockCore implements OxidownCore {
   private indentOutdentList(fromArg: number, toArg: number, indent: boolean): CoreChange | null {
     this.checkDocPos("from", fromArg);
     this.checkDocPos("to", toArg);
+    this.checkCrlfSplit(fromArg); // S2: positions as passed
+    this.checkCrlfSplit(toArg);
     // Reversed ranges normalize; positions are strict (mutation positions).
     const from = this.strictDocPos(Math.min(fromArg, toArg), "from");
     const to = this.strictDocPos(Math.max(fromArg, toArg), "to");
@@ -2083,6 +2413,8 @@ export class MockCore implements OxidownCore {
   private enterCmd(fromArg: number, toArg: number): CoreChange | null {
     this.checkDocPos("from", fromArg);
     this.checkDocPos("to", toArg);
+    this.checkCrlfSplit(fromArg); // S2: positions as passed
+    this.checkCrlfSplit(toArg);
     const from = this.strictDocPos(Math.min(fromArg, toArg), "from");
     const to = this.strictDocPos(Math.max(fromArg, toArg), "to");
     const doc = this.doc;
@@ -2097,16 +2429,26 @@ export class MockCore implements OxidownCore {
     };
 
     if (info.marker) {
-      const { col, width, glyphs } = info.marker;
+      const { col, glyphs } = info.marker;
       const markerStart = info.quoteEnd + col;
-      // Content start: past the marker token; for a task item, past the
-      // "[ ] " run too. Clamped to the line's own end (a bare "-" with no
-      // trailing space is still an empty item).
-      const taskM = TASK_RE.exec(doc.slice(markerStart + width, line.end));
-      const contentStart = Math.min(
-        markerStart + width + (taskM ? taskM[0].length : 0),
-        line.end,
-      );
+      // Content start (S13d): past the marker glyphs AND all immediately
+      // following spaces/tabs (capped at 5, matching LIST_MARKER_RE); an
+      // EMPTY item's marker keeps glyphs + one space. For a task item the
+      // "[ ] " run is marker territory too. Clamped to the line's own end
+      // (a bare "-" with no trailing space is still an empty item).
+      const glyphEnd = markerStart + glyphs.length;
+      let markerEnd: number;
+      if (isBlank(doc.slice(glyphEnd, line.end))) {
+        markerEnd = Math.min(glyphEnd + 1, line.end);
+      } else {
+        markerEnd = glyphEnd;
+        const wsCap = Math.min(line.end, glyphEnd + 5);
+        while (markerEnd < wsCap && (doc[markerEnd] === " " || doc[markerEnd] === "\t")) {
+          markerEnd++;
+        }
+      }
+      const taskM = TASK_RE.exec(doc.slice(markerEnd, line.end));
+      const contentStart = Math.min(markerEnd + (taskM ? taskM[0].length : 0), line.end);
       if (from < contentStart) return null; // inside the marker's prefix region
       if (!isBlank(doc.slice(contentStart, line.end))) {
         // CONTINUE: "\n" + quote prefix + leading indent + next marker.

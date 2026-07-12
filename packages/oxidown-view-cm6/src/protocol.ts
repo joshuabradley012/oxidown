@@ -7,8 +7,11 @@
  * the same PR.
  *
  * Web-boundary flavor: all positions in this protocol are UTF-16 code units
- * (CodeMirror's unit). The wasm crate converts to core-internal UTF-8 byte
- * offsets. Core internals never leak bytes.
+ * (CodeMirror's unit). The conversion to core-internal UTF-8 byte offsets
+ * happens inside `oxidown-core` itself — every public `Editor` entry point
+ * converts on the way in and out (editor.rs `utf16_to_byte*` /
+ * `byte_to_utf16`); the wasm crate passes UTF-16 positions through
+ * unchanged. Core internals never leak bytes.
  */
 
 /** Positions are UTF-16 code units into the current document unless stated otherwise. */
@@ -35,10 +38,15 @@ export type EditOrigin = "user" | "ime" | "paste" | "undo" | "redo" | "ai" | "co
  * - "OutOfBounds"      — a position beyond the document length (direct
  *                        argument OR inside a splices/selections payload)
  * - "InvalidRange"     — from > to on a query range
- * - "InvalidArgs"      — malformed direct numeric argument / command arity
- *                        (the Rust core's own guards spell one refusal
- *                        "InvalidArgument"; assert by /^InvalidArg/ across
- *                        cores)
+ * - "InvalidArgs"      — malformed direct numeric argument / command arity,
+ *                        thrown by the adapter/mock argument layer before
+ *                        dispatch
+ * - "InvalidArgument"  — the core's own domain refusal: a value semantically
+ *                        outside its documented domain (e.g. an inline-toggle
+ *                        range spanning more than one leaf block; a heading
+ *                        level above 6 at the core API). Where a case may
+ *                        surface from either layer, assert by /^InvalidArg/
+ *                        across cores
  * - "InvalidPayload"   — malformed splices/selections payload, or a text
  *                        payload carrying an unpaired surrogate
  * - "InvalidSplice"    — splices not ascending/non-overlapping
@@ -53,6 +61,7 @@ export type CoreErrorName =
   | "OutOfBounds"
   | "InvalidRange"
   | "InvalidArgs"
+  | "InvalidArgument"
   | "InvalidPayload"
   | "InvalidSplice"
   | "InvalidOrigin"

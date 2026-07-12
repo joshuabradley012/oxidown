@@ -43,7 +43,10 @@ deviations:
   space/tab, a run of `#`, then only spaces/tabs to end of line (`# foo #`;
   `# foo#` has no preceding space and is content) — is a SECOND delimiter
   span, concealing/revealing with the same line-level semantics as the
-  opening run.
+  opening run. **Heading content excludes trailing spaces/tabs** (matching
+  CommonMark's inline-content trimming): `"# foo   "`'s content span covers
+  `foo` only — the trailing run belongs to neither content nor delimiter
+  and carries no heading mark.
 - **Inline-code content keeps CommonMark padding spaces** (`` ` x ` `` →
   content ~`" x "`): they are document bytes; only the backtick runs conceal.
 - **Empty edit batches (or all-no-op splices) return the current revision
@@ -54,6 +57,10 @@ deviations:
   ends of) the region the top undo unit would remove (v0.1 clarification 4
   as amended in v0.3): covers typing runs, insert-at-front, and backspacing
   over just-typed text.
+- **Undo depth caps at 100 units** (`history::MAX_UNDO_DEPTH`, identical
+  constant in the JS mock): recording past the cap drops the OLDEST unit.
+  The redo stack needs no cap of its own — it is only ever fed by `undo()`
+  pops, so its depth is bounded by the undo stack's.
 
 ## M1 parser/decoration notes (node & extent decisions the contract leaves open)
 
@@ -188,12 +195,30 @@ in the order Phase 1 made them:
 enter the op log with origin `command`, never coalesce, and return
 `CoreChange { revision, splices (current-doc UTF-16), selection }`.
 
-- **Inline toggles refuse multi-block ranges**: a from/to spanning more than
-  one leaf block throws `InvalidArgument` instead of planning — the wrapped
-  text could never parse as one inline node, and a re-toggle would stack
-  delimiters. A thrown command never mutates (contract: views treat it as a
-  consumed no-op, not a desync), so the caller can tell "refused" from
-  "didn't apply" (`None`).
+- **CRLF split guard (all commands taking positions)**: a position argument
+  (`from`/`to`/`pos`) falling between the `\r` and `\n` of a CRLF pair —
+  a valid UTF-16 boundary — refuses with `InvalidArgument`, message exactly
+  `position {p} splits a CRLF sequence` (`{p}` the UTF-16 offset as passed;
+  byte-pinned across core and mock by the conformance suite). No mutation,
+  no revision bump. Positions are checked in argument order.
+- **Inline toggles trim whitespace edges (all kinds but code)**: a
+  non-empty range trims `from` forward and `to` backward over the pinned
+  whitespace set (U+0009, U+000A, U+000C, U+000D, U+0020, U+00A0, U+1680,
+  U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 — deliberately not
+  Rust `char::is_whitespace()` or JS `\s`, which disagree at U+0085/U+FEFF)
+  BEFORE any planning: a delimiter against a whitespace edge violates
+  CommonMark's flanking rules (`"a b"` toggled over `"a "` yields
+  `**a** b`, never `**a **b`), and the returned selection covers the
+  trimmed content so double-toggle stays byte-identical. OFF/EXTEND
+  detection and the multi-block guard see the trimmed range. A
+  whitespace-only selection trims to nothing: the toggle doesn't apply
+  (`None`). Cursor ranges and `toggleCode` are untouched.
+- **Inline toggles refuse multi-block ranges**: a (trimmed) from/to spanning
+  more than one leaf block throws `InvalidArgument` instead of planning —
+  the wrapped text could never parse as one inline node, and a re-toggle
+  would stack delimiters. A thrown command never mutates (contract: views
+  treat it as a consumed no-op, not a desync), so the caller can tell
+  "refused" from "didn't apply" (`None`).
 - **Inline toggle OFF** when a same-kind node's closed extent fully contains
   the target range; the *innermost* such node when several nest (`_a *b* c_`
   + toggleEm in `b` unwraps `*b*`). Delimiters strip whatever their source
@@ -212,9 +237,13 @@ enter the op log with origin `command`, never coalesce, and return
 - **setHeading** operates on the line containing `pos`; applies only on
   Paragraph/ATX-Heading/BlockQuote blocks (None on code, lists, tables, HTML
   blocks, blank lines, and setext headings). Inside blockquotes the hashes
-  go after that line's `> ` markers. `setHeading(pos, level)` at the current
-  level, and `level 0` on a non-heading, are no-ops → `None` (no burned
-  revision). Level > 6 errors.
+  go after that line's `> ` markers — and the SAME block gate applies to
+  what sits after them: a quote-nested list item or thematic break refuses
+  exactly like its top-level counterpart (`"> - item"` → `None`).
+  `setHeading(pos, level)` at the current level, and `level 0` on a
+  non-heading, are no-ops → `None` (no burned revision). `level 0` on a
+  heading deletes ALL delimiter spans — an ATX closing hash run included
+  (`"# foo #"` → `"foo"`). Level > 6 errors.
 - **toggleTask** accepts `pos` anywhere in the item (the parser records each
   task item's full extent, multi-line items included) and flips exactly the
   one checkbox byte (`[X]` also unchecks). Returns `selection: None` — a

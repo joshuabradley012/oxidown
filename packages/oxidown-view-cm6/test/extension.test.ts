@@ -6,11 +6,11 @@
 // and decoration rebuild scheduling.
 
 import { describe, expect, it, vi } from "vitest";
-import { EditorState, type Transaction } from "@codemirror/state";
+import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
-import { defaultKeymap } from "@codemirror/commands";
+import { defaultKeymap, history, undoDepth } from "@codemirror/commands";
 import { MockCore } from "../src/mock-core";
-import { applyCoreChange, oxidown, oxidownSkip } from "../src/extension";
+import { applyCoreChange, oxidown, oxidownSkip, sanitizeSurrogates } from "../src/extension";
 import type { Decoration } from "../src/protocol";
 
 // jsdom implements Range but none of its layout methods. CM6's rAF-driven
@@ -1422,6 +1422,427 @@ describe("drag freeze released by dragend (native drag-and-drop, no mouseup)", (
     window.dispatchEvent(new Event("dragend"));
     await flush();
     expect(spy.mock.calls.length).toBe(before + 1); // deferred rebuild flushed
+    view.destroy();
+  });
+});
+
+describe("S7: surrogate-safe desync recovery", () => {
+  it("sanitizeSurrogates replaces lone surrogates with U+FFFD and keeps valid pairs", () => {
+    expect(sanitizeSurrogates("plain ascii")).toBe("plain ascii");
+    expect(sanitizeSurrogates("pair: \u{1F600}!")).toBe("pair: \u{1F600}!");
+    expect(sanitizeSurrogates("a\uD800b")).toBe("a�b"); // lone high, mid-string
+    expect(sanitizeSurrogates("a\uDC00b")).toBe("a�b"); // lone low, mid-string
+    expect(sanitizeSurrogates("ab\uD800")).toBe("ab�"); // lone high at the end
+    expect(sanitizeSurrogates("\uDC00ab")).toBe("�ab"); // lone low at the start
+    // A high directly before a valid pair is itself lone.
+    expect(sanitizeSurrogates("\uD800😀")).toBe("�\u{1F600}");
+    // Sanitization is 1:1 per code unit: lengths never change.
+    expect(sanitizeSurrogates("x𐀀\uDC00y").length).toBe(5);
+  });
+
+  it("recovers from a dispatched lone-surrogate insertion: no crash, core and view converge on U+FFFD", async () => {
+    const core = new MockCore();
+    const view = makeView("abc", core);
+    await flush();
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // The forwarded applyEdit refuses the unpaired surrogate (InvalidPayload);
+    // the old recovery then called core.load(raw view buffer), which threw the
+    // SAME refusal straight out of the catch block — an uncaught crash with no
+    // recovery path. Now the buffer is sanitized before the reload.
+    expect(() =>
+      view.dispatch({ changes: { from: 3, to: 3, insert: "\uD800" }, userEvent: "input.type" }),
+    ).not.toThrow();
+
+    // The core loaded the sanitized text synchronously...
+    expect(core.getText()).toBe("abc�");
+    // ...and the deferred (microtask) repair dispatch converges the view
+    // document on the same U+FFFD text — mirror equal, no crash.
+    await flush();
+    expect(view.state.doc.toString()).toBe("abc�");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    expect(errSpy).toHaveBeenCalled(); // still a loudly-logged desync emergency
+
+    // The editor keeps working normally afterwards.
+    view.dispatch({ changes: { from: 0, to: 0, insert: "x" }, userEvent: "input.type" });
+    expect(core.getText()).toBe("xabc�");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    errSpy.mockRestore();
+    await flush();
+    view.destroy();
+  });
+
+  it("the repair transaction is skip-annotated and outside CM6 history", async () => {
+    const core = new MockCore();
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const trs: Transaction[] = [];
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc: "abc",
+        extensions: [
+          oxidown(core, { verifyMirror: true }),
+          EditorView.updateListener.of((u) => trs.push(...u.transactions)),
+        ],
+      }),
+    });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const applySpy = vi.spyOn(core, "applyEdit");
+
+    view.dispatch({ changes: { from: 3, to: 3, insert: "\uDC00" }, userEvent: "input.type" });
+    const applyCallsAfterFailure = applySpy.mock.calls.length; // the failed forward
+    trs.length = 0;
+    await flush();
+
+    // Exactly one repair transaction, skip-annotated (never echoed back into
+    // applyEdit) and tagged addToHistory: false.
+    const repairs = trs.filter((t) => t.docChanged);
+    expect(repairs.length).toBe(1);
+    expect(repairs[0].annotation(oxidownSkip)).toBe(true);
+    expect(repairs[0].annotation(Transaction.addToHistory)).toBe(false);
+    expect(applySpy.mock.calls.length).toBe(applyCallsAfterFailure);
+    expect(view.state.doc.toString()).toBe("abc�");
+    expect(core.getText()).toBe("abc�");
+    errSpy.mockRestore();
+    view.destroy();
+  });
+});
+
+describe("S8: async language-load repaint (full pipeline)", () => {
+  it("paints tok-* marks once the lazily-loaded language resolves, with NO other events", async () => {
+    const core = new MockCore();
+    // A fenced block whose language ("js") loads asynchronously on first use.
+    const doc = "```js\nconst x = 1; // note\n```\n";
+    const view = makeView(doc, core);
+
+    type P = { decorations: { iter(): { value: unknown; next(): void } } };
+    const plugin = (view as unknown as { plugins: { value: unknown }[] }).plugins
+      .map((p) => p.value)
+      .filter((v): v is P => !!v && typeof v === "object" && "decorations" in v)[0];
+    expect(plugin).toBeTruthy();
+    const hasTok = () => {
+      const iter = plugin.decorations.iter();
+      while (iter.value) {
+        const spec = (iter.value as { spec?: { class?: string } }).spec;
+        if (spec?.class && /(^|\s)tok-/.test(spec.class)) return true;
+        iter.next();
+      }
+      return false;
+    };
+
+    // Deliberately NO dispatches from here on: the load resolving must be
+    // enough. Its onLoad callback invalidates the payload cache before
+    // scheduling the rebuild — the CORE payload (and core.revision()) are
+    // unchanged, so without that invalidation flushRebuild's
+    // identical-payload skip would swallow the repaint forever.
+    for (let i = 0; i < 250 && !hasTok(); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(hasTok()).toBe(true);
+    view.destroy();
+  });
+});
+
+describe("S9: readOnly editors never dispatch core edits", () => {
+  function makeReadOnlyView(doc: string, core: MockCore, anchor?: number) {
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    return new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        selection: anchor !== undefined ? { anchor } : undefined,
+        extensions: [
+          oxidown(core, { verifyMirror: true }),
+          keymap.of(defaultKeymap),
+          EditorState.readOnly.of(true),
+        ],
+      }),
+    });
+  }
+
+  const key = (init: KeyboardEventInit) =>
+    new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+
+  it("formatting toggles (Mod-b) return false without calling core.command", async () => {
+    const core = new MockCore();
+    const doc = "hello world";
+    const view = makeReadOnlyView(doc, core);
+    view.dispatch({ selection: { anchor: 6, head: 11 } }); // selection changes are not edits
+    const cmdSpy = vi.spyOn(core, "command");
+
+    view.contentDOM.dispatchEvent(key({ key: "b", code: "KeyB", ctrlKey: true }));
+    await flush();
+
+    expect(cmdSpy).not.toHaveBeenCalled();
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(core.getText()).toBe(doc);
+    view.destroy();
+  });
+
+  it("Tab/Shift-Tab neither run indentList/outdentList nor fall back to indentMore/indentLess", async () => {
+    const core = new MockCore();
+    const doc = "- a\n- b\n";
+    const view = makeReadOnlyView(doc, core, doc.indexOf("b"));
+    const cmdSpy = vi.spyOn(core, "command");
+
+    view.contentDOM.dispatchEvent(key({ key: "Tab", code: "Tab" }));
+    view.contentDOM.dispatchEvent(key({ key: "Tab", code: "Tab", shiftKey: true }));
+    await flush();
+
+    expect(cmdSpy).not.toHaveBeenCalled();
+    expect(view.state.doc.toString()).toBe(doc);
+    view.destroy();
+  });
+
+  it("Enter and Mod-Shift-Enter return false without dispatching", async () => {
+    const core = new MockCore();
+    const doc = "- [ ] task\n";
+    const view = makeReadOnlyView(doc, core, 6);
+    const cmdSpy = vi.spyOn(core, "command");
+
+    view.contentDOM.dispatchEvent(key({ key: "Enter", code: "Enter" }));
+    view.contentDOM.dispatchEvent(
+      key({ key: "Enter", code: "Enter", ctrlKey: true, shiftKey: true }),
+    );
+    await flush();
+
+    expect(cmdSpy).not.toHaveBeenCalled();
+    expect(view.state.doc.toString()).toBe(doc);
+    view.destroy();
+  });
+
+  it("undo/redo keys never touch the core's history stacks", async () => {
+    const core = new MockCore();
+    const doc = "abc";
+    const view = makeReadOnlyView(doc, core);
+    const undoSpy = vi.spyOn(core, "undo");
+    const redoSpy = vi.spyOn(core, "redo");
+
+    view.contentDOM.dispatchEvent(key({ key: "z", code: "KeyZ", ctrlKey: true }));
+    view.contentDOM.dispatchEvent(key({ key: "y", code: "KeyY", ctrlKey: true }));
+    view.contentDOM.dispatchEvent(key({ key: "z", code: "KeyZ", ctrlKey: true, shiftKey: true }));
+    await flush();
+
+    expect(undoSpy).not.toHaveBeenCalled();
+    expect(redoSpy).not.toHaveBeenCalled();
+    expect(view.state.doc.toString()).toBe(doc);
+    view.destroy();
+  });
+
+  it("checkbox clicks are ignored (no toggleTask dispatch, no edit)", async () => {
+    const core = new MockCore();
+    const doc = "- [ ] buy milk\nelsewhere";
+    // Cursor on a different line so the widget is rendered (reveal is line-level).
+    const view = makeReadOnlyView(doc, core, doc.length);
+    await flush();
+
+    const checkbox = view.contentDOM.querySelector(
+      "input.ox-task-checkbox",
+    ) as HTMLInputElement | null;
+    expect(checkbox).not.toBeNull();
+    const cmdSpy = vi.spyOn(core, "command");
+
+    checkbox!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    await flush();
+
+    expect(cmdSpy).not.toHaveBeenCalled();
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(core.getText()).toBe(doc);
+    expect(checkbox!.checked).toBe(false); // the DOM checkbox didn't lie either
+    view.destroy();
+  });
+});
+
+describe("S10: validation refusals are logged quietly (no console.error)", () => {
+  const boldKey = () =>
+    new KeyboardEvent("keydown", {
+      key: "b",
+      code: "KeyB",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+  it("multi-block Mod-b (a contract validation refusal) produces no console.error", async () => {
+    const core = new MockCore();
+    const doc = "para one\n\npara two";
+    const view = makeView(doc, core);
+    // Selection spanning two paragraphs: the core refuses the toggle with an
+    // Invalid* validation error (thrown before any mutation) by contract.
+    view.dispatch({ selection: { anchor: 0, head: doc.length } });
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dbgSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+
+    view.contentDOM.dispatchEvent(boldKey());
+    await flush();
+
+    expect(errSpy).not.toHaveBeenCalled();
+    expect(view.state.doc.toString()).toBe(doc); // refused: no edit
+    expect(core.getText()).toBe(doc);
+    errSpy.mockRestore();
+    dbgSpy.mockRestore();
+    view.destroy();
+  });
+
+  it("routes on the Invalid* prefix: InvalidArgument goes to console.debug, other names stay loud", async () => {
+    const core = new MockCore();
+    const view = makeView("hello world", core);
+    view.dispatch({ selection: { anchor: 0, head: 5 } });
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dbgSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+
+    // A refusal spelled with the Rust core's own guard name (message prefix,
+    // no CoreErrorName type needed): quiet.
+    const cmdSpy = vi.spyOn(core, "command").mockImplementation(() => {
+      throw new Error("InvalidArgument: from must be a non-negative integer, got -1");
+    });
+    view.contentDOM.dispatchEvent(boldKey());
+    expect(errSpy).not.toHaveBeenCalled();
+    expect(dbgSpy).toHaveBeenCalled();
+
+    // Any non-Invalid* name keeps the existing loud doctrine.
+    cmdSpy.mockImplementation(() => {
+      throw new Error("UnknownStream: boom");
+    });
+    view.contentDOM.dispatchEvent(boldKey());
+    expect(errSpy).toHaveBeenCalled();
+
+    cmdSpy.mockRestore();
+    errSpy.mockRestore();
+    dbgSpy.mockRestore();
+    await flush();
+    view.destroy();
+  });
+});
+
+describe("S11: a mixed skip + user batched update routes through desync recovery", () => {
+  it("does not forward user splices computed against the wrong core doc", async () => {
+    const core = new MockCore();
+    const view = makeView("abc", core);
+    await flush();
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const loadSpy = vi.spyOn(core, "load");
+    const applySpy = vi.spyOn(core, "applyEdit");
+
+    // A host batches (view.update([...])) a plain USER transaction — built
+    // against the view's doc "abc" — together with a core-driven change the
+    // core has ALREADY applied (command() mutates the core when called).
+    // Forwarding the user splice at position 3 against the core's
+    // now-different doc "**abc**" would land it INSIDE the delimiters
+    // ("**axbc**"): silent corruption when verifyMirror is off.
+    const tr1 = view.state.update({
+      changes: { from: 3, to: 3, insert: "x" },
+      userEvent: "input.type",
+    });
+    const c = core.command("toggleStrong", 0, 3)!; // core: "abc" -> "**abc**"
+    const tr2 = tr1.state.update({
+      changes: c.splices.map((s) => ({ from: s.at, to: s.at + s.delete, insert: s.insert })),
+      annotations: oxidownSkip.of(true),
+    });
+    view.update([tr1, tr2]);
+
+    // The user splice was never forwarded splice-by-splice...
+    expect(applySpy).not.toHaveBeenCalled();
+    // ...the whole batch was treated as a desync emergency instead: one
+    // recovery reload against the update's FINAL doc.
+    expect(view.state.doc.toString()).toBe("**abc**x");
+    expect(loadSpy).toHaveBeenCalledWith("**abc**x");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    expect(errSpy).toHaveBeenCalled(); // loudly reported
+
+    errSpy.mockRestore();
+    await flush();
+    view.destroy();
+  });
+
+  it("(control) an all-skip batched update still forwards nothing and loads nothing", async () => {
+    // The mixed-case detector must not regress the legitimate all-skip batch
+    // (already covered in FIX 6, re-asserted here against the new pre-scan).
+    const core = new MockCore();
+    const view = makeView("abc", core);
+    await flush();
+
+    const loadSpy = vi.spyOn(core, "load");
+    const applySpy = vi.spyOn(core, "applyEdit");
+
+    const c1 = core.command("toggleStrong", 0, 3)!;
+    const tr1 = view.state.update({
+      changes: c1.splices.map((s) => ({ from: s.at, to: s.at + s.delete, insert: s.insert })),
+      annotations: oxidownSkip.of(true),
+    });
+    const c2 = core.command("setHeading", 0, 2)!;
+    const tr2 = tr1.state.update({
+      changes: c2.splices.map((s) => ({ from: s.at, to: s.at + s.delete, insert: s.insert })),
+      annotations: oxidownSkip.of(true),
+    });
+    view.update([tr1, tr2]);
+
+    expect(view.state.doc.toString()).toBe("## **abc**");
+    expect(core.getText()).toBe("## **abc**");
+    expect(applySpy).not.toHaveBeenCalled();
+    expect(loadSpy).not.toHaveBeenCalled();
+    view.destroy();
+    await flush();
+  });
+});
+
+describe("S12: drawSelection opt-out + core-change history tagging", () => {
+  it("bundles drawSelection by default; `drawSelection: false` omits it", () => {
+    const core1 = new MockCore();
+    const view1 = makeView("abc", core1);
+    expect(view1.dom.querySelector(".cm-cursorLayer")).not.toBeNull();
+    view1.destroy();
+
+    const core2 = new MockCore();
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view2 = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc: "abc",
+        extensions: [oxidown(core2, { verifyMirror: true, drawSelection: false })],
+      }),
+    });
+    expect(view2.dom.querySelector(".cm-cursorLayer")).toBeNull();
+    view2.destroy();
+  });
+
+  it("applyCoreChange transactions carry addToHistory: false — a wrongly-enabled CM6 history records nothing", async () => {
+    const core = new MockCore();
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const trs: Transaction[] = [];
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc: "hello world",
+        extensions: [
+          oxidown(core, { verifyMirror: true }),
+          // The host mistake the tagging defends against: CM6's own history
+          // alongside the core historian (explicitly documented as wrong).
+          history(),
+          EditorView.updateListener.of((u) => trs.push(...u.transactions)),
+        ],
+      }),
+    });
+
+    const change = core.command("toggleStrong", 6, 11);
+    expect(change).not.toBeNull();
+    trs.length = 0;
+    applyCoreChange(view, change!, "oxidown.command");
+
+    expect(view.state.doc.toString()).toBe("hello **world**");
+    const docTrs = trs.filter((t) => t.docChanged);
+    expect(docTrs.length).toBe(1);
+    expect(docTrs[0].annotation(Transaction.addToHistory)).toBe(false);
+    // The second history recorded nothing to undo.
+    expect(undoDepth(view.state)).toBe(0);
+    await flush();
     view.destroy();
   });
 });

@@ -143,6 +143,20 @@ mod tests {
     }
 
     #[test]
+    fn replacement_splice_at_an_after_biased_position_stays_before_the_insert() {
+        // A REPLACEMENT (delete > 0, non-empty insert) landing exactly ON
+        // the position: `delete > 0` disables the pure-insertion bias arm,
+        // so even After bias leaves the position at the replacement's start
+        // — i.e. an After-biased anchor sitting exactly where a replacement
+        // splice lands ends up BEFORE the inserted text. Current behavior,
+        // pinned deliberately (anchor.rs resolves anchors through exactly
+        // this path).
+        let batch = [sp(5, 3, "XYZ")];
+        assert_eq!(map_pos(5, &batch, Bias::After), 5);
+        assert_eq!(map_pos(5, &batch, Bias::Before), 5);
+    }
+
+    #[test]
     fn map_range_absorbs_insertions_at_both_edges() {
         let r = map_range(&(5..8), &[sp(5, 0, "AB"), sp(8, 0, "CD")]);
         assert_eq!(r, 5..12); // "AB" absorbed at start, "CD" absorbed at end

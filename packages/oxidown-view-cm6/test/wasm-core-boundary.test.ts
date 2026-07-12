@@ -7,8 +7,16 @@
  *
  * The adapter-level cases drive `adaptWasmCore` against a fake
  * `WasmCoreInstance` that records what actually crosses the "boundary".
+ *
+ * The one exception to "without the wasm binary": the S6 probes at the
+ * bottom pin the wasm layer's `decorations()` validation PRECEDENCE against
+ * the mock's canonical order, which only means anything against the real
+ * crate — they load `crates/oxidown-wasm/pkg` exactly like the conformance
+ * suite (skip locally when unbuilt, mandatory in CI).
  */
 import { describe, expect, it } from "vitest";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   StreamSurrogateBuffer,
   adaptWasmCore,
@@ -16,7 +24,8 @@ import {
   hasUnpairedSurrogate,
   splitTrailingHighSurrogate,
 } from "../src/wasm-core";
-import type { CoreChange } from "../src/protocol";
+import { MockCore } from "../src/mock-core";
+import type { CoreChange, OxidownCore } from "../src/protocol";
 
 const HIGH = "\uD83D"; // first half of 😀 (U+1F600 = D83D DE00)
 const LOW = "\uDE00";
@@ -25,10 +34,15 @@ const EMOJI = HIGH + LOW;
 /**
  * Fake wasm instance: records every string that would cross the boundary
  * and maintains an append-only "document" for the streaming cases.
+ * `failNextStreamAppend` arms a one-shot throw from INSIDE the instance's
+ * streamAppend (recorded as having crossed, mutating nothing) — the core-
+ * side failure mode (e.g. UnknownStream) as opposed to the adapter's own
+ * validation throws.
  */
 function fakeInner() {
   let doc = "";
   let revision = 0;
+  let streamAppendError: Error | null = null;
   const calls: { method: string; text: string }[] = [];
   const change = (at: number, insert: string): CoreChange => ({
     revision: ++revision,
@@ -38,6 +52,9 @@ function fakeInner() {
   return {
     doc: () => doc,
     calls,
+    failNextStreamAppend: (err: Error) => {
+      streamAppendError = err;
+    },
     inner: {
       free: () => {
         calls.push({ method: "free", text: "" });
@@ -63,6 +80,11 @@ function fakeInner() {
       streamOpen: () => 1,
       streamAppend: (_id: number, chunk: string) => {
         calls.push({ method: "streamAppend", text: chunk });
+        if (streamAppendError) {
+          const err = streamAppendError;
+          streamAppendError = null;
+          throw err; // before mutating: a refused append enters no document
+        }
         const at = doc.length;
         doc += chunk;
         return change(at, chunk);
@@ -244,4 +266,164 @@ describe("adaptWasmCore boundary guards (fake wasm instance)", () => {
     core.destroy?.(); // double-destroy guarded
     expect(calls.filter((c) => c.method === "free")).toHaveLength(1);
   });
+
+  it("clears the pending surrogate when the INNER streamAppend throws (core-side failure, not just validation)", () => {
+    const { inner, calls, failNextStreamAppend } = fakeInner();
+    const core = adaptWasmCore(inner);
+    const id = core.streamOpen(0);
+    // push withholds the trailing HIGH and forwards "a" — which the (armed)
+    // core rejects. The adapter's catch must drop the withheld unit: the
+    // append failed, so nothing can ever legitimately pair with it.
+    failNextStreamAppend(new Error("UnknownStream: stream 1 is unknown or already closed"));
+    expect(() => core.streamAppend(id, `a${HIGH}`)).toThrow(/^UnknownStream: /);
+    // No stale pending unit survives: close finds nothing to flush (a stale
+    // HIGH would surface here as a second, U+FFFD-carrying append).
+    expect(core.streamClose(id)).toBeNull();
+    expect(calls.filter((c) => c.method === "streamAppend").map((c) => c.text)).toEqual(["a"]);
+  });
+
+  it("streamClose closes and returns null even when the U+FFFD flush append throws", () => {
+    const { inner, doc, calls, failNextStreamAppend } = fakeInner();
+    const core = adaptWasmCore(inner);
+    const id = core.streamOpen(0);
+    core.streamAppend(id, `x${HIGH}`); // HIGH withheld in the adapter
+    failNextStreamAppend(new Error("UnknownStream: stream 1 is unknown or already closed"));
+    // Contract: streamClose NEVER throws. The failed flush entered no
+    // document, so returning null desyncs nothing.
+    expect(core.streamClose(id)).toBeNull();
+    // The flush was attempted, then the close still crossed.
+    expect(calls.map((c) => c.method)).toEqual(["streamAppend", "streamAppend", "streamClose"]);
+    expect(doc()).toBe("x");
+    // The dropped unit is gone for good: a later close flushes nothing.
+    expect(core.streamClose(id)).toBeNull();
+    expect(calls.filter((c) => c.method === "streamAppend")).toHaveLength(2);
+  });
+
+  it("a reused stream id never inherits a stale pending high surrogate", () => {
+    const { inner, calls } = fakeInner();
+    const core = adaptWasmCore(inner);
+    // Session 1 on id 1 ends with a withheld HIGH; close flushes it (U+FFFD)
+    // and clears the buffer.
+    const first = core.streamOpen(0);
+    core.streamAppend(first, `a${HIGH}`);
+    expect(core.streamClose(first)).not.toBeNull();
+    // Session 2 reuses the same id (the fake always issues 1). Its leading
+    // low surrogate must be REJECTED as lone — pairing it with session 1's
+    // HIGH would fabricate a code point the producer never sent.
+    const second = core.streamOpen(0);
+    expect(second).toBe(first);
+    expect(() => core.streamAppend(second, `${LOW}b`)).toThrow(/^InvalidPayload: /);
+    expect(calls.filter((c) => c.method === "streamAppend").map((c) => c.text)).toEqual([
+      "a",
+      "�",
+    ]);
+  });
 });
+
+// ---------------------------------------------------------------------------
+// S6 probes: decorations() validation precedence against the REAL wasm crate.
+// The mock's order (mock-core.ts `decorations`) is canonical: malformed
+// revision → staleness → malformed from/to → range (from > to) → bounds on
+// `to` → selections payload (malformed, then per-selection bounds). The wasm
+// layer parses its selections JSON before calling into the core, so unless it
+// ALSO fronts the range/bounds checks (lib.rs `check_query_range`), a bad
+// selections payload would preempt an invalid range there — these probes run
+// the same call against both cores and pin the mock's answer. Loading mirrors
+// conformance.test.ts: initSync over the raw pkg bytes, local skip when the
+// pkg is unbuilt, mandatory under CI (which builds the pkg first — a silent
+// skip would let CI go green without the real binary).
+// ---------------------------------------------------------------------------
+
+const REQUIRE_WASM = Boolean(process.env.CI);
+
+async function loadWasmFactory(): Promise<(() => OxidownCore) | null> {
+  const jsPath = fileURLToPath(
+    new URL("../../../crates/oxidown-wasm/pkg/oxidown_wasm.js", import.meta.url),
+  );
+  const wasmPath = fileURLToPath(
+    new URL("../../../crates/oxidown-wasm/pkg/oxidown_wasm_bg.wasm", import.meta.url),
+  );
+  if (!existsSync(jsPath) || !existsSync(wasmPath)) {
+    if (REQUIRE_WASM) {
+      throw new Error(
+        "[wasm-core-boundary] CI requires the wasm side: crates/oxidown-wasm/pkg is missing " +
+          "(build it with wasm-pack before running this suite)",
+      );
+    }
+    return null;
+  }
+  try {
+    const mod = (await import(/* @vite-ignore */ jsPath)) as {
+      initSync: (arg: { module: BufferSource }) => unknown;
+      OxidownCore: new () => Parameters<typeof adaptWasmCore>[0];
+    };
+    mod.initSync({ module: readFileSync(wasmPath) });
+    return () => adaptWasmCore(new mod.OxidownCore());
+  } catch (err) {
+    if (REQUIRE_WASM) {
+      throw new Error(
+        `[wasm-core-boundary] CI requires the wasm side: crates/oxidown-wasm/pkg is present but failed to load: ${String(err)}`,
+      );
+    }
+    console.log(
+      "[wasm-core-boundary] crates/oxidown-wasm/pkg present but failed to load — wasm probes skipped:",
+      err,
+    );
+    return null;
+  }
+}
+
+const wasmFactory = await loadWasmFactory();
+
+const probeCores: Array<[string, () => OxidownCore]> = [["MockCore", () => new MockCore()]];
+if (wasmFactory) {
+  probeCores.push(["WasmCore", wasmFactory]);
+} else {
+  console.log(
+    "[wasm-core-boundary] S6 wasm probes skipped (build crates/oxidown-wasm with wasm-pack to enable them)",
+  );
+  describe.skip("decorations validation precedence, S6 probes: WasmCore (pkg not built)", () => {
+    it("skipped — wasm pkg absent", () => {});
+  });
+}
+
+/** Run `fn`, expecting a throw; return the error message. */
+function thrownMessage(fn: () => unknown): string {
+  try {
+    fn();
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+  throw new Error("expected the call to throw, but it returned");
+}
+
+for (const [coreName, makeCore] of probeCores) {
+  describe(`decorations validation precedence, S6 probes: ${coreName}`, () => {
+    const boot = (): { core: OxidownCore; rev: number } => {
+      const core = makeCore();
+      const rev = core.load("hello world"); // 11 UTF-16 code units
+      return { core, rev };
+    };
+
+    it("range check (from 9 > to 2) beats a MALFORMED selections payload", () => {
+      const { core, rev } = boot();
+      expect(thrownMessage(() => core.decorations(rev, 9, 2, [{ anchor: -1, head: 0 }]))).toBe(
+        "InvalidRange: from 9 > to 2",
+      );
+    });
+
+    it("bounds check on `to` beats a MALFORMED selections payload", () => {
+      const { core, rev } = boot();
+      expect(thrownMessage(() => core.decorations(rev, 0, 99, [{ anchor: -1, head: 0 }]))).toBe(
+        "OutOfBounds: position 99 beyond document length 11 (UTF-16 code units)",
+      );
+    });
+
+    it("range check beats an OUT-OF-BOUNDS selection", () => {
+      const { core, rev } = boot();
+      expect(thrownMessage(() => core.decorations(rev, 9, 2, [{ anchor: 99, head: 0 }]))).toBe(
+        "InvalidRange: from 9 > to 2",
+      );
+    });
+  });
+}

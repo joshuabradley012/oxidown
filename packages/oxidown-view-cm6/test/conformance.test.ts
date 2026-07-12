@@ -756,6 +756,197 @@ for (const [coreName, makeCore] of factories) {
         0, 4,
       ]);
     });
+
+    // ---- S14: parser fidelity — flanking rules (S13a) ---------------------
+
+    it("intraword `_` and space-flanked `**` emphasize nothing (CommonMark flanking)", () => {
+      for (const doc of ["a_snake_case_word", "a ** b ** c"]) {
+        const core = boot(doc);
+        const ds = core.decorations(core.revision(), 0, doc.length, []);
+        expect(
+          ds.filter((d) => d.kind === "mark" || d.kind === "conceal"),
+          doc,
+        ).toEqual([]);
+      }
+    });
+
+    // ---- S14: multi-backtick code spans (S13b) ----------------------------
+
+    it("`say ``x`` ok` is ONE code span containing x (equal-length backtick runs pair)", () => {
+      const doc = "say ``x`` ok";
+      const core = boot(doc);
+      const ds = core.decorations(core.revision(), 0, doc.length, []);
+      expect(normalize(ds.filter((d) => d.kind === "mark"))).toEqual(
+        normalize([{ kind: "mark", from: 6, to: 7, style: "code" }]),
+      );
+      expect(normalize(ds.filter((d) => d.kind === "conceal"))).toEqual(
+        normalize([
+          { kind: "conceal", from: 4, to: 6 },
+          { kind: "conceal", from: 7, to: 9 },
+        ]),
+      );
+    });
+
+    // ---- S14: code-span precedence (S13c) ----------------------------------
+
+    it("code spans scan first: in `*a `b*` c*` the delimiter inside the span is inert", () => {
+      const doc = "*a `b*` c*";
+      const core = boot(doc);
+      const ds = core.decorations(core.revision(), 0, doc.length, []);
+      expect(normalize(ds)).toEqual(
+        normalize([
+          { kind: "conceal", from: 0, to: 1 },
+          { kind: "mark", from: 1, to: 9, style: "em" },
+          { kind: "conceal", from: 3, to: 4 },
+          { kind: "mark", from: 4, to: 6, style: "code" },
+          { kind: "conceal", from: 6, to: 7 },
+          { kind: "conceal", from: 9, to: 10 },
+        ]),
+      );
+    });
+
+    // ---- S14: list marker span (S13d, v0.4 note on clarification 3) --------
+
+    it("`-   spaced item`: the marker widget covers the glyphs plus ALL following spaces → [0, 4)", () => {
+      const doc = "-   spaced item";
+      const core = boot(doc);
+      const ds = core.decorations(core.revision(), 0, doc.length, []);
+      expect(normalize(ds.filter((d) => d.kind === "widget"))).toEqual(
+        normalize([{ kind: "widget", from: 0, to: 4, widget: "bullet" }]),
+      );
+    });
+
+    it("`- [ ]   spaced task`: marker conceal [0, 2) + task widget [2, 5); post-checkbox spaces are content", () => {
+      const doc = "- [ ]   spaced task";
+      const core = boot(doc);
+      const ds = core.decorations(core.revision(), 0, doc.length, []);
+      expect(normalize(ds.filter((d) => d.kind === "widget"))).toEqual(
+        normalize([{ kind: "widget", from: 2, to: 5, widget: "task", checked: false }]),
+      );
+      expect(normalize(ds.filter((d) => d.kind === "conceal"))).toEqual(
+        normalize([{ kind: "conceal", from: 0, to: 2 }]),
+      );
+    });
+
+    // ---- S14: heading trailing whitespace (S5) ------------------------------
+
+    it("`# foo   `: trailing spaces are not heading content", () => {
+      const doc = "# foo   ";
+      const core = boot(doc);
+      const ds = core.decorations(core.revision(), 0, doc.length, []);
+      expect(normalize(ds)).toEqual(
+        normalize([
+          { kind: "line", at: 0, style: "h1" },
+          { kind: "conceal", from: 0, to: 2 },
+        ]),
+      );
+    });
+
+    // ---- S14: toggle whitespace trimming (S1) -------------------------------
+
+    it("toggle trims whitespace-edged selections; double-toggle is byte-identical", () => {
+      const core = boot("a b");
+      const c1 = core.command("toggleStrong", 0, 2);
+      expect(core.getText()).toBe("**a** b");
+      expect(c1!.splices).toEqual([
+        { at: 0, delete: 0, insert: "**" },
+        { at: 1, delete: 0, insert: "**" },
+      ]);
+      expect(c1!.selection).toEqual({ anchor: 2, head: 3 });
+      const c2 = core.command("toggleStrong", c1!.selection!.anchor, c1!.selection!.head);
+      expect(c2).not.toBeNull();
+      expect(core.getText()).toBe("a b");
+    });
+
+    it("a selection over a trailing newline trims onto the line: `ab\\ncd` 0..3", () => {
+      const core = boot("ab\ncd");
+      core.command("toggleStrong", 0, 3);
+      expect(core.getText()).toBe("**ab**\ncd");
+    });
+
+    it("a whitespace-only selection does not apply: null, no revision bump, no undo unit", () => {
+      const core = boot("a   b");
+      const rev = core.revision();
+      expect(core.command("toggleStrong", 1, 4)).toBeNull();
+      expect(core.getText()).toBe("a   b");
+      expect(core.revision()).toBe(rev);
+      expect(core.undo()).toBeNull();
+    });
+
+    it("S1 trimming runs BEFORE the multi-block guard: a whitespace overhang across a block boundary trims and applies", () => {
+      const core = boot("a\n\nb");
+      const change = core.command("toggleStrong", 0, 3); // "a\n\n" — crosses the blank line untrimmed
+      expect(change).not.toBeNull();
+      expect(core.getText()).toBe("**a**\n\nb"); // no InvalidArgument multi-block throw
+    });
+
+    it("a whitespace-only selection SPANNING blocks returns null, not a multi-block throw", () => {
+      const core = boot("a\n\nb");
+      const rev = core.revision();
+      expect(core.command("toggleStrong", 1, 3)).toBeNull(); // "\n\n"
+      expect(core.getText()).toBe("a\n\nb");
+      expect(core.revision()).toBe(rev);
+    });
+
+    // ---- S14: CRLF split refusal (S2) ---------------------------------------
+
+    it("a command position splitting a CRLF pair refuses with the pinned InvalidArgument message", () => {
+      const core = boot("one\r\ntwo");
+      const rev = core.revision();
+      const msg = "InvalidArgument: position 4 splits a CRLF sequence";
+      expect(thrownMessage(() => core.command("toggleStrong", 4, 8))).toBe(msg);
+      expect(thrownMessage(() => core.command("setHeading", 4, 2))).toBe(msg);
+      expect(thrownMessage(() => core.command("enter", 4, 4))).toBe(msg);
+      expect(core.getText()).toBe("one\r\ntwo");
+      expect(core.revision()).toBe(rev);
+    });
+
+    // ---- S14: setHeading block gate + level-0 removal (S3) -------------------
+
+    it("setHeading refuses a list item inside a blockquote (S3a): `> - item` → null", () => {
+      const core = boot("> - item");
+      const rev = core.revision();
+      expect(core.command("setHeading", 5, 2)).toBeNull();
+      expect(core.getText()).toBe("> - item");
+      expect(core.revision()).toBe(rev);
+    });
+
+    it("setHeading refuses a top-level list item the same way", () => {
+      const core = boot("- item");
+      expect(core.command("setHeading", 3, 2)).toBeNull();
+      expect(core.getText()).toBe("- item");
+    });
+
+    it("setHeading level 0 deletes the ATX closing hash run too (S3b)", () => {
+      const a = boot("# foo #");
+      const c = a.command("setHeading", 3, 0);
+      expect(a.getText()).toBe("foo");
+      expect(c!.splices).toEqual([
+        { at: 0, delete: 2, insert: "" },
+        { at: 5, delete: 2, insert: "" },
+      ]);
+      const b = boot("## x ##");
+      b.command("setHeading", 4, 0);
+      expect(b.getText()).toBe("x");
+    });
+
+    // ---- S14: undo depth cap (S4) --------------------------------------------
+
+    it("undo depth caps at 100 units, dropping the oldest (101 units → oldest gone)", () => {
+      const core = boot("");
+      core.applyEdit(core.revision(), [{ at: 0, delete: 0, insert: "A" }], "paste");
+      for (let k = 0; k < 100; k++) {
+        core.applyEdit(
+          core.revision(),
+          [{ at: core.docLength(), delete: 0, insert: "x" }],
+          "paste",
+        );
+      }
+      let undos = 0;
+      while (core.undo() !== null) undos++;
+      expect(undos).toBe(100);
+      expect(core.getText()).toBe("A"); // the oldest unit fell off the stack
+    });
   });
 }
 
@@ -787,6 +978,28 @@ for (const [coreName, makeCore] of factories) {
     const fromMock = normalize(mock.decorations(mock.revision(), 0, FIXTURE.length, []));
     const fromWasm = normalize(wasm.decorations(wasm.revision(), 0, FIXTURE.length, []));
     expect(fromMock).toEqual(fromWasm);
+  });
+
+  it("both cores emit identical decorations for the S14 parser-fidelity docs", () => {
+    // S13/S5 pins: flanking rules, multi-backtick code spans, code-span
+    // precedence, one-space list markers, heading trailing-whitespace trim.
+    for (const doc of [
+      "a_snake_case_word",
+      "a ** b ** c",
+      "say ``x`` ok",
+      "*a `b*` c*",
+      "-   spaced item",
+      "- [ ]   spaced task",
+      "# foo   ",
+    ]) {
+      const mock: OxidownCore = new MockCore();
+      const wasm = wasmFactory!();
+      mock.load(doc);
+      wasm.load(doc);
+      const fromMock = normalize(mock.decorations(mock.revision(), 0, doc.length, []));
+      const fromWasm = normalize(wasm.decorations(wasm.revision(), 0, doc.length, []));
+      expect(fromMock, doc).toEqual(fromWasm);
+    }
   });
 
   // ---- decoration OFFSETS on astral-plane content -------------------------

@@ -30,9 +30,10 @@
 
 use std::ops::Range;
 
+use crate::block_index::Block;
 use crate::composition::Composition;
 use crate::parser::{Node, NodeKind};
-use crate::text::{SrcBytes, TextBuffer};
+use crate::text::TextBuffer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkStyle {
@@ -166,50 +167,31 @@ fn touches(a: usize, b: usize, from: usize, to: usize) -> bool {
     a <= to && b >= from
 }
 
-/// Start of the last blank (whitespace-only) line at/before `from`, or 0 —
-/// the windowing FLOOR for `compute`'s viewport filter. Found by a backward
-/// byte scan (chunk-cached via [`SrcBytes`]): O(bytes back to the previous
-/// blank line), which is exactly the region whose nodes can still overlap
-/// the viewport — but on a document with NO blank line above the viewport
-/// (one giant paragraph/blockquote/code block) the scan degrades to O(doc),
-/// reaching all the way back to byte 0 (measured ~2.4ms/call on a 2MB
-/// blank-line-free blockquote). A `\r\n` pair is ONE terminator — the empty "segment"
-/// between `\r` and `\n` must not read as a blank line, or the floor could
-/// land where the spans-no-blank-line invariant doesn't hold.
-fn blank_line_floor(text: &TextBuffer, from: usize) -> usize {
-    let src = SrcBytes::new(text);
-    // Start of the line containing `from` (which may sit mid-line).
-    let mut ls = from.min(src.len());
-    while ls > 0 && !matches!(src.byte(ls - 1), b'\n' | b'\r') {
-        ls -= 1;
-    }
-    loop {
-        if ls == 0 {
-            return 0;
-        }
-        // Step onto the previous line: skip its terminator (`\n`, `\r`, or
-        // the two-byte `\r\n`), then scan that line's content back to its
-        // own start, checking for anything non-blank.
-        let mut p = ls - 1;
-        if src.byte(p) == b'\n' && p > 0 && src.byte(p - 1) == b'\r' {
-            p -= 1;
-        }
-        let mut blank = true;
-        while p > 0 && !matches!(src.byte(p - 1), b'\n' | b'\r') {
-            if !matches!(src.byte(p - 1), b' ' | b'\t') {
-                blank = false;
-            }
-            p -= 1;
-        }
-        if blank {
-            return p;
-        }
-        ls = p;
-    }
+/// Windowing FLOOR for `compute`'s viewport filter: the span start of the
+/// top-level block containing `from` (the last block starting at/before it),
+/// or 0 — one `partition_point` over the block index, O(log blocks).
+/// Replaces the previous backward byte scan to the last blank line, which
+/// cost O(bytes back to that line) and degraded to O(doc) on a document
+/// with no blank line above the viewport (one giant paragraph/blockquote/
+/// code block — measured ~2.4ms/call on a 2MB blank-line-free blockquote).
+///
+/// Validity: NO overlay node's extent crosses a top-level block START —
+/// every node is derived from a construct inside exactly one top-level
+/// block (line-oriented kinds are single-line by construction; inline kinds
+/// live inside one leaf block; the blank/gap bytes between blocks carry no
+/// nodes) — so every node overlapping the viewport starts at/after the
+/// block start this returns. When `from` sits in a blank gap AFTER the
+/// found block's span, its start is merely a looser (still sound) floor.
+/// `compute`'s debug_assert re-validates the chosen floor against the
+/// nodes themselves (the linear reference) on every debug run.
+fn block_floor(blocks: &[Block], from: usize) -> usize {
+    let idx = blocks.partition_point(|b| b.span.start <= from);
+    idx.checked_sub(1).map_or(0, |i| blocks[i].span.start)
 }
 
 pub fn compute(
     nodes: &[Node],
+    blocks: &[Block],
     text: &TextBuffer,
     viewport: Range<usize>,
     selections: &[(usize, usize)],
@@ -217,10 +199,8 @@ pub fn compute(
 ) -> Vec<Decoration> {
     let mut out = Vec::new();
     // Viewport window over the overlay — O(window + log n) node filtering
-    // plus the `blank_line_floor` byte scan: O(distance to the previous
-    // blank line), which degrades to O(doc) on a document with no blank
-    // line above the viewport (see `blank_line_floor`) — NOT a linear scan
-    // of every node per call. `nodes` is sorted by `extent.start`
+    // plus the O(log blocks) `block_floor` lookup, NOT a linear scan of
+    // every node per call. `nodes` is sorted by `extent.start`
     // (`parse_document` stable-sorts; the editor's tail/incremental splice
     // paths preserve the order), so the window END is a plain
     // `partition_point`. The START cannot be: a node may begin BEFORE the
@@ -230,28 +210,23 @@ pub fn compute(
     // three lines) overlapping, but the per-line quote node of line two
     // (later start, no overlap) sits between it and the viewport, so
     // "back-scan until the first non-overlapping node" would drop the
-    // strong. Instead the start is lower-bounded by a parser-wide
-    // invariant: NO node's extent spans a blank (whitespace-only) line —
-    // line-oriented kinds (headings, quote/fence/code lines, markers,
-    // breaks) are single-line by construction, and inline kinds live inside
-    // one leaf block (paragraph/heading/table row), which a blank line
-    // always terminates. Every node overlapping the viewport therefore
-    // starts at/after the last blank line at/before `viewport.start`
-    // (anything starting earlier and ending inside the viewport would
-    // contain that whole blank line). Both bounds are asserted in debug
-    // builds, so every debug test run enforces the invariants this
-    // windowing relies on.
+    // strong. Instead the start is lower-bounded by the parser-wide
+    // invariant `block_floor` documents: no node's extent crosses a
+    // top-level block start, so every node overlapping the viewport starts
+    // at/after `viewport.start`'s own block's start. Both bounds are
+    // asserted in debug builds, so every debug test run enforces the
+    // invariants this windowing relies on.
     debug_assert!(
         nodes.windows(2).all(|w| w[0].extent.start <= w[1].extent.start),
         "compute requires the overlay sorted by extent.start"
     );
-    let floor = blank_line_floor(text, viewport.start);
+    let floor = block_floor(blocks, viewport.start);
     let lo = nodes.partition_point(|n| n.extent.start < floor);
     let hi = nodes.partition_point(|n| n.extent.start < viewport.end);
     debug_assert!(
         nodes[..lo].iter().all(|n| n.extent.end <= viewport.start),
         "windowing floor violated: a node below the floor overlaps the \
-         viewport (some extent spans a blank line?)"
+         viewport (some extent crosses a top-level block start?)"
     );
     for node in &nodes[lo..hi] {
         // Half-open overlap with the viewport. Most nodes have non-empty

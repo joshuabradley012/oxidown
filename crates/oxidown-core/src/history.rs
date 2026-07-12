@@ -43,6 +43,13 @@ use crate::text::ByteSplice;
 
 pub const COALESCE_WINDOW_MS: f64 = 500.0;
 
+/// Maximum retained undo depth (contract v0.3 consolidation): the undo
+/// stack holds at most this many units; recording past the cap drops the
+/// OLDEST unit. The JS mock pins the identical constant. The redo stack
+/// needs no cap of its own — it is only ever fed by `undo()` pops, so its
+/// depth is bounded by the undo stack's.
+pub const MAX_UNDO_DEPTH: usize = 100;
+
 #[derive(Debug)]
 pub struct UndoUnit {
     /// Inverse splices in the coordinates of the doc state where this unit is
@@ -122,12 +129,28 @@ impl History {
             }
         }
 
-        self.undo.push(UndoUnit {
+        self.push_capped(UndoUnit {
             inverse,
             coalesce_last_ms: (eligible && forward_single.is_some()).then_some(now_ms),
             stream_id: None,
         });
         self.break_next = false;
+    }
+
+    /// Push onto the undo stack, enforcing [`MAX_UNDO_DEPTH`] by dropping
+    /// the OLDEST unit (`Vec::remove(0)` — O(depth), bounded by the cap).
+    /// Dropping the bottom unit disturbs neither coalescing (which only
+    /// ever touches the TOP unit) nor stream-append merging (which locates
+    /// its unit by `stream_id` at record time — a stream unit old enough to
+    /// fall off the cap simply gets a fresh unit on the next append, the
+    /// same recovery path as a stream unit undone away). A dropped unit's
+    /// inverse referenced a document state that undoing can no longer
+    /// reach, so nothing else needs rewriting.
+    fn push_capped(&mut self, unit: UndoUnit) {
+        self.undo.push(unit);
+        if self.undo.len() > MAX_UNDO_DEPTH {
+            self.undo.remove(0);
+        }
     }
 
     /// Record a stream append: a pure insertion of `len` bytes at `at`
@@ -159,7 +182,7 @@ impl History {
             .iter()
             .rposition(|u| u.stream_id == Some(stream_id))
         else {
-            self.undo.push(UndoUnit {
+            self.push_capped(UndoUnit {
                 inverse: vec![ByteSplice {
                     at,
                     delete: len,
@@ -263,7 +286,7 @@ impl History {
     /// unit per stream session, not immunity from the user unwinding the
     /// stream mid-flight and then diverging.
     pub fn push_undo_unit(&mut self, inverse: Vec<ByteSplice>, stream_id: Option<u64>) {
-        self.undo.push(UndoUnit {
+        self.push_capped(UndoUnit {
             inverse,
             coalesce_last_ms: None,
             stream_id,

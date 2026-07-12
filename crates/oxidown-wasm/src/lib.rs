@@ -38,7 +38,11 @@
 //! via `convert_splices`/`convert_selections`: the mock's integer check
 //! ("InvalidPayload: malformed ...") first, then over-u32 and past-doc-end
 //! values flow to the ordinary OutOfBounds bounds check — never a serde
-//! range error, never a silent 32-bit truncation. The constructor installs
+//! range error, never a silent 32-bit truncation. Numeric values quoted in
+//! boundary error messages format as JS `${v}` prints them (`js_num`), so
+//! message parity with the mock holds at the extremes: >= 1e21 uses the
+//! `1e+21` exponential form, and 2^64 never misprints as the saturated
+//! u64::MAX that `check_arg`'s cast produces. The constructor installs
 //! `console_error_panic_hook` so any core panic surfaces its message on the
 //! JS console instead of an opaque `RuntimeError: unreachable`.
 //!
@@ -77,15 +81,61 @@ fn core_err(e: CoreError) -> JsError {
     JsError::new(&e.to_string())
 }
 
+/// Format an `f64` exactly as JS `${v}` would print it — every boundary
+/// error message that embeds a caller-supplied number goes through this, so
+/// message parity with the mock (whose template literals get JS formatting
+/// for free) holds at the extremes. Rust's `Display` produces the same
+/// shortest-round-trip digits as JS but NEVER switches notation, so the two
+/// only disagree where JS goes exponential:
+/// - magnitude >= 1e21: JS prints `1e+21`; Rust `Display` would print the
+///   21-zero digit string. Rust's `LowerExp` emits the same mantissa digits
+///   with a sign-less positive exponent (`1e21`), so inserting the `+`
+///   reproduces JS exactly.
+/// - 0 < magnitude < 1e-6: JS prints `1e-7`; `LowerExp` already matches
+///   (negative exponents carry their `-`). Only reachable from messages
+///   quoting a NON-integral refused value, but those quote it verbatim too.
+/// - non-finite: both spell `NaN` the same, but JS prints `Infinity`, not
+///   Rust's `inf`.
+fn js_num(v: f64) -> String {
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return (if v < 0.0 { "-Infinity" } else { "Infinity" }).to_string();
+    }
+    if v.abs() >= 1e21 {
+        // The exponent is always >= 21 here, so the bare `e` is always
+        // followed by the positive exponent that needs JS's explicit `+`.
+        return format!("{v:e}").replace('e', "e+");
+    }
+    if v == 0.0 {
+        // Covers negative zero: JS `${-0}` is "0", Rust Display is "-0".
+        return "0".to_string();
+    }
+    if v.abs() < 1e-6 {
+        return format!("{v:e}");
+    }
+    format!("{v}")
+}
+
 /// Validate an `f64` boundary argument (position/level/id): it must be
 /// finite, integral, and non-negative — `as` casts would otherwise silently
 /// saturate NaN/negatives to 0 and quietly truncate fractions. Returns the
 /// "InvalidArgs: ..." message on failure (a plain `String` so native unit
 /// tests can exercise it without constructing a `JsError` off-wasm).
+///
+/// The returned `u64` SATURATES at 2^64 (float `as` int is a saturating
+/// cast): safe for comparisons that only need "huge stays huge" (a saturated
+/// id/revision can never collide with a real one, which counts up from 0),
+/// but NEVER format it into an error message — quote the raw `f64` via
+/// `js_num` instead, or the message names `18446744073709551615` where the
+/// caller passed `18446744073709552000` (2^64) and the mock echoes the
+/// latter.
 fn check_arg(v: f64, what: &str) -> Result<u64, String> {
     if !v.is_finite() || v.fract() != 0.0 || v < 0.0 {
         return Err(format!(
-            "InvalidArgs: {what} must be a non-negative integer, got {v}"
+            "InvalidArgs: {what} must be a non-negative integer, got {}",
+            js_num(v)
         ));
     }
     Ok(v as u64)
@@ -103,11 +153,14 @@ const MAX_POS: u64 = u32::MAX as u64;
 
 /// The core's OutOfBounds message (`CoreError::OutOfBounds` Display),
 /// reproduced verbatim for positions too large to fit the `usize` the
-/// `CoreError` variant carries on wasm32. `pos` stays `f64` so the value
-/// formats exactly as the caller sent it (integral f64s print digits-only,
-/// matching the mock's JS `${pos}`).
+/// `CoreError` variant carries on wasm32. `pos` stays `f64` and is formatted
+/// as JS `${pos}` (`js_num`) so the value prints exactly as the caller sent
+/// it — digits below 1e21, the mock's `1e+21` exponential form above.
 fn oob_msg(pos: f64, doc_len: usize) -> String {
-    format!("OutOfBounds: position {pos} beyond document length {doc_len} (UTF-16 code units)")
+    format!(
+        "OutOfBounds: position {} beyond document length {doc_len} (UTF-16 code units)",
+        js_num(pos)
+    )
 }
 
 /// Position flavor of `check_arg`: additionally rejects integers above
@@ -124,20 +177,35 @@ fn check_pos(v: f64, what: &str, doc_len: usize) -> Result<usize, String> {
     Ok(n as usize)
 }
 
-/// `check_pos` for a query range (`decorations` / `compositionBegin`), with
-/// the mock/core's shared error precedence when an endpoint exceeds
-/// `u32::MAX`: malformed numbers first, then `InvalidRange` when
-/// `from > to`, otherwise OutOfBounds reported on `to` (`to >= from`, so
-/// `to` is over-u32 and is the position the bounds check names).
+/// `check_pos` for a query range (`decorations` / `compositionBegin`),
+/// fronting the mock's FULL validation order (mock-core.ts `decorations` /
+/// `compositionBegin`): malformed `from` → malformed `to` → `InvalidRange`
+/// when `from > to` → OutOfBounds on `to` when it exceeds the document.
+/// The core re-checks range/bounds for values that reach it, but this layer
+/// cannot defer to those re-checks: `decorations` parses its selections
+/// payload BEFORE calling the core, and the mock validates selections LAST —
+/// deferring would let a malformed selections payload preempt an invalid
+/// range (probe-confirmed divergence, pinned by the S6 probes in
+/// wasm-core-boundary.test.ts: `decorations(rev, 9, 2, [{anchor:-1,head:0}])`
+/// must be InvalidRange, not InvalidPayload). Comparisons use the RAW f64s
+/// (exact for integral values; the checked u64s saturate at 2^64), and the
+/// bounds check subsumes the u32 ceiling `check_pos` guards — `doc_len`
+/// always fits u32, so every over-u32 endpoint is beyond the document.
 fn check_query_range(from: f64, to: f64, doc_len: usize) -> Result<(usize, usize), String> {
     let f = check_arg(from, "from")?;
     let t = check_arg(to, "to")?;
-    if f > MAX_POS || t > MAX_POS {
-        if f > t {
-            return Err(format!("InvalidRange: from {from} > to {to}"));
-        }
+    if from > to {
+        return Err(format!(
+            "InvalidRange: from {} > to {}",
+            js_num(from),
+            js_num(to)
+        ));
+    }
+    if to > doc_len as f64 {
         return Err(oob_msg(to, doc_len));
     }
+    // from <= to <= doc_len <= u32::MAX here, so both casts are exact on
+    // wasm32's 32-bit usize.
     Ok((f as usize, t as usize))
 }
 
@@ -164,15 +232,17 @@ fn convert_splices(splices: Vec<SpliceIn>, doc_len: usize) -> Result<Vec<Splice>
         if !payload_num_ok(s.at) || !payload_num_ok(s.delete) {
             return Err(format!(
                 "InvalidPayload: malformed splices: splice #{i} has at={} delete={}",
-                s.at, s.delete
+                js_num(s.at),
+                js_num(s.delete)
             ));
         }
         let end = s.at + s.delete;
         if i > 0 && s.at < prev_end {
             return Err(format!(
                 "InvalidSplice: splice #{i}: splices must be ascending and non-overlapping \
-                 (at {} < previous end {prev_end})",
-                s.at
+                 (at {} < previous end {})",
+                js_num(s.at),
+                js_num(prev_end)
             ));
         }
         if end > doc_len as f64 {
@@ -201,7 +271,8 @@ fn convert_selections(
         if !payload_num_ok(s.anchor) || !payload_num_ok(s.head) {
             return Err(format!(
                 "InvalidPayload: malformed selections: anchor={} head={}",
-                s.anchor, s.head
+                js_num(s.anchor),
+                js_num(s.head)
             ));
         }
         let hi = s.anchor.max(s.head);
@@ -454,14 +525,21 @@ impl OxidownCore {
         // call (stale AND malformed payload) must be StaleRevision on both
         // cores — opposite handling classes otherwise (desync-resync vs
         // consumed no-op).
-        let base_revision = arg(base_revision, "baseRevision")?;
+        let requested = arg(base_revision, "baseRevision")?;
         let current = self.inner.revision();
-        if base_revision != current {
-            return Err(core_err(CoreError::StaleRevision {
-                current,
-                requested: base_revision,
-            }));
+        if requested != current {
+            // CoreError::StaleRevision's Display, reproduced with the RAW
+            // f64: `requested` saturates at 2^64 (see check_arg) — the
+            // variant's u64 would misname the revision the caller actually
+            // passed, while js_num prints it as the mock's `${revision}`
+            // does at every extreme. (The saturated value still compares
+            // correctly: real revisions count up from 0 and never reach it.)
+            return Err(JsError::new(&format!(
+                "StaleRevision: core is at revision {current}, caller passed {}",
+                js_num(base_revision)
+            )));
         }
+        let base_revision = requested;
         let splices: Vec<SpliceIn> = from_js(&splices, "splices")?;
         let core_splices = convert_splices(splices, self.inner.doc_len_utf16())
             .map_err(|msg| JsError::new(&msg))?;
@@ -497,17 +575,24 @@ impl OxidownCore {
     ) -> Result<JsValue, JsError> {
         // Validation order mirrors the mock (mock-core.ts `decorations`):
         // malformed revision → staleness → malformed from/to → range →
-        // bounds → selections payload. The core re-checks staleness/range/
-        // bounds for values a 32-bit usize can represent; this layer fronts
-        // the checks it cannot pass through.
-        let revision = arg(revision, "revision")?;
+        // bounds → selections payload. EVERY check ahead of the selections
+        // payload is fronted here in full (not deferred to the core's own
+        // re-checks), because the payload is parsed before the core call —
+        // deferring range/bounds would let a malformed selections payload
+        // preempt an invalid range, diverging from the mock (pinned by the
+        // S6 probes in wasm-core-boundary.test.ts).
+        let requested = arg(revision, "revision")?;
         let current = self.inner.revision();
-        if revision != current {
-            return Err(core_err(CoreError::StaleRevision {
-                current,
-                requested: revision,
-            }));
+        if requested != current {
+            // Raw-f64 message for the same reason as apply_edit's staleness
+            // check: `requested` saturates at 2^64; js_num matches the
+            // mock's `${revision}` at every extreme.
+            return Err(JsError::new(&format!(
+                "StaleRevision: core is at revision {current}, caller passed {}",
+                js_num(revision)
+            )));
         }
+        let revision = requested;
         let (from, to) = self.query_range(from, to)?;
         let selections: Vec<SelectionIn> = from_js(&selections, "selections")?;
         let sels = convert_selections(selections, self.inner.doc_len_utf16())
@@ -621,10 +706,15 @@ impl OxidownCore {
                 // level → pos document bounds (`setHeadingCmd` validates the
                 // level before `checkDocPos`).
                 arg(a, "pos")?;
-                let level = arg(need_b("a heading level")?, "level")?;
+                let level_raw = need_b("a heading level")?;
+                let level = arg(level_raw, "level")?;
                 if level > 6 {
+                    // `level` saturates at 2^64 (still > 6, so the check
+                    // itself is unaffected); the message quotes the raw f64
+                    // like the mock's `${level}`.
                     return Err(JsError::new(&format!(
-                        "InvalidArgs: setHeading level must be an integer 0..=6, got {level}"
+                        "InvalidArgs: setHeading level must be an integer 0..=6, got {}",
+                        js_num(level_raw)
                     )));
                 }
                 Command::SetHeading {
@@ -658,10 +748,21 @@ impl OxidownCore {
     /// closed ids.
     #[wasm_bindgen(js_name = streamAppend)]
     pub fn stream_append(&mut self, id: f64, chunk: &str) -> Result<JsValue, JsError> {
-        let change = self
-            .inner
-            .stream_append(arg(id, "id")?, chunk)
-            .map_err(core_err)?;
+        let id_u = arg(id, "id")?;
+        // An id at/above 2^64 saturates in check_arg's u64 (see its doc):
+        // it can never have been issued (stream ids count up from 0), so it
+        // is necessarily unknown — front the core's own UnknownStream here
+        // with the RAW value, where the core's u64-carrying variant would
+        // misquote the saturated u64::MAX and the mock echoes the caller's
+        // number. (`u64::MAX as f64` rounds UP to exactly 2^64, the first
+        // value that saturates.)
+        if id >= u64::MAX as f64 {
+            return Err(JsError::new(&format!(
+                "UnknownStream: stream {} is unknown or already closed",
+                js_num(id)
+            )));
+        }
+        let change = self.inner.stream_append(id_u, chunk).map_err(core_err)?;
         change_to_js(Some(change))
     }
 
@@ -758,6 +859,60 @@ mod wire_format {
     #[test]
     fn empty_batch_is_an_empty_array() {
         assert_eq!(decorations_json_string(&[]), "[]");
+    }
+}
+
+#[cfg(test)]
+mod js_number_format {
+    //! `js_num` pins boundary error messages to JS `${v}` formatting at the
+    //! extremes — the mock gets this for free from template literals, so
+    //! message parity depends on it. The load-bearing cases: 2^64 (where
+    //! check_arg's u64 saturates — the message must still quote the caller's
+    //! number) and >= 1e21 (where JS switches to `1e+21` exponential form
+    //! but Rust's `Display` never does).
+
+    use super::js_num;
+
+    #[test]
+    fn ordinary_integers_print_digits_like_js() {
+        assert_eq!(js_num(0.0), "0");
+        assert_eq!(js_num(-0.0), "0"); // JS `${-0}` is "0"
+        assert_eq!(js_num(1.0), "1");
+        assert_eq!(js_num(4096.0), "4096");
+        assert_eq!(js_num(-3.0), "-3");
+        assert_eq!(js_num(1.5), "1.5");
+        // 2^53 and above: still digits in JS (exponential starts at 1e21),
+        // and Rust's shortest-round-trip digits match JS's exactly.
+        assert_eq!(js_num(9007199254740992.0), "9007199254740992");
+        assert_eq!(js_num(4294967302.0), "4294967302");
+    }
+
+    #[test]
+    fn two_to_the_64_prints_the_callers_number_not_the_saturated_u64() {
+        // JS `${2**64}` — NOT u64::MAX's 18446744073709551615, which is what
+        // a message formatting check_arg's saturated u64 would name.
+        assert_eq!(js_num(18446744073709551616.0), "18446744073709552000");
+    }
+
+    #[test]
+    fn at_1e21_and_above_js_switches_to_exponential() {
+        assert_eq!(js_num(1e21), "1e+21");
+        assert_eq!(js_num(1e22), "1e+22");
+        assert_eq!(js_num(1.5e21), "1.5e+21");
+        assert_eq!(js_num(-1e21), "-1e+21");
+        // Largest finite f64: JS prints 1.7976931348623157e+308.
+        assert_eq!(js_num(f64::MAX), "1.7976931348623157e+308");
+        // Just below the threshold: digits.
+        assert_eq!(js_num(999999999999999900000.0), "999999999999999900000");
+    }
+
+    #[test]
+    fn tiny_magnitudes_and_non_finites_match_js_spellings() {
+        assert_eq!(js_num(1e-7), "1e-7"); // JS goes exponential below 1e-6
+        assert_eq!(js_num(0.000001), "0.000001"); // 1e-6 itself: digits
+        assert_eq!(js_num(f64::NAN), "NaN");
+        assert_eq!(js_num(f64::INFINITY), "Infinity"); // Rust Display: "inf"
+        assert_eq!(js_num(f64::NEG_INFINITY), "-Infinity");
     }
 }
 
@@ -893,11 +1048,22 @@ mod pos_validation {
             check_query_range(4294967296.0, 4294967302.0, 3).unwrap_err(),
             "OutOfBounds: position 4294967302 beyond document length 3 (UTF-16 code units)"
         );
-        // In-u32-range values pass through untouched — staleness/range/
-        // bounds for these stay the core's job.
+        // IN-u32-range violations are fronted too (S6): the core would catch
+        // them, but only AFTER `decorations` parses its selections payload —
+        // the mock checks range, then bounds, then selections.
+        assert_eq!(
+            check_query_range(9.0, 2.0, 11).unwrap_err(),
+            "InvalidRange: from 9 > to 2"
+        );
+        assert_eq!(
+            check_query_range(0.0, 99.0, 11).unwrap_err(),
+            "OutOfBounds: position 99 beyond document length 11 (UTF-16 code units)"
+        );
+        // Valid ranges pass through; `to == doc_len` is in bounds (the range
+        // is half-open).
         assert_eq!(check_query_range(2.0, 9.0, 11), Ok((2, 9)));
-        assert_eq!(check_query_range(9.0, 2.0, 11), Ok((9, 2)));
-        assert_eq!(check_query_range(0.0, 99.0, 11), Ok((0, 99)));
+        assert_eq!(check_query_range(0.0, 11.0, 11), Ok((0, 11)));
+        assert_eq!(check_query_range(0.0, 0.0, 0), Ok((0, 0)));
     }
 }
 

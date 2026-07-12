@@ -21,6 +21,7 @@ export {
   applyCoreChange,
   changesToSplices,
   endOfLastSplice,
+  sanitizeSurrogates,
 } from "./extension.js";
 export type { OxidownOptions } from "./extension.js";
 

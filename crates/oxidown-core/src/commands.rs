@@ -10,6 +10,19 @@
 //! ## Toggle semantics (contract-open decisions, documented here and in the
 //! crate README)
 //!
+//! * **Whitespace trimming (all kinds but code)**: a NON-EMPTY range first
+//!   trims `from` forward and `to` backward over the pinned whitespace set
+//!   ([`is_toggle_ws`]) — a delimiter placed against a whitespace edge
+//!   violates CommonMark's flanking rules (`"a b"` + toggleStrong 0..2
+//!   emitted `**a **b`, which parses as no strong at all, and a re-toggle
+//!   over the returned selection stacked `****a ****b`). Every rule below
+//!   (the block-boundary guard included) then operates on the trimmed
+//!   range. A range that trims to nothing (whitespace-only selection) means
+//!   the toggle doesn't apply: `Ok(None)`, no mutation, no burned revision.
+//!   Cursor ranges (`from == to`) are untouched — the empty-pair insertion
+//!   below is flanking-safe, since the pair only parses once content is
+//!   typed between the delimiters. Code spans have no flanking rules, so
+//!   toggleCode keeps its exact range.
 //! * **OFF (strip)** when a node of the toggled kind's *closed extent fully
 //!   contains* the range — the innermost such node when several nest
 //!   (`_a *b* c_` + toggleEm inside `b` unwraps `*b*`, not the outer `_…_`).
@@ -57,8 +70,14 @@
 //! `None` on code blocks/fences, lists, tables, HTML blocks, thematic
 //! breaks, blank lines, and setext headings (whose "delimiter" is the
 //! following underline, not a leading-hash run this command rewrites).
-//! Inside a blockquote the hashes go after the line's `> ` markers. Level 0
-//! removes an existing hash prefix (`None` if there isn't one).
+//! Inside a blockquote the hashes go after the line's `> ` markers — and the
+//! SAME block gate applies to what sits after those markers: a quote-nested
+//! list item or thematic break (constructs the overlay records per line) is
+//! refused exactly like its top-level counterpart (`"> - item"` → `None`;
+//! the BlockKind gate alone only sees the top-level BlockQuote and would
+//! have written hashes into the item's line). Level 0 removes an existing
+//! heading's delimiter spans — ALL of them, an ATX closing hash run
+//! included (`"# foo #"` → `"foo"`); `None` if there is no heading.
 //!
 //! ## toggleTask
 //!
@@ -377,6 +396,86 @@ fn single_leaf_block(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize)
     true
 }
 
+/// The inline-toggle whitespace set (contract v0.3 consolidation, pinned
+/// byte-for-byte against the JS mock's implementation of the same rule):
+/// U+0009, U+000A, U+000C, U+000D, U+0020, U+00A0, U+1680, U+2000–U+200A,
+/// U+2028, U+2029, U+202F, U+205F, U+3000. Deliberately NOT Rust's
+/// `char::is_whitespace()` (which also matches U+0085) and not JS `\s`
+/// (which also matches U+FEFF) — the two disagree exactly there, and the
+/// cross-core conformance suite pins this explicit set on both sides.
+fn is_toggle_ws(cp: u32) -> bool {
+    matches!(
+        cp,
+        0x09 | 0x0A
+            | 0x0C
+            | 0x0D
+            | 0x20
+            | 0xA0
+            | 0x1680
+            | 0x2000..=0x200A
+            | 0x2028
+            | 0x2029
+            | 0x202F
+            | 0x205F
+            | 0x3000
+    )
+}
+
+/// Decode the UTF-8 scalar starting at `i`: `(code point, byte length)`, or
+/// `None` past the document's end. `i` must sit on a char boundary — every
+/// toggle endpoint is a validated UTF-16 conversion, and trimming only ever
+/// steps by whole decoded scalars.
+fn scalar_at(src: &SrcBytes, i: usize) -> Option<(u32, usize)> {
+    let b0 = src.get(i)?;
+    match b0 {
+        0x00..=0x7F => Some((u32::from(b0), 1)),
+        0xC0..=0xDF => Some((
+            (u32::from(b0 & 0x1F) << 6) | u32::from(src.get(i + 1)? & 0x3F),
+            2,
+        )),
+        0xE0..=0xEF => Some((
+            (u32::from(b0 & 0x0F) << 12)
+                | (u32::from(src.get(i + 1)? & 0x3F) << 6)
+                | u32::from(src.get(i + 2)? & 0x3F),
+            3,
+        )),
+        // 4-byte lead: an astral scalar (>= U+10000). Never in the WS set,
+        // and the exact value is irrelevant here — only that trimming stops
+        // at it — so a sentinel above the BMP suffices. (Continuation bytes
+        // can't reach this arm: `i` is a char boundary.)
+        _ => Some((0x10000, 4)),
+    }
+}
+
+/// Trim `[from_b, to_b]` inward over [`is_toggle_ws`] — the flanking-safety
+/// rule of the module doc's "Toggle semantics". Both endpoints sit on char
+/// boundaries; the backward step scans to the previous lead byte (at most 3
+/// continuation bytes) and decodes forward from there.
+fn trim_flanking_ws(src: &SrcBytes, mut from_b: usize, mut to_b: usize) -> (usize, usize) {
+    while from_b < to_b {
+        let Some((cp, len)) = scalar_at(src, from_b) else {
+            break;
+        };
+        if !is_toggle_ws(cp) {
+            break;
+        }
+        from_b += len;
+    }
+    while to_b > from_b {
+        let mut lead = to_b - 1;
+        while lead > from_b && src.byte(lead) & 0xC0 == 0x80 {
+            lead -= 1;
+        }
+        match scalar_at(src, lead) {
+            // `lead + len == to_b` re-checks the decode's consistency with
+            // the boundary invariant; a mismatch stops rather than corrupts.
+            Some((cp, len)) if is_toggle_ws(cp) && lead + len == to_b => to_b = lead,
+            _ => break,
+        }
+    }
+    (from_b, to_b)
+}
+
 pub fn toggle_inline(
     nodes: &[Node],
     src: &SrcBytes,
@@ -384,6 +483,21 @@ pub fn toggle_inline(
     from_b: usize,
     to_b: usize,
 ) -> Result<Option<CommandPlan>, CoreError> {
+    // Flanking-safety trim (module doc, "Toggle semantics"): trim BEFORE
+    // any planning or guard, so OFF/EXTEND detection and the block guard
+    // all see the trimmed range; a whitespace-only selection trims to
+    // nothing and the toggle simply doesn't apply. Cursor ranges pass
+    // through untouched, and code spans keep their exact range (no
+    // flanking rules for code).
+    let (from_b, to_b) = if kind == InlineKind::Code || from_b == to_b {
+        (from_b, to_b)
+    } else {
+        let (f, t) = trim_flanking_ws(src, from_b, to_b);
+        if f == t {
+            return Ok(None); // whitespace-only selection: doesn't apply
+        }
+        (f, t)
+    };
     // Block-boundary guard (see `single_leaf_block`): a selection spanning
     // more than one leaf block errors instead of planning — the wrapped
     // text could never parse as one inline node, and a re-toggle would
@@ -601,6 +715,23 @@ pub fn set_heading(
     }) {
         return None;
     }
+    // Blockquote-nested block gate (module doc, "setHeading"): the BlockKind
+    // gate below only sees the TOP-LEVEL block, so a list item or thematic
+    // break nested inside a quote would slip through it and get hashes
+    // written into its line (`"> - item"` + level 1 produced `"> # - item"`,
+    // a heading swallowing the marker). Refused the same way as their
+    // top-level counterparts: `None`, no burned revision. The overlay lookup
+    // binary-searches this line's node window, like `quote_context`.
+    {
+        let lo = nodes.partition_point(|n| n.extent.start < line.start);
+        let hi = nodes.partition_point(|n| n.extent.start < line.end);
+        if nodes[lo..hi]
+            .iter()
+            .any(|n| matches!(n.kind, NodeKind::ListMarker { .. } | NodeKind::ThematicBreak))
+        {
+            return None;
+        }
+    }
     // Inside a blockquote the hashes go after this line's `> ` markers.
     let after_quote = nodes
         .iter()
@@ -642,9 +773,12 @@ pub fn set_heading(
 
     let batch = match (existing, level) {
         (None, 0) => return None, // nothing to remove
-        (Some(_), 0) => {
-            let d = existing.unwrap().delims[0].clone();
-            vec![del(&d)]
+        (Some(node), 0) => {
+            // Level 0 deletes ALL delimiter spans — an ATX closing hash run
+            // included (`"# foo #"` → `"foo"`, not `"foo #"`). Delimiter
+            // spans are position-ordered (opening run first), so the batch
+            // is ascending as the apply path requires.
+            node.delims.iter().map(del).collect()
         }
         (Some(node), n) => {
             let d = node.delims[0].clone();

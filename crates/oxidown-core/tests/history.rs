@@ -60,6 +60,35 @@ fn undo_redo_roundtrip_single_edit() {
 }
 
 #[test]
+fn undo_depth_caps_at_100_units_dropping_the_oldest() {
+    // 101 never-coalescing units (paste origin): recording the 101st drops
+    // the FIRST unit; the surviving 100 undo in exact reverse order
+    // (mirror-verified) and the dropped unit's edit is permanent.
+    let mut ed = Editor::new(1);
+    let mut rev = ed.load("");
+    let mut text = String::new();
+    let mut snapshots = vec![text.clone()];
+    for i in 0..101 {
+        let s = format!("{i},");
+        let at = ed.doc_len_utf16();
+        rev = ed.apply_edit(rev, &ins(at, &s), EditOrigin::Paste, i as f64).unwrap();
+        text.push_str(&s);
+        snapshots.push(text.clone());
+    }
+    assert_eq!(ed.history_depths().0, 100, "depth capped at MAX_UNDO_DEPTH");
+
+    let mut mirror = ed.get_text();
+    for expect in snapshots[1..101].iter().rev() {
+        let u = ed.undo().unwrap();
+        apply_to_mirror(&mut mirror, &u.splices);
+        assert_eq!(&ed.get_text(), expect, "units undo newest-first, order preserved");
+        assert_eq!(&mirror, expect);
+    }
+    assert!(ed.undo().is_none(), "unit #1 fell off the cap: nothing left to undo");
+    assert_eq!(ed.get_text(), "0,", "the oldest unit's edit is permanent");
+}
+
+#[test]
 fn undo_empty_stack_returns_none() {
     let mut ed = Editor::new(1);
     ed.load("x");

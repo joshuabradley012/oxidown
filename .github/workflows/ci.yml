@@ -34,10 +34,21 @@ jobs:
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Perf smoke test (informational, non-fatal)
+      # perf_smoke and stream_perf assert only loose ceilings (5-30x the
+      # contract budget), sized to absorb shared-runner noise — they gate:
+      # an order-of-magnitude regression fails CI, wall-time jitter does not.
+      # perf_baseline additionally carries tight (<1ms-scale) local trip-wires
+      # that WOULD flake on shared runners, so it stays informational.
+      - name: Perf gate (loose ceilings; perf_smoke + stream_perf)
         run: |
-          echo "::group::perf smoke (--ignored, release, non-fatal)"
-          cargo test --release -p oxidown-core -- --ignored --nocapture || true
+          echo "::group::perf gate (--ignored, release)"
+          cargo test --release -p oxidown-core --test perf_smoke --test stream_perf -- --ignored --nocapture
+          echo "::endgroup::"
+
+      - name: Perf baseline (informational, non-fatal)
+        run: |
+          echo "::group::perf baseline (--ignored, release, non-fatal)"
+          cargo test --release -p oxidown-core --test perf_baseline -- --ignored --nocapture || true
           echo "::endgroup::"
 
   wasm:

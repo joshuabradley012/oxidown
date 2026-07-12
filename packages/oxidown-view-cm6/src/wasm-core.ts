@@ -1,54 +1,31 @@
 /**
- * ADAPTER STUB for the real Rust/wasm core — ALL GUESSING IS ISOLATED IN THIS
- * FILE. The orchestrator will reconcile this with the actual wasm-bindgen API
- * once `crates/oxidown-wasm` builds.
+ * Adapter for the real Rust/wasm core: wraps the wasm-bindgen `OxidownCore`
+ * class from `crates/oxidown-wasm` (built with wasm-pack `--target web`,
+ * out-dir `pkg`) behind the boundary protocol's `OxidownCore` interface.
+ * The crate's method surface (crates/oxidown-wasm/src/lib.rs) matches the
+ * protocol 1:1 — snake_case Rust methods are exported camelCase via
+ * `js_name` — with three deliberate divergences this adapter papers over:
  *
- * Assumed wasm-pack output (`--target web`, out-dir `pkg`):
- *   - module `crates/oxidown-wasm/pkg/oxidown_wasm.js`
- *   - default export = async init function (instantiates the .wasm)
- *   - an exported class named `OxidownCore` (or `WasmCore` / `Core`) with a
- *     zero-arg constructor and methods matching the boundary protocol's names
- *     (wasm-bindgen camelCases snake_case Rust methods, or the crate uses
- *     `js_name` to the same effect):
- *       load(text: string): number
- *       applyEdit(baseRevision: number, splices: JsValue /* Splice[] *\/, origin: string): number
- *       undo(): CoreChange | null | undefined
- *       redo(): CoreChange | null | undefined
- *       decorations(revision, from, to, selections: JsValue): Decoration[]
- *       compositionBegin(from: number, to: number): void
- *       compositionEnd(): void
- *       getText(): string
- *       docLength(): number
- *       revision(): number
+ *   - `command(name: string, a: number, b?: number)`: TS's overloaded
+ *     `command(name, from, to)` / `(name, pos, level)` / `(name, pos)`
+ *     signatures don't exist at the JS/wasm-bindgen call boundary; the crate
+ *     exports ONE method taking the variant's positional args with the
+ *     trailing one optional, dispatched by `name` Rust-side.
+ *   - `streamClose(id): void`: the PROTOCOL's streamClose returns
+ *     `CoreChange | null` (the U+FFFD flush of a withheld surrogate); that
+ *     flush lives entirely in this adapter — the core never buffers, so it
+ *     never has a flush edit to return (see below).
+ *   - `undo`/`redo`/`resolveAnchor`/`command` may surface `undefined` where
+ *     the protocol says `null`; the adapter normalizes with `?? null`.
  *
- *   v0.2 (M1) additions — same guessing style, assumed camelCase 1:1 with the
- *   contract (docs/boundary-v0.md "v0.2 additions"):
- *       createAnchor(pos: number, bias: string): number
- *       resolveAnchor(id: number): number | null | undefined
- *       dropAnchor(id: number): void
- *       command(name: string, a: number, b?: number): CoreChange | null | undefined
- *         — TS's overloaded `command(name, from, to)` / `command(name,
- *           pos, level)` / `command(name, pos)` signatures don't exist at
- *           the JS/wasm-bindgen call boundary; we ASSUME the exported Rust
- *           fn is a single method taking the variant's positional args with
- *           the trailing one optional (`b?`), dispatched by `name` Rust-side.
- *           If the real crate instead exports one method per command name
- *           (`toggleStrong`, `setHeading`, ...), only this file's `command`
- *           wrapper needs to change.
- *       streamOpen(pos: number): number
- *       streamAppend(id: number, chunk: string): CoreChange
- *       streamClose(id: number): void
- *         — the PROTOCOL's streamClose returns `CoreChange | null` (the
- *           U+FFFD flush of a withheld surrogate); that flush lives entirely
- *           in this adapter (it forwards one final streamAppend and returns
- *           its CoreChange), so the wasm instance's own streamClose stays
- *           void.
- *
- *   splices/selections/decorations cross the boundary as one JSON string per
- *   call (`serde_json` Rust-side, `js_sys::JSON` JS-side — see the crate doc
- *   in crates/oxidown-wasm/src/lib.rs), so callers still see plain JS values;
- *   errors surface as thrown JS exceptions whose messages start with the
- *   error name ("StaleRevision: ...", "OutOfBounds: ...", "InvalidArgs: ...").
+ * Loading (`loadWasmCore`): the pkg module's default export is the async
+ * init function (instantiates the .wasm via fetch), and the class is the
+ * module's `OxidownCore` export. splices/selections/decorations cross the
+ * boundary as one JSON string per call (`serde_json` Rust-side,
+ * `js_sys::JSON` JS-side — see the crate doc), so callers still see plain
+ * JS values; errors surface as thrown JS exceptions whose messages start
+ * with the error name ("StaleRevision: ...", "OutOfBounds: ...",
+ * "InvalidArgs: ...").
  *
  * Adapter responsibilities beyond forwarding:
  *   - Unpaired-surrogate policy, enforced JS-SIDE before crossing the
@@ -61,10 +38,15 @@
  *     prepended to the next chunk, and `streamClose` flushes a still-pending
  *     one as U+FFFD before closing — RETURNING that flush's CoreChange (null
  *     when nothing was pending) so the view can apply it and stay in sync
- *     with the core document. A lone surrogate anywhere else in a
- *     chunk throws "InvalidPayload: ..."; the stream's buffer is cleared
- *     whenever an append throws, and ALL streams' buffers are cleared by
- *     `load` (the core clears its streams then, and the buffer must follow).
+ *     with the core document. `streamClose` itself NEVER throws: if the
+ *     flush append throws (only reachable when the stream is already dead
+ *     core-side, where there is no document to desync), the pending unit is
+ *     dropped and the close still runs — the contract pins streamClose as a
+ *     no-op returning null on unknown/closed ids. A lone surrogate anywhere
+ *     else in a chunk throws "InvalidPayload: ..."; the stream's buffer is
+ *     cleared whenever an append throws, and ALL streams' buffers are
+ *     cleared by `load` (the core clears its streams then, and the buffer
+ *     must follow).
  *     `applyEdit` replicates the mock's malformed-baseRevision and staleness
  *     checks ahead of its surrogate check so the cross-core validation
  *     precedence (revision checks before payload checks) holds even though
@@ -200,7 +182,7 @@ export class StreamSurrogateBuffer {
   }
 }
 
-/** Method surface we expect on the wasm-bindgen class instance. */
+/** Method surface of the wasm-bindgen `OxidownCore` class instance (crates/oxidown-wasm/src/lib.rs). */
 interface WasmCoreInstance {
   /** wasm-bindgen's per-instance deallocator. */
   free(): void;
@@ -307,15 +289,24 @@ export function adaptWasmCore(inner: WasmCoreInstance): OxidownCore {
       // A still-pending high surrogate can never be completed: flush it as
       // U+FFFD (one final append) before closing, and RETURN the flush's
       // CoreChange so the caller can apply it to the view (dropping it would
-      // silently desync the core doc from the view by one code unit). Close
-      // even if the flush throws; null when nothing was pending.
+      // silently desync the core doc from the view by one code unit).
+      // streamClose itself NEVER throws (contract: a no-op returning null on
+      // unknown/closed ids): if the flush append throws, the only reachable
+      // cause is a stream already dead core-side (UnknownStream) — its
+      // U+FFFD never entered any document, so swallowing the error and
+      // returning null desyncs nothing. The pending unit is already gone
+      // (takeFlush always clears); the defensive clear() keeps that true
+      // even if takeFlush's contract ever changes. Close runs regardless.
       const flush = streamBuffer.takeFlush(id);
       let change: CoreChange | null = null;
-      try {
-        if (flush) change = inner.streamAppend(id, flush);
-      } finally {
-        inner.streamClose(id);
+      if (flush) {
+        try {
+          change = inner.streamAppend(id, flush);
+        } catch {
+          streamBuffer.clear(id);
+        }
       }
+      inner.streamClose(id);
       return change;
     },
 
@@ -346,13 +337,12 @@ export async function loadWasmCore(): Promise<OxidownCore | null> {
     } else if (typeof mod.init === "function") {
       await (mod.init as () => Promise<unknown>)();
     }
-    const CoreClass = (mod.OxidownCore ?? mod.WasmCore ?? mod.Core) as
-      | (new () => WasmCoreInstance)
-      | undefined;
+    // The crate's one class export (crates/oxidown-wasm/src/lib.rs
+    // `#[wasm_bindgen] pub struct OxidownCore`, constructor's replica_id
+    // defaults to 1 when omitted).
+    const CoreClass = mod.OxidownCore as (new () => WasmCoreInstance) | undefined;
     if (!CoreClass) {
-      console.warn(
-        "[oxidown] wasm pkg loaded but no OxidownCore/WasmCore/Core export found; falling back",
-      );
+      console.warn("[oxidown] wasm pkg loaded but has no OxidownCore export; falling back");
       return null;
     }
     return adaptWasmCore(new CoreClass());

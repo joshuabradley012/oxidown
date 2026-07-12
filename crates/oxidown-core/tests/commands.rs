@@ -219,11 +219,21 @@ fn selection_containing_formatted_node_absorbs_it() {
 
 #[test]
 fn adjacent_same_kind_node_merges() {
+    // Touching counts as overlap: the selection starts exactly AT the
+    // strong node's end (no whitespace between — a whitespace edge would
+    // trim off first, see the flanking-trim tests below).
+    let mut ed = Editor::new(1);
+    ed.load("**ab**cd");
+    run(&mut ed, Command::ToggleStrong { from: 6, to: 8 }).unwrap();
+    assert_eq!(ed.get_text(), "**abcd**", "touching counts as overlap");
+
+    // With a space at the selection's start, trimming moves `from` past it
+    // BEFORE touch detection (delimiters may never sit against whitespace):
+    // the existing node is no longer touched, so only "cd" wraps.
     let mut ed = Editor::new(1);
     ed.load("**ab** cd");
-    // Selection starting exactly at the strong node's end.
     run(&mut ed, Command::ToggleStrong { from: 6, to: 9 }).unwrap();
-    assert_eq!(ed.get_text(), "**ab cd**", "touching counts as overlap");
+    assert_eq!(ed.get_text(), "**ab** **cd**", "no merge across the trimmed space");
 }
 
 #[test]
@@ -538,6 +548,143 @@ fn toggle_range_normalized_and_validated() {
     assert_eq!(err.name(), "SurrogateSplit");
 }
 
+#[test]
+fn toggle_trims_whitespace_edges_and_double_toggle_stays_byte_identical() {
+    // "a b" toggled over "a " (0..2): the space trims off, delimiters land
+    // tight against content — never the flanking-violating `**a **b` that
+    // stacked `****a ****b` on retoggle.
+    let mut ed = Editor::new(1);
+    ed.load("a b");
+    let change = run(&mut ed, Command::ToggleStrong { from: 0, to: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "**a** b");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (2, 3), "selection covers the trimmed content");
+    // Retoggle over the returned selection: byte-identical round trip.
+    run(&mut ed, Command::ToggleStrong { from: sel.anchor, to: sel.head }).unwrap();
+    assert_eq!(ed.get_text(), "a b");
+
+    // Leading whitespace trims too, for every non-code kind.
+    let mut ed = Editor::new(1);
+    ed.load("a b");
+    run(&mut ed, Command::ToggleEm { from: 1, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "a *b*");
+    let mut ed = Editor::new(1);
+    ed.load("a b");
+    run(&mut ed, Command::ToggleStrike { from: 1, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "a ~~b~~");
+
+    // A selection swallowing a trailing softbreak trims it off.
+    let mut ed = Editor::new(1);
+    ed.load("ab\ncd");
+    run(&mut ed, Command::ToggleStrong { from: 0, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "**ab**\ncd");
+
+    // OFF detection sees the trimmed range too: selecting "**a** " (the
+    // trailing space included) unwraps rather than extending.
+    let mut ed = Editor::new(1);
+    ed.load("**a** b");
+    run(&mut ed, Command::ToggleStrong { from: 0, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "a b");
+
+    // Trimming runs BEFORE the multi-block guard: "a" plus the two
+    // terminators trims down to just "a" (single block), so this applies
+    // instead of throwing.
+    let mut ed = Editor::new(1);
+    ed.load("a\n\nb");
+    run(&mut ed, Command::ToggleStrong { from: 0, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "**a**\n\nb");
+
+    // toggleCode keeps its exact range (no flanking rules for code spans):
+    // "a " wraps as-is — the trailing space stays content, space-edged
+    // content padded per the existing rule.
+    let mut ed = Editor::new(1);
+    ed.load("a b");
+    run(&mut ed, Command::ToggleCode { from: 0, to: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "` a  `b", "code toggle does not trim");
+}
+
+#[test]
+fn toggle_whitespace_only_selection_does_not_apply() {
+    // Trimmed-to-empty selections: `Ok(None)`, no mutation, no burned
+    // revision — like any other doesn't-apply target. Cursor behavior
+    // (empty-pair insertion) is unaffected, pinned elsewhere.
+    for (doc, from, to) in [
+        ("a  b", 1, 3),   // plain spaces
+        ("a\tb", 1, 2),   // tab
+        ("a\n \nb", 1, 4), // whitespace spanning a blank line (trim precedes the guard)
+    ] {
+        let mut ed = Editor::new(1);
+        ed.load(doc);
+        let rev = ed.revision();
+        assert!(
+            ed.command(Command::ToggleStrong { from, to }).unwrap().is_none(),
+            "{doc:?} {from}..{to}"
+        );
+        assert_eq!(ed.get_text(), doc, "no mutation for {doc:?}");
+        assert_eq!(ed.revision(), rev, "no revision bump for {doc:?}");
+    }
+}
+
+#[test]
+fn toggle_trims_unicode_whitespace_and_keeps_astral_content() {
+    // NBSP (U+00A0) and ideographic space (U+3000) are in the pinned WS
+    // set; the astral 😀 is content, not whitespace. UTF-16 offsets.
+    let mut ed = Editor::new(1);
+    ed.load("a\u{00A0}\u{3000}b");
+    run(&mut ed, Command::ToggleStrong { from: 0, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "**a**\u{00A0}\u{3000}b");
+
+    // Trailing space after a surrogate-pair scalar trims; 😀 stays wrapped.
+    let mut ed = Editor::new(1);
+    ed.load("😀 x");
+    run(&mut ed, Command::ToggleStrong { from: 0, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "**😀** x");
+
+    // Em space + thin space (U+2003, U+2009): whitespace-only, no apply.
+    let mut ed = Editor::new(1);
+    ed.load("a\u{2003}\u{2009}b");
+    let rev = ed.revision();
+    assert!(ed.command(Command::ToggleEm { from: 1, to: 3 }).unwrap().is_none());
+    assert_eq!(ed.get_text(), "a\u{2003}\u{2009}b");
+    assert_eq!(ed.revision(), rev);
+}
+
+#[test]
+fn command_positions_splitting_a_crlf_pair_are_refused() {
+    // Contract: any command position argument falling between the '\r' and
+    // '\n' of a CRLF pair refuses with InvalidArgument and this EXACT
+    // message (byte-pinned across core and mock by the conformance suite).
+    let doc = "ab\r\ncd\r\n";
+    let mut ed = Editor::new(1);
+    ed.load(doc);
+    let rev = ed.revision();
+    for cmd in [
+        Command::ToggleStrong { from: 3, to: 6 },
+        Command::ToggleEm { from: 0, to: 3 },
+        Command::ToggleStrike { from: 3, to: 3 },
+        Command::ToggleCode { from: 3, to: 3 },
+        Command::SetHeading { pos: 3, level: 1 },
+        Command::ToggleTask { pos: 3 },
+        Command::IndentList { from: 3, to: 3 },
+        Command::OutdentList { from: 3, to: 3 },
+        Command::Enter { from: 3, to: 3 },
+    ] {
+        let err = ed.command(cmd).unwrap_err();
+        assert_eq!(err.name(), "InvalidArgument", "{cmd:?}");
+        assert_eq!(
+            err.to_string(),
+            "InvalidArgument: position 3 splits a CRLF sequence",
+            "{cmd:?}"
+        );
+        assert_eq!(ed.get_text(), doc, "no mutation for {cmd:?}");
+        assert_eq!(ed.revision(), rev, "no revision bump for {cmd:?}");
+    }
+    // Positions AT either side of the pair stay valid (2 = before '\r',
+    // 4 = after '\n').
+    run(&mut ed, Command::ToggleStrong { from: 0, to: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "**ab**\r\ncd\r\n");
+}
+
 // ---------------------------------------------------------- setHeading --
 
 #[test]
@@ -665,6 +812,54 @@ fn set_heading_inside_blockquote_goes_after_markers() {
     ed.load("> quoted line\n");
     run(&mut ed, Command::SetHeading { pos: 5, level: 2 }).unwrap();
     assert_eq!(ed.get_text(), "> ## quoted line\n");
+}
+
+#[test]
+fn set_heading_refuses_blockquote_nested_list_items_and_breaks_like_top_level() {
+    // The same block gate as at top level applies AFTER the quote markers
+    // are stripped: a quote-nested list item / thematic break refuses
+    // (None, no burned revision). Pre-fix `"> - item"` + level 1 produced
+    // `"> # - item"` — a heading swallowing the marker.
+    for doc in ["> - item\n", "> 1. item\n", "> > - deep\n", "> ---\n"] {
+        let mut ed = Editor::new(1);
+        ed.load(doc);
+        let rev = ed.revision();
+        let pos = doc.len() - 2; // on the construct's own line content
+        assert!(
+            ed.command(Command::SetHeading { pos, level: 1 }).unwrap().is_none(),
+            "{doc:?}"
+        );
+        assert_eq!(ed.get_text(), doc, "no mutation for {doc:?}");
+        assert_eq!(ed.revision(), rev, "no revision bump for {doc:?}");
+    }
+    // Control: a plain quoted line still promotes (the refusal is about
+    // the nested construct, not quotes).
+    let mut ed = Editor::new(1);
+    ed.load("> quoted\n");
+    run(&mut ed, Command::SetHeading { pos: 4, level: 1 }).unwrap();
+    assert_eq!(ed.get_text(), "> # quoted\n");
+}
+
+#[test]
+fn set_heading_zero_removes_the_closing_hash_run_too() {
+    // Level 0 deletes ALL heading delimiter spans — the ATX closing hash
+    // run included. Pre-fix `"# foo #"` became `"foo #"`, leaving a stray
+    // delimiter behind.
+    let mut ed = Editor::new(1);
+    ed.load("# foo #\n");
+    run(&mut ed, Command::SetHeading { pos: 3, level: 0 }).unwrap();
+    assert_eq!(ed.get_text(), "foo\n");
+
+    let mut ed = Editor::new(1);
+    ed.load("## x ##\n");
+    run(&mut ed, Command::SetHeading { pos: 3, level: 0 }).unwrap();
+    assert_eq!(ed.get_text(), "x\n");
+
+    // Releveling leaves the closing run alone (unchanged behavior).
+    let mut ed = Editor::new(1);
+    ed.load("# foo #\n");
+    run(&mut ed, Command::SetHeading { pos: 3, level: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "### foo #\n");
 }
 
 #[test]

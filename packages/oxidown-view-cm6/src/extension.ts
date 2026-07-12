@@ -4,7 +4,7 @@ import {
   type Extension,
   Prec,
   type Range,
-  type Transaction,
+  Transaction,
 } from "@codemirror/state";
 import {
   Decoration,
@@ -54,6 +54,12 @@ export const oxidownSkip = Annotation.define<true>();
  * user's CURRENT selection through the change instead of moving it. This is
  * what lets the user keep typing at the top of the document while an AI
  * stream appends far below: the stream's edits never touch their cursor.
+ *
+ * Every core-originated dispatch also carries `addToHistory: false`: the core
+ * is the only historian (see oxidown()'s doc comment), but a host that
+ * wrongly enables CM6's own history() must not accumulate a SECOND undo
+ * record of changes the core already tracks in its own units — the two
+ * histories would fight over the same edits.
  */
 export function applyCoreChange(view: EditorView, change: CoreChange, userEvent: string): void {
   if (change.splices.length === 0 && !change.selection) return;
@@ -64,10 +70,105 @@ export function applyCoreChange(view: EditorView, change: CoreChange, userEvent:
   view.dispatch({
     changes,
     selection,
-    annotations: oxidownSkip.of(true),
+    annotations: [oxidownSkip.of(true), Transaction.addToHistory.of(false)],
     scrollIntoView: Boolean(change.selection),
     userEvent,
   });
+}
+
+/**
+ * Replace each LONE (unpaired) surrogate code unit with U+FFFD, leaving valid
+ * surrogate pairs untouched. The cores enforce the no-lone-surrogate document
+ * invariant (`load`/`applyEdit` refuse text payloads carrying one), so any
+ * view buffer headed into `core.load()` must be sanitized first — see
+ * recoverDesyncedMirror below.
+ */
+export function sanitizeSurrogates(s: string): string {
+  let out = "";
+  let copied = 0; // everything before this index is already in `out`
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    const high = code >= 0xd800 && code <= 0xdbff;
+    if (high && i + 1 < s.length) {
+      const next = s.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        i++; // valid pair: keep both units
+        continue;
+      }
+    }
+    const low = code >= 0xdc00 && code <= 0xdfff;
+    if (high || low) {
+      out += s.slice(copied, i) + "�";
+      copied = i + 1;
+    }
+  }
+  return copied === 0 ? s : out + s.slice(copied);
+}
+
+/**
+ * Desync-emergency recovery shared by every "re-load the core from the view
+ * buffer" call site (applyEdit/decorations/composition/undo-redo catches, the
+ * skip-annotated mirror check, and the mixed-batch bail-out in update()).
+ *
+ * `core.load()` enforces the no-lone-surrogate document invariant, so loading
+ * the RAW view buffer can itself throw (`InvalidPayload`) precisely when the
+ * desync was CAUSED by a lone-surrogate insertion — and a throw inside a
+ * recovery catch block escapes uncaught, crashing the caller with no further
+ * recovery path. Instead the buffer is sanitized (lone surrogates → U+FFFD;
+ * a 1:1 code-unit replacement, so lengths are preserved) and the core loads
+ * the sanitized text, which cannot be refused. When sanitization changed the
+ * buffer, the view document must converge on the same U+FFFD text: it is
+ * repaired via a skip-annotated dispatch (never forwarded back into
+ * applyEdit, and outside CM6 history) followed by one more `core.load` in
+ * case an edit landed in between. That repair is deferred to a microtask
+ * because several call sites run inside a ViewUpdate (or the plugin
+ * constructor), where dispatching is not allowed — the interim window is
+ * safe: sanitization preserves length, so the mirror is structurally
+ * consistent until the repair lands. The clean-buffer path (the
+ * overwhelmingly common case) stays fully synchronous, exactly like the
+ * previous bare `core.load(text)`.
+ *
+ * `text` defaults to the view's current doc; update() passes each
+ * transaction's own `tr.newDoc` so a batched update recovers against the
+ * right intermediate state.
+ */
+function recoverDesyncedMirror(core: OxidownCore, view: EditorView, text?: string): void {
+  const raw = text ?? view.state.doc.toString();
+  const sanitized = sanitizeSurrogates(raw);
+  core.load(sanitized);
+  if (sanitized === raw) return;
+  console.error(
+    "[oxidown] view buffer contains lone surrogates — sanitized to U+FFFD; repairing the view document to match",
+  );
+  queueMicrotask(() => {
+    // Recompute against the CURRENT doc: another edit (or another queued
+    // repair) may have landed between the failure and this microtask.
+    // Dispatching on a destroyed view is a CM6 no-op, so no guard is needed.
+    const now = view.state.doc.toString();
+    const fixed = sanitizeSurrogates(now);
+    if (fixed !== now) {
+      view.dispatch({
+        changes: { from: 0, to: now.length, insert: fixed },
+        annotations: [oxidownSkip.of(true), Transaction.addToHistory.of(false)],
+        userEvent: "oxidown.recover",
+      });
+    }
+    if (core.getText() !== fixed) core.load(fixed);
+  });
+}
+
+/**
+ * True for a core validation REFUSAL (contract: thrown before any mutation,
+ * with a CoreErrorName message prefix like `InvalidRange: ...`): these are
+ * expected, contract-mandated "no" answers — e.g. a toggle over a multi-block
+ * selection — not integration failures, so they must not spam console.error.
+ * Matched by string prefix (on both `err.name` and the message's leading
+ * name) rather than the CoreErrorName union, so new Invalid* refusals keep
+ * working without a type change.
+ */
+function isValidationRefusal(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return /^Invalid/.test(err.name) || /^Invalid\w*:/.test(err.message);
 }
 
 /**
@@ -102,10 +203,18 @@ function runCoreCommand(
   try {
     return { ok: true, change: invoke() };
   } catch (err) {
-    console.error(
-      `[oxidown] core error during command(${name}) — command() is transactional and did not mutate the core; ignoring:`,
-      err,
-    );
+    if (isValidationRefusal(err)) {
+      // A contract-mandated refusal (Invalid* name, thrown before any
+      // mutation) — e.g. toggleStrong over a multi-block selection. This is
+      // an expected "no", not an integration failure: keep it off
+      // console.error so hosts' error monitoring stays quiet.
+      console.debug(`[oxidown] command(${name}) refused by core validation (no mutation):`, err);
+    } else {
+      console.error(
+        `[oxidown] core error during command(${name}) — command() is transactional and did not mutate the core; ignoring:`,
+        err,
+      );
+    }
     return { ok: false };
   }
 }
@@ -124,6 +233,15 @@ export interface OxidownOptions {
    * Default: true in dev builds (import.meta.env.DEV), else false.
    */
   verifyMirror?: boolean;
+  /**
+   * Include CM6's `drawSelection()` in the bundle (see the rationale comment
+   * inside `oxidown()`: the native caret renders at full line-box height next
+   * to widget/replace decorations). Set false when the host composes its own
+   * drawSelection (CM6 dedupes by config, so a doubled one usually works, but
+   * a host may need different drawSelection options — e.g. cursorBlinkRate —
+   * which WOULD conflict). Default: true.
+   */
+  drawSelection?: boolean;
 }
 
 const defaultVerifyMirror = (() => {
@@ -260,6 +378,10 @@ class TaskCheckboxWidget extends WidgetType {
       // only source of truth for `checked` — the next decoration rebuild
       // reflects whatever the core returns, not the DOM's own click default.
       event.preventDefault();
+      // Read-only editor: the click must not edit the document (and the
+      // preventDefault above already stopped the DOM checkbox from lying
+      // about its state).
+      if (view.state.readOnly) return;
       // Resolve the CURRENT position from the DOM at click time — never a
       // position captured at CONSTRUCTION. RangeSet.map repositions this
       // widget's decoration range on every doc change without touching
@@ -489,9 +611,11 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         this.view = view;
         // Establish the mirror. Skip the load when the core already holds this
         // exact text (e.g. re-created by a source-mode toggle) so history and
-        // revisions survive reconfiguration.
+        // revisions survive reconfiguration. Routed through the surrogate-safe
+        // recovery: a host-supplied initial doc carrying a lone surrogate must
+        // not make load() throw out of the constructor.
         const text = view.state.doc.toString();
-        if (core.getText() !== text) core.load(text);
+        if (core.getText() !== text) recoverDesyncedMirror(core, view, text);
         if (renderDecorations) this.decorations = this.buildDecorations();
         if (typeof window !== "undefined") {
           window.addEventListener("mouseup", this.onDragGestureEnd);
@@ -513,50 +637,78 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         // non-last tr.newDoc is an intermediate state: comparing those would
         // false-positive and needlessly wipe undo history/anchors via load().
         let lastDocChanged: Transaction | null = null;
-        for (const tr of update.transactions) {
-          if (tr.docChanged) lastDocChanged = tr;
-        }
+        let sawSkipDocChange = false;
+        let sawPlainDocChange = false;
         for (const tr of update.transactions) {
           if (!tr.docChanged) continue;
-          if (tr.annotation(oxidownSkip)) {
-            // Core-driven change (undo/redo/command/stream): the core
-            // already applied this edit itself before the view dispatched
-            // the transaction, so there's nothing to forward. But a host
-            // changeFilter/transactionFilter that altered the transaction in
-            // flight (the contract requires hosts not do this to
-            // oxidown-annotated transactions) would otherwise desync core
-            // and view silently until the NEXT forwarded edit happened to
-            // notice via the check below — and only then if verifyMirror is
-            // on. Run the same length check immediately instead of waiting:
-            // the core already applied the change, so lengths must match
-            // right now — but only against the update's FINAL doc (the last
-            // doc-changing transaction; see `lastDocChanged` above), never a
-            // batched update's intermediate per-transaction doc.
-            if (verifyMirror && tr === lastDocChanged && core.docLength() !== tr.newDoc.length) {
+          lastDocChanged = tr;
+          if (tr.annotation(oxidownSkip)) sawSkipDocChange = true;
+          else sawPlainDocChange = true;
+        }
+        if (sawSkipDocChange && sawPlainDocChange) {
+          // A single update batching a core-driven (skip-annotated) change
+          // TOGETHER with a plain doc-changing transaction cannot be forwarded
+          // splice-by-splice: the core applied the skip change(s) when they
+          // were produced (BEFORE this update ran), so a plain transaction's
+          // splices — expressed against whatever view doc it was built on —
+          // are in the WRONG coordinates for the core's current doc.
+          // Forwarding them would silently corrupt the mirror (verifyMirror
+          // off) or wipe history twice (verifyMirror on). Treat the whole
+          // batch as a desync emergency instead: one recovery reload against
+          // the update's final doc.
+          console.error(
+            "[oxidown] a single update batched a core-driven (skip-annotated) change with a " +
+              "plain doc-changing transaction — user splices cannot be forwarded safely; " +
+              "re-loading core from view buffer",
+          );
+          recoverDesyncedMirror(core, this.view, update.state.doc.toString());
+        } else {
+          for (const tr of update.transactions) {
+            if (!tr.docChanged) continue;
+            if (tr.annotation(oxidownSkip)) {
+              // Core-driven change (undo/redo/command/stream): the core
+              // already applied this edit itself before the view dispatched
+              // the transaction, so there's nothing to forward. But a host
+              // changeFilter/transactionFilter that altered the transaction in
+              // flight (the contract requires hosts not do this to
+              // oxidown-annotated transactions) would otherwise desync core
+              // and view silently until the NEXT forwarded edit happened to
+              // notice via the check below — and only then if verifyMirror is
+              // on. Run the same length check immediately instead of waiting:
+              // the core already applied the change, so lengths must match
+              // right now — but only against the update's FINAL doc (the last
+              // doc-changing transaction; see `lastDocChanged` above), never a
+              // batched update's intermediate per-transaction doc.
+              if (verifyMirror && tr === lastDocChanged && core.docLength() !== tr.newDoc.length) {
+                console.error(
+                  `[oxidown] mirror desync on a core-driven change (core=${core.docLength()} view=${tr.newDoc.length}) — ` +
+                    "a host changeFilter/transactionFilter may have altered an oxidown-annotated " +
+                    "transaction; re-loading core from view buffer:",
+                );
+                recoverDesyncedMirror(core, this.view, tr.newDoc.toString());
+              }
+              continue;
+            }
+            const splices = changesToSplices(tr.changes);
+            try {
+              core.applyEdit(core.revision(), splices, originOf(tr, this.view));
+              if (verifyMirror && core.docLength() !== tr.newDoc.length) {
+                throw new Error(
+                  `mirror desync: core=${core.docLength()} view=${tr.newDoc.length}`,
+                );
+              }
+            } catch (err) {
+              // Contract: any core exception is a mirror-desync emergency.
+              // recoverDesyncedMirror (not a bare core.load) because the
+              // failed edit may itself be WHY the view buffer is unloadable —
+              // a lone-surrogate insertion makes load(raw buffer) throw the
+              // same InvalidPayload right back, uncaught, crashing the plugin.
               console.error(
-                `[oxidown] mirror desync on a core-driven change (core=${core.docLength()} view=${tr.newDoc.length}) — ` +
-                  "a host changeFilter/transactionFilter may have altered an oxidown-annotated " +
-                  "transaction; re-loading core from view buffer:",
+                "[oxidown] core error during applyEdit — re-loading core from view buffer:",
+                err,
               );
-              core.load(tr.newDoc.toString());
+              recoverDesyncedMirror(core, this.view, tr.newDoc.toString());
             }
-            continue;
-          }
-          const splices = changesToSplices(tr.changes);
-          try {
-            core.applyEdit(core.revision(), splices, originOf(tr, this.view));
-            if (verifyMirror && core.docLength() !== tr.newDoc.length) {
-              throw new Error(
-                `mirror desync: core=${core.docLength()} view=${tr.newDoc.length}`,
-              );
-            }
-          } catch (err) {
-            // Contract: any core exception is a mirror-desync emergency.
-            console.error(
-              "[oxidown] core error during applyEdit — re-loading core from view buffer:",
-              err,
-            );
-            core.load(tr.newDoc.toString());
           }
         }
 
@@ -686,7 +838,7 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
             "[oxidown] core error during decorations — re-loading core from view buffer:",
             err,
           );
-          core.load(state.doc.toString());
+          recoverDesyncedMirror(core, this.view, state.doc.toString());
           try {
             return core.decorations(core.revision(), from, to, selections);
           } catch (err2) {
@@ -790,6 +942,17 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
           if (regions.length > 0) {
             ranges.push(
               ...this.highlighter.highlightRegions(state, regions, () => {
+                // Invalidate the payload cache BEFORE scheduling: a language
+                // arriving with no other event in between leaves the CORE
+                // payload (and core.revision()) unchanged, so flushRebuild's
+                // identical-payload skip would swallow the repaint — the
+                // cache only keys on the core payload, not on highlighter
+                // state. Nulling it forces the rebuild through to
+                // buildDecorationSet, which re-runs the highlighter (now
+                // with the loaded language — or retrying a FAILED load; see
+                // highlight.ts's supportFor).
+                this.lastPayload = null;
+                this.lastPayloadRevision = null;
                 this.dirty = true;
                 this.scheduleRebuild();
               }),
@@ -847,7 +1010,7 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
               "[oxidown] core error during compositionBegin — re-loading core from view buffer:",
               err,
             );
-            core.load(view.state.doc.toString());
+            recoverDesyncedMirror(core, view);
             this.dirty = true; // rebuilt after the composition settles
           }
         },
@@ -860,7 +1023,7 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
               "[oxidown] core error during compositionEnd — re-loading core from view buffer:",
               err,
             );
-            core.load(view.state.doc.toString());
+            recoverDesyncedMirror(core, view);
           }
           // Runs whether or not compositionEnd threw: the catch-up rebuild
           // must still be scheduled (and after a resync, doubly so).
@@ -899,6 +1062,10 @@ function historyKeymap(core: OxidownCore): Extension {
   const run =
     (kind: "undo" | "redo") =>
     (view: EditorView): boolean => {
+      // Read-only editor: undo/redo would edit the document. Return false
+      // (CM6 convention: the command doesn't apply) WITHOUT touching the
+      // core's history stacks, so a host binding may still claim the key.
+      if (view.state.readOnly) return false;
       let result: CoreChange | null;
       try {
         result = kind === "undo" ? core.undo() : core.redo();
@@ -908,12 +1075,12 @@ function historyKeymap(core: OxidownCore): Extension {
         // core BEFORE returning splices, so an exception leaves the mirror
         // in an unknown state. Treat it like the applyEdit/decorations
         // sites: a desync emergency — log loudly and re-load from the view
-        // buffer.
+        // buffer (surrogate-safe; see recoverDesyncedMirror).
         console.error(
           `[oxidown] core error during ${kind} — re-loading core from view buffer:`,
           err,
         );
-        core.load(view.state.doc.toString());
+        recoverDesyncedMirror(core, view);
         return true;
       }
       if (result) applyCoreChange(view, result, kind);
@@ -932,9 +1099,14 @@ function historyKeymap(core: OxidownCore): Extension {
  * streaming (command → CoreChange → applyCoreChange).
  */
 function commandKeymap(core: OxidownCore): Extension {
+  // Read-only editor: every binding here would edit the document, so each
+  // runner returns false (CM6 convention: the command doesn't apply here)
+  // WITHOUT dispatching anything to the core — a later keymap/host binding
+  // may still claim the key.
   const runToggle =
     (name: RangeCommandName) =>
     (view: EditorView): boolean => {
+      if (view.state.readOnly) return false;
       const { from, to } = view.state.selection.main;
       const outcome = runCoreCommand(name, () => core.command(name, from, to));
       if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
@@ -956,6 +1128,7 @@ function commandKeymap(core: OxidownCore): Extension {
   const runIndent =
     (name: "indentList" | "outdentList", fallback: (view: EditorView) => boolean) =>
     (view: EditorView): boolean => {
+      if (view.state.readOnly) return false;
       const { from, to } = view.state.selection.main;
       const outcome = runCoreCommand(name, () => core.command(name, from, to));
       // An exception is NOT the same as a legitimate `null` — it must never
@@ -976,7 +1149,7 @@ function commandKeymap(core: OxidownCore): Extension {
   // Never intercept while an IME composition is active: Enter then belongs
   // to the composition (confirming a candidate), not to us.
   const runEnter = (view: EditorView): boolean => {
-    if (view.composing) return false;
+    if (view.composing || view.state.readOnly) return false;
     const { from, to } = view.state.selection.main;
     const outcome = runCoreCommand("enter", () => core.command("enter", from, to));
     // Same distinction as runIndent: a thrown command is handled-and-ignored,
@@ -995,6 +1168,7 @@ function commandKeymap(core: OxidownCore): Extension {
   // key. Not bound by defaultKeymap (which uses Mod-Enter for
   // insertBlankLine) nor elsewhere in this file.
   const runToggleTask = (view: EditorView): boolean => {
+    if (view.state.readOnly) return false;
     const pos = view.state.selection.main.head;
     const outcome = runCoreCommand("toggleTask", () => core.command("toggleTask", pos));
     if (!outcome.ok) return true; // thrown: handled-and-ignored, never "doesn't apply"
@@ -1082,7 +1256,9 @@ export function oxidown(core: OxidownCore, options: OxidownOptions = {}): Extens
     // <img>s there, and Chrome sizes the caret to the line box beside replaced
     // elements) — every concealed marker boundary showed an enlarged caret.
     // drawSelection hides the native caret and draws one from coordsAtPos,
-    // which reflects the real text metrics at every position.
-    drawSelection(),
+    // which reflects the real text metrics at every position. Opt out via
+    // `drawSelection: false` when the host composes its own (see
+    // OxidownOptions).
+    options.drawSelection !== false ? drawSelection() : [],
   ];
 }

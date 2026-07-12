@@ -4,9 +4,9 @@ The minimum contract between `oxidown-core` and a platform view, for the M0 spik
 This document is authoritative: if the Rust core and the TypeScript view disagree, the one that
 matches this file wins; if this file is wrong, change it in the same PR as the code.
 
-Current contract version: **v0.3** — the base v0 sections below are followed by the v0.1
-clarifications, the v0.2 (M1) additions, and inline v0.3 amendments; the "v0.3 changelog"
-section at the end enumerates exactly what v0.3 comprises.
+Current contract version: **v0.4** — the base v0 sections below are followed by the v0.1
+clarifications, the v0.2 (M1) additions, and inline v0.3/v0.4 amendments; the "v0.3 changelog"
+and "v0.4 changelog" sections at the end enumerate exactly what each version comprises.
 
 Web-boundary flavor: **all positions in this protocol are UTF-16 code units** (CodeMirror's unit).
 The conversion to core-internal UTF-8 byte offsets happens inside `oxidown-core` itself — every
@@ -77,6 +77,9 @@ export interface OxidownCore {
    * plus the resulting revision, or null if the stack is empty.
    * Coalescing: consecutive `user`/`ime` edits within 500ms and adjacent positions group
    * into one undo unit; `paste` always breaks the group. Coalescing pauses during composition.
+   * Depth (v0.4 amendment): the undo stack holds at most 100 units — pushing the 101st
+   * silently drops the oldest (matching CM6's own default). The redo stack needs no cap
+   * (bounded by undo).
    */
   undo(): { revision: number; splices: Splice[] } | null;
   redo(): { revision: number; splices: Splice[] } | null;
@@ -144,11 +147,31 @@ Nesting (`**bold *italic***`) must work; reveal applies per-node, not per-line.
   `transactionFilter`) — those carry core-driven changes (undo/redo/command/stream) the core has
   already applied; the dev-mode mirror check (`verifyMirror`) verifies these transactions
   immediately (not only on the next forwarded edit), so a host that violates this is caught early.
+- **`readOnly` (v0.4 addition):** when `EditorState.readOnly` is true, the view initiates no
+  core mutations — widget interactions (checkbox clicks) are inert, and every editing keybinding
+  (toggles, `setHeading`, Tab/Shift-Tab, undo/redo, task toggle) returns `false` so hosts see
+  the standard CM6 convention. Core-driven changes the HOST initiates (e.g. a stream it runs
+  against the same core) are outside this rule — `readOnly` gates the view's own gestures.
+- **Core-driven dispatches carry `addToHistory: false` (v0.4 addition):** the view already owns
+  history routing (rule above; CM6 history must not be enabled alongside oxidown), and tagging
+  every `applyCoreChange` dispatch makes a host that wrongly enables CM6 history degrade
+  gracefully (core changes stay out of the rogue history) instead of building a second,
+  conflicting undo stack.
+- **Mixed batched updates are a desync signal (v0.4 addition):** a single view update that
+  batches a doc-changing NON-skip transaction together with a skip-annotated (core-originated)
+  one cannot be forwarded — the user splices' coordinates predate a change the core has already
+  applied. The view must treat the update as a mirror-desync emergency and recover via the
+  sanitized-reload path (see "Error handling"), never forward the splices as-is.
 
 ## Performance budget (M0 gate)
 
 `applyEdit` + `decorations` for a ~3k-code-unit viewport on a 100KB document: **< 1ms combined
 p95 in the core** (excluding DOM work), measured from the JS side of the wasm boundary.
+
+Enforcement (v0.4 note): CI gates the LOOSE ceilings (`perf_smoke`, `stream_perf` — 5-30x the
+budget, sized to absorb shared-runner noise), so an order-of-magnitude regression fails CI.
+The 1ms budget itself remains a local trip-wire (`perf_baseline`, informational in CI): shared
+runners are too noisy to gate on sub-millisecond wall time.
 
 **Complexity note (amended with the incremental-reparse implementation).** `applyEdit`'s
 "O(edit + dirty block), not O(doc)" holds as follows: parse work is bounded by a window of
@@ -235,6 +258,9 @@ export interface DecorationWidget {
 ```
 
 M1 emission scope (parser may understand more than it decorates):
+- ATX headings — content span TRIMS trailing spaces/tabs (v0.4 amendment, matching CommonMark:
+  `# foo   ` marks `foo`, not `foo   `); a closing hash run and the whitespace around it stay
+  delimiter territory as before.
 - Strikethrough `~~x~~` — mark `strike` + conceal/delim pairs, same reveal rules as strong/em.
 - Links `[text](url)` — concealed: `mark:link` over text, conceal `[` and `](url)`.
   Revealed: delimiters as `mark:delim`, destination as `mark:url`. Autolinks: `mark:link` whole.
@@ -365,6 +391,44 @@ single undo units (never coalesce). Returns null when the command doesn't apply 
 happens entirely before any apply, so a thrown command is not a mirror-desync signal; views must
 not resync (`load()`) in response to one (contrast with `applyEdit`/`decorations`, where any
 exception IS still a desync emergency per "Error handling" below).
+
+**CRLF positions (v0.4 addition).** A command position argument (`from`/`to`/`pos`) that falls
+between the `\r` and `\n` of a CRLF pair is a validation refusal — the delimiter insert would
+split one line terminator into two line breaks, adding a line the user never asked for. Both
+code units are individually addressable (they are separate chars, so the strict surrogate check
+passes), which is why this needs its own rule. Throws `InvalidArgument: position {p} splits a
+CRLF sequence` (identical on both cores), no mutation, no revision bump.
+
+### Inline toggles: flanking-safe trimming (v0.4 amendment)
+
+CommonMark's flanking rules mean a `**` inserted before whitespace can never open strong — a
+naive toggle over `"a "` in `a b` would emit `**a **b`, which parses as LITERAL asterisks, and a
+second toggle over the same content would then STACK another delimiter pair instead of removing
+one. The same planner already refuses every context where its delimiters would come out literal
+(code spans, multi-block ranges); whitespace edges are that hazard's remaining case, closed by
+trimming rather than refusal:
+
+- Before planning, `toggleStrong`/`toggleEm`/`toggleStrike` TRIM a non-empty selection's ends
+  inward over whitespace; detection of the already-toggled (OFF/extend) state runs on the
+  trimmed range too. The whitespace set is pinned — U+0009, U+000A, U+000C, U+000D, U+0020,
+  U+00A0, U+1680, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 — chosen to match
+  CommonMark's Unicode-whitespace definition; it is NOT Rust `char::is_whitespace()` and NOT
+  JS `\s` (they disagree at U+0085/U+FEFF), so both cores hard-code the same list.
+- A selection that trims to empty (whitespace-only) means the toggle DOES NOT APPLY → `null`,
+  the standard doesn't-apply signal. No undo unit, no revision bump.
+- The returned `selection` covers the trimmed, toggled content, preserving the double-toggle
+  guarantee: toggling the returned selection again restores the original bytes exactly.
+- Cursor-only toggles (`from == to`) and `toggleCode` are unchanged — code spans have no
+  flanking rules; the code planner's existing padding treatment stands.
+
+### `setHeading` (v0.4 clarifications)
+
+- The list-item gate applies at any quote depth: `setHeading` inside a blockquote strips the
+  `>` prefix before classifying the target line, so a quoted list item (`> - item`) refuses
+  (`null`) exactly like a top-level one — previously the quote wrapper hid the inner list from
+  the gate and the marker was swallowed as literal heading text.
+- Level 0 (heading → paragraph) removes EVERY delimiter span, an ATX closing hash run included:
+  `# foo #` → `foo`, not `foo #`. Releveling (1–6) keeps the closing run, as before.
 
 ### `indentList` / `outdentList`
 
@@ -621,6 +685,16 @@ Rules:
    (LIFO)**: a user edit made mid-stream pops before the stream's unit, because its unit was
    created after the stream's unit began.
 3. **`list-marker` spans include the required trailing whitespace** (`"- "`, `"1. "`).
+   *(v0.4 clarification — the span's end is pinned, resolving an ambiguity in "required":)*
+   a non-empty item's marker span runs to the item's CONTENT START (the underlying parser's
+   first-content lookahead, clamped to the marker's own line) — ALL post-marker spaces/tabs
+   are marker territory, not just the single required one, so `-   spaced` conceals `-   `
+   ([0,4)) and the item text renders flush at the content column like every sibling. A task
+   item's marker span ends where the `[x]` checkbox begins, extra spaces before the brackets
+   included. Empty items (whose marker is synthesized — no content event exists to look
+   ahead to) take glyphs + delimiter + the single trailing space if present. This does NOT
+   change `indentList`/`outdentList`'s "marker token width", which remains the FIXED
+   glyphs+one-space formula by design (see that section).
 4. **Link conceal spans** are two spans (`[` and `](url)`); on reveal they are emitted as
    delim/url/delim pieces. An angle-bracketed destination (`[t](<u v>)`) contributes only the
    inner span as `mark:url`; the `<`/`>` wrappers remain in the surrounding `mark:delim` pieces.
@@ -659,7 +733,7 @@ Validation-refusal error names (v0.3):
   `setHeading` level outside 0–6 at the boundary).
 - `InvalidArgument` — thrown by the core when a value is semantically outside its documented
   domain (e.g. a heading level above 6 at the core API; an inline-toggle range spanning more
-  than one leaf block).
+  than one leaf block; a command position splitting a CRLF pair — v0.4).
 - `InvalidPayload` — thrown by the adapter/mock payload layer when a STRUCTURED payload is
   malformed before it can cross the boundary: mis-shaped or non-serializable `splices` /
   `selections` (e.g. a negative or non-integer field — wasm:
@@ -677,11 +751,36 @@ inserts, malformed numbers, ordering, bounds) → origin (`InvalidOrigin`) → a
 surrogate-split check (`SurrogateSplit`). A call that is simultaneously stale AND
 payload-malformed therefore throws `StaleRevision`.
 
-All of these are refusals thrown WITHOUT mutating the core; callers should treat them as consumed
-no-ops (log and move on — never fall back to a default action, never resync), per the
-Commands section's no-mutation-on-throw rule. This carve-out applies from EVERY entry point,
-`applyEdit` and `decorations` included: the desync-emergency rule above governs exceptions the
-core throws once a well-formed call is underway, not these named pre-dispatch refusals.
+`decorations` likewise validates in a pinned order (v0.4 — identical on mock and wasm, closing
+a divergence where the wasm layer checked the selections payload first and the two cores threw
+DIFFERENT names, in different handling classes, for the same doubly-invalid call): malformed
+`revision` (`InvalidArgs`) → staleness (`StaleRevision`) → malformed `from`/`to`
+(`InvalidArgs`) → viewport range (`InvalidRange`: `from > to`) → viewport bounds
+(`OutOfBounds`) → per-selection malformed fields (`InvalidPayload`) → per-selection bounds
+(`OutOfBounds`).
+
+All of these are refusals thrown WITHOUT mutating the core, and how a view treats one depends on
+what it has already done (v0.4 amendment — the previous blanket "consumed no-ops from EVERY
+entry point" rule was unsound for `applyEdit`; see below):
+
+- From `command`, `decorations`, anchor, and stream entry points, the view has changed nothing:
+  the refusal is a consumed no-op. Log quietly and move on — validation refusals (names
+  matching `/^Invalid/`) are contract behavior, not faults, and must not be reported at error
+  severity — and never fall back to a default action, never resync.
+- From `applyEdit`, the view forwards changes it has ALREADY applied to its own buffer, so a
+  refusal means the mirrors have already diverged — the refusal itself is the desync signal.
+  The view must recover via **sanitized reload**: replace any lone surrogate code unit in the
+  view buffer with U+FFFD (1:1, length-preserving) and `load()` the sanitized text into the
+  core; if sanitization changed the text, also bring the view document to the sanitized form
+  with a skip-annotated, history-exempt dispatch. CM6 forbids dispatching from inside an
+  update, so the repair dispatch may be deferred (microtask) after the immediate `load()` —
+  length preservation keeps the interim mirror structurally consistent, and the pair must end
+  byte-equal. The sanitize step exists because the canonical trigger IS a lone-surrogate
+  insertion (`InvalidPayload`, see below) — reloading the raw buffer would throw the same
+  refusal inside the recovery path and leave no way back to a consistent pair.
+
+The desync-emergency rule above continues to govern exceptions the core throws once a
+well-formed call is underway; recovery for those follows the same sanitized-reload path.
 
 ## Unpaired surrogates in payloads (v0.3 addition)
 
@@ -705,7 +804,7 @@ itself never contains an unpaired surrogate code unit:
 
 # v0.3 changelog
 
-**The current version of this contract is v0.3.** v0.3 is additive/amending on top of
+v0.3 is additive/amending on top of
 v0.2 and, following the same in-place convention as the v0.2 clarifications, its items live
 inline in the sections above, each tagged "(v0.3 amendment)" or "(v0.3 addition)". The full
 list:
@@ -744,3 +843,48 @@ list:
 - **Incremental-reparse complexity note** — the amendment under "Performance budget" pinning
   how `applyEdit`'s "O(edit + dirty block)" clause holds (windowed reparse, realignment,
   documented degrade cases).
+
+---
+
+# v0.4 changelog
+
+**The current version of this contract is v0.4** (pinned from the M1 PR review). Same in-place
+convention: each item lives inline above, tagged "(v0.4 amendment/addition/clarification)".
+The full list:
+
+- **Flanking-safe inline toggles** — `toggleStrong`/`Em`/`Strike` trim selection ends over a
+  pinned whitespace set before planning; whitespace-only selections → `null`; double-toggle
+  byte-identity is preserved over the returned selection. Closes the case where a
+  whitespace-edged toggle emitted flanking-violating (literal) delimiters that STACKED on
+  re-toggle. See "Inline toggles: flanking-safe trimming" under Commands.
+- **CRLF position guard** — a command position between `\r` and `\n` throws
+  `InvalidArgument: position {p} splits a CRLF sequence` (both cores, byte-identical message).
+  See "CRLF positions" under Commands.
+- **`setHeading` clarifications** — the list-item gate sees through blockquote prefixes
+  (`> - item` refuses like `- item`); level 0 removes closing hash runs too (`# foo #` → `foo`).
+- **Undo depth cap** — the undo stack holds at most 100 units; the oldest is dropped. See the
+  `undo()` interface comment.
+- **ATX heading content trim** — trailing spaces/tabs are excluded from the heading content
+  span (CommonMark). See the M1 emission scope.
+- **`decorations` validation precedence pinned** — identical order on mock and wasm
+  (revision `InvalidArgs` → `StaleRevision` → viewport `InvalidArgs`/`InvalidRange`/
+  `OutOfBounds` → selections `InvalidPayload` → selection `OutOfBounds`), closing a
+  cross-core divergence where the same
+  doubly-invalid call threw different names in different handling classes. See "Error handling".
+- **Refusal handling split by entry point** — supersedes v0.3's blanket "consumed no-ops from
+  any entry point": refusals remain consumed no-ops everywhere EXCEPT `applyEdit`, where the
+  view has already applied the change it forwards, so a refusal IS the desync signal and
+  triggers **sanitized reload** (lone surrogates → U+FFFD, sync the view doc, then `load()`).
+  Validation refusals (`/^Invalid/`) are logged quietly, never at error severity. See "Error
+  handling".
+- **View rules: `readOnly`, `addToHistory: false`, mixed batched updates** — read-only states
+  gate all view-initiated core mutations; core-driven dispatches are tagged out of any rogue
+  CM6 history; an update batching user changes after a core-originated change routes through
+  desync recovery instead of forwarding stale-coordinate splices. See "Rules for the view".
+- **List-marker span end pinned** — a non-empty item's marker span runs to the item's
+  content start (all post-marker whitespace included, clamped to the marker's line),
+  resolving v0.2 clarification 3's ambiguous "required trailing whitespace". See the
+  amendment under that clarification.
+- **Perf-gate enforcement note** — CI gates the loose perf ceilings (`perf_smoke`,
+  `stream_perf`); the 1ms contract budget stays a local trip-wire (`perf_baseline`,
+  informational in CI). See "Performance budget".
