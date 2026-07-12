@@ -23,10 +23,17 @@
 //!
 //! Errors: every core `Err` becomes a thrown JS exception whose message
 //! starts with the error name (e.g. "StaleRevision: ..."), per the contract's
-//! mirror-desync-emergency handling. Every `f64` position/level/id argument
-//! is validated (finite, integral, non-negative) before conversion; anything
-//! else throws "InvalidArgs: ..." — `as usize` would otherwise silently
-//! saturate negatives to 0 and NaN to 0. The constructor installs
+//! mirror-desync-emergency handling. Every numeric argument crosses as `f64`
+//! (never a `u32` wasm-bindgen param, whose JS→wasm coercion silently wraps
+//! negatives and truncates fractions) and is validated (finite, integral,
+//! non-negative) before conversion; anything else throws "InvalidArgs: ..."
+//! — `as usize` would otherwise silently saturate negatives to 0 and NaN
+//! to 0. Document POSITIONS are additionally bounded to `u32::MAX` (wasm32's
+//! usize is 32 bits, so `as usize` would truncate 2^32+6 to 6 and edit the
+//! wrong place); an over-u32 position is necessarily beyond the document and
+//! fails with the core's own "OutOfBounds: ..." message, matching the mock,
+//! whose numeric layer has no u32 ceiling and reaches its document-bounds
+//! check instead. The constructor installs
 //! `console_error_panic_hook` so any core panic surfaces its message on the
 //! JS console instead of an opaque `RuntimeError: unreachable`.
 //!
@@ -75,6 +82,51 @@ fn check_arg(v: f64, what: &str) -> Result<u64, String> {
 /// `check_arg`, boundary-flavored: failures become thrown JS exceptions.
 fn arg(v: f64, what: &str) -> Result<u64, JsError> {
     check_arg(v, what).map_err(|msg| JsError::new(&msg))
+}
+
+/// Largest document position the boundary accepts: it must fit wasm32's
+/// 32-bit `usize`. Document lengths (UTF-16 code units of an in-memory
+/// string) always fit too, so anything above this is beyond the document.
+const MAX_POS: u64 = u32::MAX as u64;
+
+/// The core's OutOfBounds message (`CoreError::OutOfBounds` Display),
+/// reproduced verbatim for positions too large to fit the `usize` the
+/// `CoreError` variant carries on wasm32. `pos` stays `f64` so the value
+/// formats exactly as the caller sent it (integral f64s print digits-only,
+/// matching the mock's JS `${pos}`).
+fn oob_msg(pos: f64, doc_len: usize) -> String {
+    format!("OutOfBounds: position {pos} beyond document length {doc_len} (UTF-16 code units)")
+}
+
+/// Position flavor of `check_arg`: additionally rejects integers above
+/// `u32::MAX`, which `as usize` on wasm32 would silently TRUNCATE (2^32+6
+/// becomes 6 — probe-confirmed to edit the wrong range before this guard).
+/// The rejection is the same OutOfBounds the core's own document-bounds
+/// check produces, because that is where the mock — whose numeric layer has
+/// no u32 ceiling — fails for the same value (mock-core.ts `checkDocPos`).
+fn check_pos(v: f64, what: &str, doc_len: usize) -> Result<usize, String> {
+    let n = check_arg(v, what)?;
+    if n > MAX_POS {
+        return Err(oob_msg(v, doc_len));
+    }
+    Ok(n as usize)
+}
+
+/// `check_pos` for a query range (`decorations` / `compositionBegin`), with
+/// the mock/core's shared error precedence when an endpoint exceeds
+/// `u32::MAX`: malformed numbers first, then `InvalidRange` when
+/// `from > to`, otherwise OutOfBounds reported on `to` (`to >= from`, so
+/// `to` is over-u32 and is the position the bounds check names).
+fn check_query_range(from: f64, to: f64, doc_len: usize) -> Result<(usize, usize), String> {
+    let f = check_arg(from, "from")?;
+    let t = check_arg(to, "to")?;
+    if f > MAX_POS || t > MAX_POS {
+        if f > t {
+            return Err(format!("InvalidRange: from {from} > to {to}"));
+        }
+        return Err(oob_msg(to, doc_len));
+    }
+    Ok((f as usize, t as usize))
 }
 
 /// Parse a JsValue (array of objects) by stringifying once and deserializing.
@@ -266,6 +318,20 @@ pub struct OxidownCore {
     inner: Editor,
 }
 
+// Boundary-flavored position validation (plain impl block: these are
+// internal helpers, not exports).
+impl OxidownCore {
+    /// `check_pos` against the live document length; failures thrown.
+    fn pos_arg(&self, v: f64, what: &str) -> Result<usize, JsError> {
+        check_pos(v, what, self.inner.doc_len_utf16()).map_err(|msg| JsError::new(&msg))
+    }
+
+    /// `check_query_range` against the live document length; failures thrown.
+    fn query_range(&self, from: f64, to: f64) -> Result<(usize, usize), JsError> {
+        check_query_range(from, to, self.inner.doc_len_utf16()).map_err(|msg| JsError::new(&msg))
+    }
+}
+
 #[wasm_bindgen]
 impl OxidownCore {
     /// `replica_id` defaults to 1 (no entropy source in the core by design).
@@ -329,10 +395,24 @@ impl OxidownCore {
     pub fn decorations(
         &self,
         revision: f64,
-        from: u32,
-        to: u32,
+        from: f64,
+        to: f64,
         selections: JsValue,
     ) -> Result<JsValue, JsError> {
+        // Validation order mirrors the mock (mock-core.ts `decorations`):
+        // malformed revision → staleness → malformed from/to → range →
+        // bounds → selections payload. The core re-checks staleness/range/
+        // bounds for values a 32-bit usize can represent; this layer fronts
+        // the checks it cannot pass through.
+        let revision = arg(revision, "revision")?;
+        let current = self.inner.revision();
+        if revision != current {
+            return Err(core_err(CoreError::StaleRevision {
+                current,
+                requested: revision,
+            }));
+        }
+        let (from, to) = self.query_range(from, to)?;
         let selections: Vec<SelectionIn> = from_js(&selections, "selections")?;
         let sels: Vec<SelectionRange> = selections
             .into_iter()
@@ -341,20 +421,18 @@ impl OxidownCore {
                 head: s.head as usize,
             })
             .collect();
-        let revision = arg(revision, "revision")?;
         let decos = self
             .inner
-            .decorations(revision, from as usize, to as usize, &sels)
+            .decorations(revision, from, to, &sels)
             .map_err(core_err)?;
         js_sys::JSON::parse(&decorations_json_string(&decos))
             .map_err(|_| JsError::new("InternalError: produced invalid JSON"))
     }
 
     #[wasm_bindgen(js_name = compositionBegin)]
-    pub fn composition_begin(&mut self, from: u32, to: u32) -> Result<(), JsError> {
-        self.inner
-            .composition_begin(from as usize, to as usize)
-            .map_err(core_err)
+    pub fn composition_begin(&mut self, from: f64, to: f64) -> Result<(), JsError> {
+        let (from, to) = self.query_range(from, to)?;
+        self.inner.composition_begin(from, to).map_err(core_err)
     }
 
     #[wasm_bindgen(js_name = compositionEnd)]
@@ -367,14 +445,17 @@ impl OxidownCore {
     /// `createAnchor(pos, bias)` — bias is `"before"` or `"after"`. Returns
     /// the anchor id.
     #[wasm_bindgen(js_name = createAnchor)]
-    pub fn create_anchor(&mut self, pos: u32, bias: &str) -> Result<f64, JsError> {
+    pub fn create_anchor(&mut self, pos: f64, bias: &str) -> Result<f64, JsError> {
+        // Bias first, then the position — the mock's order (mock-core.ts
+        // `createAnchor`).
         let bias = match bias {
             "before" => Bias::Before,
             "after" => Bias::After,
             other => return Err(JsError::new(&format!("InvalidBias: {other:?}"))),
         };
+        let pos = self.pos_arg(pos, "pos")?;
         self.inner
-            .create_anchor(pos as usize, bias)
+            .create_anchor(pos, bias)
             .map(|id| id as f64)
             .map_err(core_err)
     }
@@ -413,10 +494,18 @@ impl OxidownCore {
         let need_b = |what: &str| -> Result<f64, JsError> {
             b.ok_or_else(|| JsError::new(&format!("InvalidArgs: {name} requires {what}")))
         };
+        // Range-command argument order mirrors the mock (`rangeArgs` +
+        // `checkDocPos` in each command impl): malformed `from` → missing
+        // `to` → malformed `to` → over-u32 bounds on `from`, then `to`.
+        let range_args = |core: &Self| -> Result<(usize, usize), JsError> {
+            arg(a, "from")?;
+            let b_val = need_b("a `to` position")?;
+            arg(b_val, "to")?;
+            Ok((core.pos_arg(a, "from")?, core.pos_arg(b_val, "to")?))
+        };
         let cmd = match name {
             "toggleStrong" | "toggleEm" | "toggleStrike" | "toggleCode" => {
-                let from = arg(a, "from")? as usize;
-                let to = arg(need_b("a `to` position")?, "to")? as usize;
+                let (from, to) = range_args(self)?;
                 match name {
                     "toggleStrong" => Command::ToggleStrong { from, to },
                     "toggleEm" => Command::ToggleEm { from, to },
@@ -425,8 +514,7 @@ impl OxidownCore {
                 }
             }
             "indentList" | "outdentList" => {
-                let from = arg(a, "from")? as usize;
-                let to = arg(need_b("a `to` position")?, "to")? as usize;
+                let (from, to) = range_args(self)?;
                 if name == "indentList" {
                     Command::IndentList { from, to }
                 } else {
@@ -434,12 +522,14 @@ impl OxidownCore {
                 }
             }
             "enter" => {
-                let from = arg(a, "from")? as usize;
-                let to = arg(need_b("a `to` position")?, "to")? as usize;
+                let (from, to) = range_args(self)?;
                 Command::Enter { from, to }
             }
             "setHeading" => {
-                let pos = arg(a, "pos")? as usize;
+                // Mock order: malformed pos → missing/malformed/out-of-range
+                // level → pos document bounds (`setHeadingCmd` validates the
+                // level before `checkDocPos`).
+                arg(a, "pos")?;
                 let level = arg(need_b("a heading level")?, "level")?;
                 if level > 6 {
                     return Err(JsError::new(&format!(
@@ -447,12 +537,12 @@ impl OxidownCore {
                     )));
                 }
                 Command::SetHeading {
-                    pos,
+                    pos: self.pos_arg(a, "pos")?,
                     level: level as u8,
                 }
             }
             "toggleTask" => Command::ToggleTask {
-                pos: arg(a, "pos")? as usize,
+                pos: self.pos_arg(a, "pos")?,
             },
             other => return Err(JsError::new(&format!("InvalidCommand: {other:?}"))),
         };
@@ -464,9 +554,10 @@ impl OxidownCore {
     /// Open a stream at `pos`; the insertion point becomes an internal
     /// after-bias anchor. Returns the stream id.
     #[wasm_bindgen(js_name = streamOpen)]
-    pub fn stream_open(&mut self, pos: u32) -> Result<f64, JsError> {
+    pub fn stream_open(&mut self, pos: f64) -> Result<f64, JsError> {
+        let pos = self.pos_arg(pos, "pos")?;
         self.inner
-            .stream_open(pos as usize)
+            .stream_open(pos)
             .map(|id| id as f64)
             .map_err(core_err)
     }
@@ -483,7 +574,12 @@ impl OxidownCore {
         change_to_js(Some(change))
     }
 
-    /// Close a stream. No-op on unknown/already-closed ids.
+    /// Close a stream. No-op on unknown/already-closed ids. Returns nothing:
+    /// the boundary contract's `streamClose(id): CoreChange | null` (the
+    /// surrogate-flush change, v0.3) is produced by the TS adapter
+    /// (wasm-core.ts), which is where trailing-high-surrogate buffering
+    /// lives — the core itself never buffers, so it never has a flush edit
+    /// to return.
     #[wasm_bindgen(js_name = streamClose)]
     pub fn stream_close(&mut self, id: f64) -> Result<(), JsError> {
         self.inner.stream_close(arg(id, "id")?);
@@ -626,5 +722,90 @@ mod arg_validation {
             check_arg(-3.0, "baseRevision").unwrap_err(),
             "InvalidArgs: baseRevision must be a non-negative integer, got -3"
         );
+    }
+}
+
+#[cfg(test)]
+mod pos_validation {
+    //! `check_pos`/`check_query_range` guard every document POSITION
+    //! crossing the boundary: on wasm32 `as usize` is a 32-bit cast, so an
+    //! integer above `u32::MAX` would silently truncate (2^32+6 → 6,
+    //! editing the wrong range). Over-u32 positions fail with the core's
+    //! own OutOfBounds message — byte-identical to what the mock
+    //! (mock-core.ts `checkDocPos`/`outOfBounds`) throws for the same value.
+
+    use super::{check_pos, check_query_range};
+
+    #[test]
+    fn accepts_the_full_u32_range() {
+        assert_eq!(check_pos(0.0, "pos", 11), Ok(0));
+        assert_eq!(check_pos(6.0, "pos", 11), Ok(6));
+        assert_eq!(
+            check_pos(4294967295.0, "pos", 11),
+            Ok(u32::MAX as usize),
+            "u32::MAX itself is representable and left to the core's bounds check"
+        );
+    }
+
+    #[test]
+    fn over_u32_positions_are_out_of_bounds_not_truncated() {
+        // The probe that motivated the guard: 2^32 + 6 used to wrap to 6.
+        assert_eq!(
+            check_pos(4294967302.0, "pos", 11).unwrap_err(),
+            "OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)"
+        );
+        // First rejected value: u32::MAX + 1 (would wrap to 0).
+        assert_eq!(
+            check_pos(4294967296.0, "from", 0).unwrap_err(),
+            "OutOfBounds: position 4294967296 beyond document length 0 (UTF-16 code units)"
+        );
+    }
+
+    #[test]
+    fn malformed_positions_are_still_invalid_args() {
+        assert_eq!(
+            check_pos(-1.0, "pos", 11).unwrap_err(),
+            "InvalidArgs: pos must be a non-negative integer, got -1"
+        );
+        assert_eq!(
+            check_pos(1.5, "from", 11).unwrap_err(),
+            "InvalidArgs: from must be a non-negative integer, got 1.5"
+        );
+        assert!(check_pos(f64::NAN, "pos", 11)
+            .unwrap_err()
+            .starts_with("InvalidArgs: "));
+    }
+
+    #[test]
+    fn query_range_error_precedence_matches_the_mock() {
+        // Malformed endpoints beat everything (`from` first).
+        assert_eq!(
+            check_query_range(-1.0, 4294967302.0, 11).unwrap_err(),
+            "InvalidArgs: from must be a non-negative integer, got -1"
+        );
+        assert_eq!(
+            check_query_range(0.0, 2.5, 11).unwrap_err(),
+            "InvalidArgs: to must be a non-negative integer, got 2.5"
+        );
+        // Reversed range with an over-u32 endpoint: InvalidRange, not
+        // OutOfBounds (the mock checks `from > to` before bounds).
+        assert_eq!(
+            check_query_range(4294967302.0, 5.0, 11).unwrap_err(),
+            "InvalidRange: from 4294967302 > to 5"
+        );
+        // Ordered but over-u32: OutOfBounds reported on `to`.
+        assert_eq!(
+            check_query_range(0.0, 4294967302.0, 11).unwrap_err(),
+            "OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)"
+        );
+        assert_eq!(
+            check_query_range(4294967296.0, 4294967302.0, 3).unwrap_err(),
+            "OutOfBounds: position 4294967302 beyond document length 3 (UTF-16 code units)"
+        );
+        // In-u32-range values pass through untouched — staleness/range/
+        // bounds for these stay the core's job.
+        assert_eq!(check_query_range(2.0, 9.0, 11), Ok((2, 9)));
+        assert_eq!(check_query_range(9.0, 2.0, 11), Ok((9, 2)));
+        assert_eq!(check_query_range(0.0, 99.0, 11), Ok((0, 99)));
     }
 }

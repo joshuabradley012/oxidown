@@ -589,6 +589,84 @@ fn command_list_planner_scaling_on_huge_lists() {
     );
 }
 
+// ---- (h) blockquote-heavy full-parse scaling -------------------------------
+
+/// Quote-heavy corpus: short blockquote blocks of mixed nesting separated by
+/// blank lines, ~`lines` physical lines total. This maximizes both the
+/// number of blockquote INTERVALS and the number of quoted lines — the shape
+/// that made the parser's per-line blockquote pass quadratic
+/// (O(quoted lines × intervals): `depth_at_line` rescanned every interval
+/// for every quoted line).
+fn generate_quote_heavy_doc(lines: usize) -> String {
+    let mut doc = String::with_capacity(lines * 24);
+    let mut i = 0usize;
+    let mut emitted = 0usize;
+    while emitted < lines {
+        match i % 4 {
+            0 => {
+                doc.push_str(&format!("> quoted {i} words here\n> second line {i}\n\n"));
+                emitted += 3;
+            }
+            1 => {
+                doc.push_str(&format!("> > nested {i} **bold**\n> > > third {i}\n> back\n\n"));
+                emitted += 4;
+            }
+            2 => {
+                doc.push_str(&format!("> single {i} `code`\n\n"));
+                emitted += 2;
+            }
+            _ => {
+                doc.push_str(&format!("> a{i}\n> b{i}\n> c{i}\n\n"));
+                emitted += 4;
+            }
+        }
+        i += 1;
+    }
+    doc
+}
+
+/// Regression gate for the two-pointer blockquote per-line pass
+/// (parser.rs's `parse_document`): pre-fix, `depth_at_line` scanned EVERY
+/// interval for EVERY quoted line — measured ~22ms / ~74ms / ~252ms for
+/// 8k/16k/32k-line quote-heavy docs in release (clearly quadratic). Fixed,
+/// the pass is O(quoted lines + intervals) and the whole parse is
+/// single-digit ms at 32k lines. The ceiling is generous (100ms, well over
+/// an order of magnitude above the fixed cost so slow CI hardware never
+/// flakes) while the pre-fix cost (~2.5x the ceiling) trips it instantly.
+#[test]
+#[ignore = "perf baseline; run with --release --ignored --nocapture"]
+fn parse_blockquote_heavy_scaling() {
+    let n = iters(30);
+    println!("\n=== parse_document on blockquote-heavy docs (release-mode timings) ===");
+    println!("{:<12} {:>10} {:>34}", "lines", "bytes", "timing");
+    for lines in [8 * 1024usize, 16 * 1024, 32 * 1024] {
+        let doc = generate_quote_heavy_doc(lines);
+        let warm = parser::parse_document(&doc);
+        std::hint::black_box(&warm);
+
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t = Instant::now();
+            let result = parser::parse_document(&doc);
+            let us = t.elapsed().as_secs_f64() * 1e6;
+            std::hint::black_box(&result);
+            samples.push(us);
+        }
+        let s = stats(samples);
+        println!("{:<12} {:>10} {}", format!("~{}k", lines / 1024), doc.len(), s);
+
+        if lines == 32 * 1024 {
+            assert!(
+                s.p95 < 100_000.0,
+                "32k-line quote-heavy parse p95 {:.0}us — the per-line \
+                 blockquote pass has regressed toward O(lines x intervals) \
+                 (pre-fix: ~252ms)",
+                s.p95
+            );
+        }
+    }
+}
+
 // ---- (f) wasm-boundary-equivalent JSON serialization, native Rust ---------
 
 /// Replicates `crates/oxidown-wasm/src/lib.rs`'s `decoration_json` mapping

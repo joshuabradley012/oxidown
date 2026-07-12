@@ -218,12 +218,20 @@ export interface OxidownCore {
    * Streaming ingestion (plan §5.9). An ENTIRE stream session (open→close) is
    * exactly ONE undo unit; ops carry origin "ai". The insertion point becomes
    * an internal anchor so concurrent user edits above/below it interleave
-   * correctly. `streamClose` on an unknown/closed id is a no-op; `streamAppend`
-   * on one throws.
+   * correctly. `streamClose` on an unknown/closed id is a no-op (returns
+   * null); `streamAppend` on one throws.
+   *
+   * `streamClose` may itself edit the document: a trailing high surrogate
+   * withheld from the last chunk can never be completed once the stream
+   * closes, so it is flushed as one U+FFFD — a final append belonging to the
+   * stream's single undo unit. When that happens, the flush's CoreChange is
+   * RETURNED and the view MUST apply it exactly like a `streamAppend` result
+   * (skip annotation; no selection — the user's cursor maps through).
+   * Returns null when no flush was needed (the common case).
    */
   streamOpen(pos: number): number; // stream id; insertion point becomes an internal anchor
   streamAppend(id: number, chunk: string): CoreChange; // splices for the view to apply (skip annotation)
-  streamClose(id: number): void;
+  streamClose(id: number): CoreChange | null; // U+FFFD-flush change to apply, or null
 
   /**
    * Optional teardown. Releases resources held outside the JS heap (the wasm

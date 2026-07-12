@@ -56,6 +56,11 @@ function withTiming(core: OxidownCore, onSample: (s: PerfSample) => void): Oxido
     streamOpen: (pos) => core.streamOpen(pos),
     streamAppend: (id, chunk) => core.streamAppend(id, chunk),
     streamClose: (id) => core.streamClose(id),
+
+    // Optional teardown: forwarded only when the wrapped core has one (the
+    // wasm adapter frees its wasm-bindgen instance; MockCore omits it), so
+    // this proxy's surface matches the wrapped core's exactly.
+    ...(core.destroy ? { destroy: () => core.destroy?.() } : {}),
   };
 }
 
@@ -178,7 +183,12 @@ function endStream(status: "done" | "stopped") {
   }
   if (streamId !== null) {
     try {
-      core.streamClose(streamId);
+      // streamClose may return one final CoreChange (the U+FFFD flush of a
+      // surrogate withheld from the last chunk): route it into the editor
+      // exactly like a streamAppend result, or the view falls one code unit
+      // behind the core doc.
+      const change = core.streamClose(streamId);
+      if (change) applyCoreChange(view, change, "oxidown.stream");
     } catch (err) {
       // endStream must be safe to call on a broken core (e.g. right after a
       // streamAppend threw) — log and move on so the UI still resets.

@@ -10,7 +10,7 @@ import { EditorState, type Transaction } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { defaultKeymap } from "@codemirror/commands";
 import { MockCore } from "../src/mock-core";
-import { applyCoreChange, oxidown } from "../src/extension";
+import { applyCoreChange, oxidown, oxidownSkip } from "../src/extension";
 import type { Decoration } from "../src/protocol";
 
 // jsdom implements Range but none of its layout methods. CM6's rAF-driven
@@ -526,6 +526,46 @@ describe("v0.2 additions (M1)", () => {
     view.destroy();
   });
 
+  it("task checkbox prevents mousedown default (Chrome focus steal) and carries an aria-label", async () => {
+    const core = new MockCore();
+    const doc = "- [ ] buy milk\nelsewhere";
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        selection: { anchor: doc.length },
+        extensions: [oxidown(core, { verifyMirror: true })],
+      }),
+    });
+    await flush();
+
+    const checkbox = view.contentDOM.querySelector(
+      "input.ox-task-checkbox",
+    ) as HTMLInputElement | null;
+    expect(checkbox).not.toBeNull();
+
+    // Chrome focuses form controls on mousedown; the post-toggle rebuild
+    // then replaces the focused input and focus falls to <body>, killing
+    // typing. The widget must preventDefault the mousedown (standard CM6
+    // checkbox-widget pattern) so focus never leaves the editor.
+    const mousedown = new MouseEvent("mousedown", { bubbles: true, cancelable: true });
+    checkbox!.dispatchEvent(mousedown);
+    expect(mousedown.defaultPrevented).toBe(true);
+
+    // Accessible name for screen readers; tabIndex stays -1 (Tab must stay
+    // in the editor — it indents — so the widget is never a tab stop).
+    expect(checkbox!.getAttribute("aria-label")).toBe("task checkbox");
+    expect(checkbox!.tabIndex).toBe(-1);
+
+    // The click path still toggles normally after the prevented mousedown.
+    checkbox!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    await flush();
+    expect(core.getText()).toBe("- [x] buy milk\nelsewhere");
+    view.destroy();
+  });
+
   it("ordered marker widget renders the computed number, replaced by raw digits when the line is revealed", async () => {
     // Contract v0.3 amendment (research/07 §0/§1.2): a concealed ordered
     // marker is a widget rendering the VIEW-COMPUTED number, never raw
@@ -852,6 +892,49 @@ describe("FIX 4: a thrown command() is logged and swallowed, never a mirror-desy
   });
 });
 
+describe("history keymap error doctrine (undo/redo wrapped like every other core call site)", () => {
+  const modKey = (key: string) =>
+    new KeyboardEvent("keydown", {
+      key,
+      code: `Key${key.toUpperCase()}`,
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+  for (const [kind, key, method] of [
+    ["undo", "z", "undo"],
+    ["redo", "y", "redo"],
+  ] as const) {
+    it(`a thrown core.${kind}() is logged and recovered (mirror re-load), never an uncaught crash`, async () => {
+      const core = new MockCore();
+      const view = makeView("abc", core);
+      view.dispatch({ changes: { from: 3, to: 3, insert: "d" }, userEvent: "input.type" });
+      await flush();
+
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const loadSpy = vi.spyOn(core, "load");
+      const histSpy = vi.spyOn(core, method).mockImplementation(() => {
+        throw new Error("boom");
+      });
+
+      // Must not throw out of the keymap handler.
+      expect(() => view.contentDOM.dispatchEvent(modKey(key))).not.toThrow();
+
+      expect(errSpy).toHaveBeenCalled();
+      // Unlike command() (transactional), undo/redo may have mutated the
+      // core before throwing: desync emergency → re-load from the view.
+      expect(loadSpy).toHaveBeenCalledWith(view.state.doc.toString());
+      expect(core.getText()).toBe(view.state.doc.toString());
+
+      histSpy.mockRestore();
+      errSpy.mockRestore();
+      await flush();
+      view.destroy();
+    });
+  }
+});
+
 describe("FIX 6: skip-annotated dispatches are mirror-verified immediately", () => {
   it("detects and recovers when a host changeFilter alters a core-driven (skip-annotated) change", async () => {
     const core = new MockCore();
@@ -911,6 +994,54 @@ describe("FIX 6: skip-annotated dispatches are mirror-verified immediately", () 
     expect(core.getText()).toBe(view.state.doc.toString());
     errSpy.mockRestore();
     view.destroy();
+  });
+
+  it("does NOT false-positive when a batched update carries a skip-annotated transaction that isn't last", async () => {
+    // A host may deliver several transactions in ONE ViewUpdate
+    // (view.update([...]) / a batching dispatch). Core-driven changes were
+    // applied to the core BEFORE the update runs, so while iterating the
+    // batch, core.docLength() is already the FINAL length — comparing it
+    // against a NON-last skip-annotated transaction's intermediate newDoc
+    // used to false-positive and wipe undo history/anchors via load().
+    const core = new MockCore();
+    const view = makeView("abc", core);
+    await flush();
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const loadSpy = vi.spyOn(core, "load");
+
+    // Two core-driven changes, batched into one update. Both are already in
+    // the core when the update runs (exactly like two applyCoreChange
+    // dispatches a host batched together).
+    const c1 = core.command("toggleStrong", 0, 3)!; // core: "**abc**"
+    const tr1 = view.state.update({
+      changes: c1.splices.map((s) => ({ from: s.at, to: s.at + s.delete, insert: s.insert })),
+      annotations: oxidownSkip.of(true),
+    });
+    const c2 = core.command("setHeading", 0, 2)!; // core: "## **abc**"
+    const tr2 = tr1.state.update({
+      changes: c2.splices.map((s) => ({ from: s.at, to: s.at + s.delete, insert: s.insert })),
+      annotations: oxidownSkip.of(true),
+    });
+    view.update([tr1, tr2]);
+
+    expect(view.state.doc.toString()).toBe("## **abc**");
+    expect(core.getText()).toBe("## **abc**");
+    // No desync was reported and the core was never re-loaded...
+    expect(errSpy).not.toHaveBeenCalled();
+    expect(loadSpy).not.toHaveBeenCalled();
+    // ...so the undo history survived intact (a false-positive load() wipes it).
+    expect(core.undo()).not.toBeNull();
+    expect(core.getText()).toBe("**abc**");
+    expect(core.undo()).not.toBeNull();
+    expect(core.getText()).toBe("abc");
+
+    errSpy.mockRestore();
+    // Destroy BEFORE yielding: the undo probes above (deliberately not
+    // dispatched to the view) left core behind the view buffer, so the
+    // pending decoration rebuild must not run against it.
+    view.destroy();
+    await flush();
   });
 
   it("does NOT re-check (or false-positive) on an ordinary, unaltered core-driven change", async () => {

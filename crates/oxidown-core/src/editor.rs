@@ -691,14 +691,23 @@ impl Editor {
     ///   preceding paragraph;
     /// * indent/marker capture: `"- item\n\npara"` — giving `para`'s first
     ///   line leading indent (or a list marker) merges it into the list
-    ///   above, even ACROSS the blank line.
+    ///   above, even ACROSS the blank line;
+    /// * blank-line span absorption: `"- a\n\npara"` + `"\r\n"` at `para`'s
+    ///   start → `"- a\n\n\r\npara"` — no content merges, but pulldown-cmark
+    ///   reports List (and FootnoteDefinition) spans INCLUDING trailing
+    ///   blank lines, so the new blank line extends the absorber's span
+    ///   (`List 0..5` → `List 0..7`) — a change strictly ABOVE the tail
+    ///   slice, invisible to a standalone tail parse. Deletions trigger it
+    ///   too: `"- a\n\nx\npara"` minus the `x` blanks the first line the
+    ///   same way.
     ///
     /// The first two require direct line adjacency, so a blank line above
-    /// the tail block ("insulation") rules them out. The third survives
+    /// the tail block ("insulation") rules them out. The last two survive
     /// blank lines but only for block kinds that absorb indented/marker
-    /// lines (lists, indented code, footnote definitions) and only when the
-    /// edit leaves the first line with an absorbable SHAPE (leading
-    /// space/tab or a list-marker character). Hence:
+    /// lines or trailing blanks (lists, indented code, footnote
+    /// definitions) and only when the edit leaves the first line with an
+    /// absorbable SHAPE (leading space/tab, a list-marker character, or a
+    /// line-terminator byte — i.e. the first line became blank). Hence:
     ///
     /// * an edit strictly past the first line is always safe (the block's
     ///   start boundary is byte-determined by unchanged text);
@@ -763,8 +772,18 @@ impl Editor {
         } else {
             self.text.byte_at(region_start)
         };
-        let absorbable_shape = post_first_byte
-            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'-' | b'+' | b'*') || b.is_ascii_digit());
+        // `\r` / `\n` arms: a first line that became BLANK is absorbable
+        // too — List/FootnoteDefinition spans extend over trailing blank
+        // lines (the doc comment's fourth hazard). Without them, streaming
+        // `"\r\n"` at the tail block's start under a loose list took the
+        // fast path and left the cached List span 2 bytes short of a full
+        // parse. Only an edit touching `region_start` itself can blank the
+        // first line (the `else` arm's byte is a block's first byte, never
+        // a terminator), so unchanged-first-byte edits stay on the fast
+        // path.
+        let absorbable_shape = post_first_byte.is_some_and(|b| {
+            matches!(b, b' ' | b'\t' | b'-' | b'+' | b'*' | b'\r' | b'\n') || b.is_ascii_digit()
+        });
         (!absorbable_shape).then_some(region_start)
     }
 
@@ -773,6 +792,12 @@ impl Editor {
     /// at/after `region_start`, so everything before it is untouched.
     fn reparse_tail(&mut self, region_start: usize, batch: &[ByteSplice]) {
         self.reparse_counts.tail += 1;
+        // COST NOTE: this `retain` walks the ENTIRE overlay (the kept prefix
+        // included), so even a 1-char EOF keystroke pays O(overlay nodes) —
+        // small constants (a predicate over two usizes, compacting in
+        // place), but not strictly size-independent. See the invariant note
+        // in `reparse_incremental` step 3a for the shared flat-vec tradeoff
+        // and the scale at which it would matter.
         self.overlay.retain(|n| n.extent.end <= region_start);
         let slice = self
             .text
@@ -968,6 +993,24 @@ impl Editor {
             // 3a. Overlay splice. The overlay is sorted by extent.start and
             //     no node spans a top-level block boundary, so the replaced
             //     range is a contiguous run.
+            //
+            //     INVARIANT/COST NOTE (steps 3a+3b): the overlay is a flat
+            //     Vec of ABSOLUTE byte offsets, so after the window splice
+            //     every suffix node is shifted by `delta` (the loop below),
+            //     and 3b rebuilds + re-matches the whole block-span list.
+            //     A keystroke is therefore O(overlay nodes + blocks) with
+            //     very small constants (integer adds over a contiguous Vec;
+            //     one Vec rebuild of ~(doc/400)-ish spans) — NOT strictly
+            //     size-independent. Deliberate tradeoff: relative-offset
+            //     trees (CM6-style) make every READ pay pointer-chasing and
+            //     accumulation, while this shape keeps `decorations()` a
+            //     binary-searchable sorted slice. Counterexample scale: the
+            //     shift only starts to rival the window parse itself around
+            //     ~10MB documents (~1M overlay nodes ≈ a few hundred µs of
+            //     shifting per keystroke); the contract's 100KB reference
+            //     doc costs ~10k node shifts ≈ single-digit µs. Revisit
+            //     (chunked offsets / a per-suffix pending-delta) only if
+            //     docs that size become a target.
             let prefix_len = self
                 .overlay
                 .partition_point(|n| n.extent.start < region_start);

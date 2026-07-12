@@ -414,7 +414,17 @@ pub fn parse_document(src: &str) -> ParseResult {
                 nodes.extend(link_node(bytes, range.clone(), *link_type));
             }
             Event::Start(Tag::BlockQuote(_)) => {
-                bq_depth += 1;
+                // Saturating, like `list_depth` below: depth must never
+                // overflow the u8 (counterexample: `"> ".repeat(300) + "x"`
+                // — 300 nested quotes — panicked in debug, "attempt to add
+                // with overflow", and wrapped to a desynced depth for the
+                // rest of the parse in release). Depths clamp at 255; `End`
+                // `saturating_sub`s back down, so depth returns to 0 by
+                // document end (past the cap the add/sub pair transiently
+                // under-reports — acceptable, 256+ nesting is far beyond
+                // any real document, and every emitted depth stays a sane
+                // clamped value).
+                bq_depth = bq_depth.saturating_add(1);
                 bq_intervals.push((range.clone(), bq_depth));
             }
             Event::End(TagEnd::BlockQuote(_)) => {
@@ -464,14 +474,50 @@ pub fn parse_document(src: &str) -> ParseResult {
 
     // Per-line blockquote nodes: only walk lines within *top-level*
     // (depth == 1) intervals — nested intervals are subsets of those in
-    // byte range, and `depth_at` picks the deepest interval covering each
-    // line, so every line is visited exactly once regardless of nesting.
-    for (range, depth) in bq_intervals.iter().filter(|(_, d)| *d == 1) {
+    // byte range, and the deepest interval covering each line wins, so every
+    // line is visited exactly once regardless of nesting.
+    //
+    // The deepest-covering-interval query is a TWO-POINTER scan, not a
+    // per-line rescan of every interval: intervals are recorded at `Start`
+    // events, i.e. in document order (non-decreasing `range.start` —
+    // asserted below, the scan relies on it), and the lines below advance
+    // monotonically too (top-level intervals are disjoint and ordered;
+    // `split_lines` yields each one's lines in order). So an interval
+    // enters `bq_active` once its start precedes the current line's end and
+    // leaves for good once its end reaches the current line's start — each
+    // interval is pushed and dropped exactly once, making the whole pass
+    // O(quoted lines + intervals + Σ active-per-line), where the active set
+    // is just the nesting depth at that line. The previous shape
+    // (`depth_at_line` over ALL intervals for EVERY quoted line) was
+    // quadratic on quote-heavy documents — counterexample: a 32k-line
+    // document of short blockquotes is ~15k intervals × ~24k quoted lines
+    // ≈ 4·10^8 range tests, ~252ms per parse in release, vs single-digit ms
+    // with this scan (gated by tests/perf_baseline.rs
+    // `parse_blockquote_heavy_scaling`).
+    debug_assert!(
+        bq_intervals.windows(2).all(|w| w[0].0.start <= w[1].0.start),
+        "blockquote intervals must be in document order for the two-pointer scan"
+    );
+    let mut bq_cursor = 0usize;
+    let mut bq_active: Vec<(Range<usize>, u8)> = Vec::new();
+    for (range, _top_depth) in bq_intervals.iter().filter(|(_, d)| *d == 1) {
         for line in split_lines(bytes, range.clone()) {
             if line.start >= line.end {
                 continue;
             }
-            let line_depth = depth_at_line(&bq_intervals, &line);
+            while bq_cursor < bq_intervals.len() && bq_intervals[bq_cursor].0.start < line.end {
+                bq_active.push(bq_intervals[bq_cursor].clone());
+                bq_cursor += 1;
+            }
+            // Expired intervals can never cover a later line either (line
+            // starts advance monotonically), so dropping them here is final.
+            bq_active.retain(|(r, _)| r.end > line.start);
+            let line_depth = bq_active.iter().map(|(_, d)| *d).max().unwrap_or(0);
+            debug_assert_eq!(
+                line_depth,
+                depth_at_line(&bq_intervals, &line),
+                "two-pointer active set must agree with the reference scan"
+            );
             if line_depth == 0 {
                 continue;
             }
@@ -481,7 +527,6 @@ pub fn parse_document(src: &str) -> ParseResult {
             // `line_depth` runs.
             let mut delims = blockquote_markers(bytes, line.clone());
             delims.truncate(line_depth as usize);
-            let _ = depth; // depth of the enclosing top-level interval; line_depth is authoritative
             // Reveal is LINE-level (matching headings, contract v0.3): the
             // node's extent IS the line (terminator excluded by split_lines),
             // and the default reveal predicate uses the extent — a cursor
@@ -506,6 +551,11 @@ pub fn parse_document(src: &str) -> ParseResult {
 /// point-containment against the line's first byte would under-count depth
 /// for every line whose nested marker isn't at column 0. Overlap is exactly
 /// what "this line is (at least partly) inside this blockquote" means.
+///
+/// This is the REFERENCE implementation (O(intervals) per call): the hot
+/// path in `parse_document` uses the two-pointer active-set scan instead and
+/// `debug_assert`s agreement with this per line — the linear rescan is only
+/// ever evaluated in debug builds.
 fn depth_at_line(intervals: &[(Range<usize>, u8)], line: &Range<usize>) -> u8 {
     intervals
         .iter()
@@ -1853,6 +1903,55 @@ mod tests {
         assert_eq!(markers.len(), 2);
         assert_eq!(lines.len(), 2);
         assert_eq!(markers[0].extent, 2..4);
+    }
+
+    #[test]
+    fn deeply_nested_blockquotes_saturate_instead_of_overflowing() {
+        // 300 nested quotes on one line: `bq_depth += 1` on a u8 panicked in
+        // debug at depth 256 ("attempt to add with overflow") and wrapped —
+        // desyncing every later depth — in release. Depth now saturates,
+        // matching `list_depth`.
+        let doc = "> ".repeat(300) + "x";
+        let nodes = parse(&doc);
+        let lines: Vec<_> = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::BlockQuoteLine(_)))
+            .collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].kind,
+            NodeKind::BlockQuoteLine(u8::MAX),
+            "clamped at 255, never wrapped"
+        );
+        assert_eq!(
+            lines[0].delims.len(),
+            usize::from(u8::MAX),
+            "conceal runs capped at the clamped depth (runs 256..300 are content)"
+        );
+        assert_eq!(lines[0].extent, 0..doc.len());
+    }
+
+    #[test]
+    fn deep_mixed_quote_and_list_nesting_saturates_both_counters() {
+        // Quote AND list nesting both past the u8 cap on one line: both
+        // counters saturate (list_depth already did; bq_depth now matches)
+        // and the parse completes with sane clamped depths.
+        let doc = "> ".repeat(300) + &"- ".repeat(300) + "x";
+        let nodes = parse(&doc);
+        let max_list_depth = nodes
+            .iter()
+            .filter_map(|n| match n.kind {
+                NodeKind::ListMarker { depth, .. } => Some(depth),
+                _ => None,
+            })
+            .max();
+        assert_eq!(max_list_depth, Some(u8::MAX), "list depth clamps at 255");
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::BlockQuoteLine(u8::MAX)),
+            "quote depth clamps at 255"
+        );
     }
 
     #[test]

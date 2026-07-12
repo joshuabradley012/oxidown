@@ -30,7 +30,21 @@
 //! * An empty range with no touched node inserts an empty delimiter pair
 //!   and places the cursor between them (standard toolbar behavior; the
 //!   empty pair doesn't parse as formatting until content is typed —
-//!   accepted).
+//!   accepted). A second empty-range toggle between the delimiters nests
+//!   another pair (`a****b` → `a********b`): the empty pair parses as no
+//!   node, so there is nothing to strip — also accepted (pinned by test).
+//! * **Code contexts don't toggle**: a range touching a fenced-code line,
+//!   or (for the non-code toggles) a range endpoint strictly inside an
+//!   inline code span, returns `Ok(None)` — delimiters there would be
+//!   literal bytes, and a re-toggle would stack them. `Ok(None)` (no
+//!   mutation, no burned revision) rather than the multi-block
+//!   `InvalidArgument`, matching `set_heading`'s code-context check — the
+//!   nearest analog: the target is a well-formed range that the command
+//!   simply doesn't apply to, not a malformed argument.
+//! * Stripping a code span also sheds its CommonMark padding pair iff the
+//!   content has both a leading and a trailing space and is not all spaces
+//!   (the exact inverse of the ON path's padding rule), so padded spans
+//!   round-trip byte-identically (`` `edge `` ⇄ ``` `` `edge `` ```).
 //!
 //! ## setHeading
 //!
@@ -378,6 +392,21 @@ pub fn toggle_inline(
             detail: "inline toggle range spans more than one leaf block".into(),
         });
     }
+    // Code-context guard (module doc, "Toggle semantics"): delimiters
+    // written onto a fenced-code line are literal bytes, never formatting
+    // (`**code**` inside a fence stays raw, and a re-toggle over the
+    // returned selection stacks `****code****`). `single_leaf_block`'s own
+    // fence detection never runs for a single-line range (it short-circuits
+    // true), so this must be checked independently. Like `set_heading`'s
+    // code check — the nearest analog — this is "doesn't apply" (`Ok(None)`,
+    // no mutation, no burned revision), not the multi-block error above.
+    if nodes.iter().any(|n| {
+        matches!(n.kind, NodeKind::CodeFenceLine | NodeKind::CodeBlockLine)
+            && n.extent.start <= to_b
+            && from_b <= n.extent.end
+    }) {
+        return Ok(None);
+    }
     // OFF: innermost same-kind node whose closed extent contains the range
     // (rfind on the document-ordered overlay = last-starting = innermost).
     let containing = nodes.iter().rfind(|n| {
@@ -387,13 +416,35 @@ pub fn toggle_inline(
             && to_b <= n.extent.end
     });
     if let Some(node) = containing {
-        let d0 = &node.delims[0];
-        let d1 = &node.delims[1];
-        let open_len = d0.end - d0.start;
+        let (open_span, close_span) = strip_spans(kind, src, node);
+        let open_len = open_span.end - open_span.start;
         return Ok(Some(CommandPlan {
-            batch: vec![del(d0), del(d1)],
-            selection: Some((node.content.start - open_len, node.content.end - open_len)),
+            batch: vec![del(&open_span), del(&close_span)],
+            // Post-apply, the surviving content starts where the open span
+            // did and ends one open-span-length left of the close span.
+            selection: Some((open_span.start, close_span.start - open_len)),
         }));
+    }
+
+    // Inline-code half of the code-context guard, for the non-code toggles
+    // only (a code toggle's own interaction with Code nodes is the
+    // strip/extend logic around this): a range endpoint STRICTLY inside a
+    // code span's extent would drop a delimiter into the span's literal
+    // content (`` `code` `` + toggleStrong 2..4 → `` `c**od**e` ``, and a
+    // re-toggle stacks). Endpoints AT the extent's boundaries are fine —
+    // ``**`code`**`` parses as strong containing code. Checked AFTER the
+    // OFF branch above: unwrapping a containing same-kind node (e.g.
+    // toggleStrong inside the code span of ``**a `b` c**``) only deletes
+    // delimiters OUTSIDE the code span and stays safe.
+    if kind != InlineKind::Code {
+        let inside_code = |p: usize| {
+            nodes.iter().any(|n| {
+                matches!(n.kind, NodeKind::Code) && n.extent.start < p && p < n.extent.end
+            })
+        };
+        if inside_code(from_b) || inside_code(to_b) {
+            return Ok(None);
+        }
     }
 
     // ON / EXTEND: union with every touched same-kind node.
@@ -419,19 +470,28 @@ pub fn toggle_inline(
     let (open, close) = delimiters(kind, src, &touched, t_start, t_end);
     let open_len = open.len();
 
-    let mut batch = Vec::with_capacity(2 + touched.len() * 2);
+    // Same-KIND nodes CAN nest via different delimiter flavors (`_a *b* c_`
+    // is Emphasis inside Emphasis; `__a **b** c__` Strong inside Strong), so
+    // document order over `touched` is NOT position order over their
+    // delimiter spans — the outer node's closing delimiter sits after both
+    // of the inner node's. The apply path requires an ascending batch
+    // (counterexample pre-sort: `_a *b* c_ x` + toggleEm 0..11 emitted
+    // deletes at 0, 8, 3, 5 and silently corrupted both the text and its
+    // undo inverse), so collect every delimiter span and sort by position.
+    let mut delim_spans: Vec<&Range<usize>> =
+        touched.iter().flat_map(|n| n.delims.iter()).collect();
+    delim_spans.sort_unstable_by_key(|d| d.start);
+    let mut batch = Vec::with_capacity(2 + delim_spans.len());
     batch.push(ins(t_start, open));
     let mut deleted = 0usize;
-    for n in &touched {
-        deleted += (n.delims[0].end - n.delims[0].start) + (n.delims[1].end - n.delims[1].start);
-        batch.push(del(&n.delims[0]));
-        batch.push(del(&n.delims[1]));
+    for d in &delim_spans {
+        deleted += d.end - d.start;
+        batch.push(del(d));
     }
     batch.push(ins(t_end, close));
-    // `touched` nodes are document-ordered and non-overlapping for the same
-    // kind (same-delimiter emphasis cannot directly nest); with the open
-    // insert at t_start ≤ first delim and the close insert at t_end ≥ last
-    // delim end, the batch is ascending and non-overlapping as built.
+    // Delimiter spans are disjoint byte ranges; sorted by position, with the
+    // open insert at t_start ≤ every delim start and the close insert at
+    // t_end ≥ every delim end, the batch is ascending and non-overlapping.
     Ok(Some(CommandPlan {
         batch,
         selection: Some((t_start + open_len, t_end - deleted + open_len)),
@@ -483,6 +543,32 @@ fn delimiters(
     }
 }
 
+/// The two delete spans for an OFF (strip) toggle — [`delimiters`]' inverse.
+/// For every kind but code these are exactly the node's delimiter spans. A
+/// code span additionally sheds its CommonMark padding pair — one space on
+/// each side — iff the raw content has BOTH a leading and a trailing space
+/// and is not all spaces (the exact condition under which CommonMark strips
+/// a pad pair at render time, and the shape [`delimiters`]' ON path emits
+/// for edge-backtick content). Counterexample without this: `` `edge `` →
+/// ON → ``` `` `edge `` ``` → OFF left `· `edge ·` (two stray pad spaces)
+/// instead of round-tripping byte-identically. `` ` ` `` (all-space content)
+/// keeps its space: CommonMark never unpads it, so neither do we.
+fn strip_spans(kind: InlineKind, src: &SrcBytes, node: &Node) -> (Range<usize>, Range<usize>) {
+    let d0 = node.delims[0].clone();
+    let d1 = node.delims[1].clone();
+    let content = &node.content;
+    let padded = kind == InlineKind::Code
+        && content.end - content.start >= 2
+        && src.get(content.start) == Some(b' ')
+        && src.get(content.end - 1) == Some(b' ')
+        && !(content.start..content.end).all(|i| src.get(i) == Some(b' '));
+    if padded {
+        (d0.start..d0.end + 1, d1.start - 1..d1.end)
+    } else {
+        (d0, d1)
+    }
+}
+
 pub fn set_heading(
     nodes: &[Node],
     src: &SrcBytes,
@@ -491,12 +577,6 @@ pub fn set_heading(
     pos_b: usize,
     level: u8,
 ) -> Option<CommandPlan> {
-    if !matches!(
-        block_kind,
-        Some(BlockKind::Paragraph) | Some(BlockKind::Heading) | Some(BlockKind::BlockQuote)
-    ) {
-        return None;
-    }
     // Defensive: never rewrite lines the overlay knows are code.
     if nodes.iter().any(|n| {
         matches!(n.kind, NodeKind::CodeFenceLine | NodeKind::CodeBlockLine)
@@ -506,17 +586,43 @@ pub fn set_heading(
         return None;
     }
     // Inside a blockquote the hashes go after this line's `> ` markers.
-    let insertion = nodes
+    let after_quote = nodes
         .iter()
         .filter(|n| matches!(n.kind, NodeKind::BlockQuoteLine(_)))
         .find(|n| n.extent.start == line.start)
         .and_then(|n| n.delims.last().map(|d| d.end))
         .unwrap_or(line.start);
+    // ATX headings tolerate 1-3 spaces of leading indent (CommonMark), so
+    // the hash run sits/goes after such a run — counterexample without
+    // this: `"  # foo"` + any level returned `None` because the heading's
+    // delimiter starts at 2, not at the line start. A 4+-space run is
+    // indented code territory (its own line never passes the BlockKind gate
+    // above; a run this deep reaching here — e.g. a lazily-continued
+    // paragraph line — keeps the old at-the-run's-start behavior).
+    let space_run = (after_quote..line.end)
+        .take_while(|&i| src.get(i) == Some(b' '))
+        .count();
+    let insertion = if space_run <= 3 { after_quote + space_run } else { after_quote };
 
     let existing = nodes
         .iter()
         .filter(|n| matches!(n.kind, NodeKind::Heading(_)))
         .find(|n| n.delims.first().is_some_and(|d| d.start == insertion));
+
+    // Applies only on Paragraph/ATX-Heading/BlockQuote lines. The BlockKind
+    // gate alone is blind to an ATX heading with legal 1-3 spaces of leading
+    // indent: the heading BLOCK's span starts at its first `#`, not the line
+    // start, so the caller's line-start block lookup misses (`block_kind`
+    // `None`) — counterexample: `"  # foo"` could neither relevel nor be
+    // removed. An overlay heading whose delimiter sits exactly at the
+    // insertion point IS that case, so `existing` passes the gate too.
+    if !matches!(
+        block_kind,
+        Some(BlockKind::Paragraph) | Some(BlockKind::Heading) | Some(BlockKind::BlockQuote)
+    ) && existing.is_none()
+    {
+        return None;
+    }
 
     let batch = match (existing, level) {
         (None, 0) => return None, // nothing to remove
@@ -542,8 +648,13 @@ pub fn set_heading(
             if block_kind == Some(BlockKind::Heading) {
                 return None;
             }
-            // Blank line: nothing to promote.
-            if line.start >= line.end {
+            // Blank line: nothing to promote. Measured from `insertion`,
+            // not the line start, so a quote line with EMPTY content (`">"`,
+            // `"> "`) counts as blank exactly like a blank paragraph line —
+            // counterexample without this: `">"` + level 1 produced `"># "`,
+            // an empty heading inside the empty quote line. (Space-only
+            // remainders also land here via the 1-3-space skip above.)
+            if insertion >= line.end {
                 return None;
             }
             vec![ins(insertion, format!("{} ", "#".repeat(n as usize)))]

@@ -30,7 +30,11 @@ function fakeInner() {
   let doc = "";
   let revision = 0;
   const calls: { method: string; text: string }[] = [];
-  const change = (): CoreChange => ({ revision: ++revision, splices: [] });
+  const change = (at: number, insert: string): CoreChange => ({
+    revision: ++revision,
+    splices: [{ at, delete: 0, insert }],
+    selection: null,
+  });
   return {
     doc: () => doc,
     calls,
@@ -59,8 +63,9 @@ function fakeInner() {
       streamOpen: () => 1,
       streamAppend: (_id: number, chunk: string) => {
         calls.push({ method: "streamAppend", text: chunk });
+        const at = doc.length;
         doc += chunk;
-        return change();
+        return change(at, chunk);
       },
       streamClose: (id: number) => {
         calls.push({ method: "streamClose", text: String(id) });
@@ -151,20 +156,25 @@ describe("adaptWasmCore boundary guards (fake wasm instance)", () => {
     // length-2 chunking of "a😀b" splits the emoji: ["a\uD83D", "\uDE00b"]
     core.streamAppend(id, `a${HIGH}`);
     core.streamAppend(id, `${LOW}b`);
-    core.streamClose(id);
+    // No pending unit at close: nothing to flush, so nothing to return.
+    expect(core.streamClose(id)).toBeNull();
     expect(doc()).toBe(`a${EMOJI}b`);
     expect(doc()).not.toContain("�");
   });
 
-  it("flushes a still-pending high surrogate as U+FFFD on streamClose", () => {
+  it("flushes a still-pending high surrogate as U+FFFD on streamClose and returns the flush's CoreChange", () => {
     const { inner, doc, calls } = fakeInner();
     const core = adaptWasmCore(inner);
     const id = core.streamOpen(0);
     core.streamAppend(id, `x${HIGH}`);
-    core.streamClose(id);
+    const flush = core.streamClose(id);
     expect(doc()).toBe("x�");
     // The flush is one final append, then the close.
     expect(calls.map((c) => c.method)).toEqual(["streamAppend", "streamAppend", "streamClose"]);
+    // The final append's CoreChange is returned to the caller (dropping it
+    // would leave the view one code unit behind the core doc).
+    expect(flush).not.toBeNull();
+    expect(flush!.splices).toEqual([{ at: 1, delete: 0, insert: "�" }]);
   });
 
   it("streamAppend throws InvalidPayload on an interior lone surrogate; nothing crosses", () => {

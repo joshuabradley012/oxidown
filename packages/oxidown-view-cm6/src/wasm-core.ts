@@ -38,6 +38,11 @@
  *       streamOpen(pos: number): number
  *       streamAppend(id: number, chunk: string): CoreChange
  *       streamClose(id: number): void
+ *         — the PROTOCOL's streamClose returns `CoreChange | null` (the
+ *           U+FFFD flush of a withheld surrogate); that flush lives entirely
+ *           in this adapter (it forwards one final streamAppend and returns
+ *           its CoreChange), so the wasm instance's own streamClose stays
+ *           void.
  *
  *   splices/selections/decorations cross the boundary as one JSON string per
  *   call (`serde_json` Rust-side, `js_sys::JSON` JS-side — see the crate doc
@@ -54,7 +59,9 @@
  *     high surrogate per stream (a producer chunking at fixed UTF-16 lengths
  *     can split a surrogate pair across chunks); the withheld code unit is
  *     prepended to the next chunk, and `streamClose` flushes a still-pending
- *     one as U+FFFD before closing. A lone surrogate anywhere else in a
+ *     one as U+FFFD before closing — RETURNING that flush's CoreChange (null
+ *     when nothing was pending) so the view can apply it and stay in sync
+ *     with the core document. A lone surrogate anywhere else in a
  *     chunk throws "InvalidPayload: ..."; the stream's buffer is cleared
  *     whenever an append throws.
  *   - `destroy()`: frees the underlying wasm-bindgen instance (its `free()`
@@ -254,15 +261,20 @@ export function adaptWasmCore(inner: WasmCoreInstance): OxidownCore {
         throw err;
       }
     },
-    streamClose: (id: number) => {
+    streamClose: (id: number): CoreChange | null => {
       // A still-pending high surrogate can never be completed: flush it as
-      // U+FFFD (one final append) before closing. Close even if that throws.
+      // U+FFFD (one final append) before closing, and RETURN the flush's
+      // CoreChange so the caller can apply it to the view (dropping it would
+      // silently desync the core doc from the view by one code unit). Close
+      // even if the flush throws; null when nothing was pending.
       const flush = streamBuffer.takeFlush(id);
+      let change: CoreChange | null = null;
       try {
-        if (flush) inner.streamAppend(id, flush);
+        if (flush) change = inner.streamAppend(id, flush);
       } finally {
         inner.streamClose(id);
       }
+      return change;
     },
 
     destroy: () => {

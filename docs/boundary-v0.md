@@ -9,7 +9,10 @@ clarifications, the v0.2 (M1) additions, and inline v0.3 amendments; the "v0.3 c
 section at the end enumerates exactly what v0.3 comprises.
 
 Web-boundary flavor: **all positions in this protocol are UTF-16 code units** (CodeMirror's unit).
-The wasm crate converts to core-internal UTF-8 byte offsets. Core internals never leak bytes.
+The conversion to core-internal UTF-8 byte offsets happens inside `oxidown-core` itself — every
+public `Editor` entry point converts on the way in and out (editor.rs `utf16_to_byte*` /
+`byte_to_utf16`); the wasm crate passes UTF-16 positions through unchanged. Core internals never
+leak bytes.
 
 ## Model (restating plan.md §4 invariants for this seam)
 
@@ -333,6 +336,14 @@ Anchors survive arbitrary edits (mapped through every splice, bias-aware: "befor
 when an insertion lands exactly on it; "after" moves with the insertion). Deleting the anchored
 text collapses the anchor to the deletion site; it does not become null in M1.
 
+**Replacement-at-anchor bias (v0.3 clarification, pinned by test).** For a REPLACEMENT splice
+(`at = p`, `delete > 0`, non-empty `insert`) with an anchor exactly at `p`, the anchor stays at
+`p` — before the inserted text — regardless of bias. An "after"-biased anchor moves with a PURE
+insertion at its position, but a replacement's insertion happens at the deletion site the anchor
+collapsed to and does not carry the anchor past it. This intentionally differs from CM6's
+`assoc: 1` position mapping, which would place the position after the inserted text; both cores
+implement the stay-at-`p` behavior.
+
 ## Commands
 
 ```ts
@@ -561,7 +572,8 @@ empty items now decorate and behave like any other item.
 ```ts
 streamOpen(pos: number): number;                    // stream id; insertion point becomes an internal anchor
 streamAppend(id: number, chunk: string): CoreChange; // splices for the view to apply (skip annotation)
-streamClose(id: number): void;
+// v0.3 amendment — returns the surrogate-flush change (see below), or null. Previously void.
+streamClose(id: number): CoreChange | null;
 ```
 
 Rules:
@@ -573,7 +585,17 @@ Rules:
 - Append fast-path: an append that only extends the open tail block must not force
   full-document work beyond Phase-A parsing; with Phase A this means the decoration/damage
   computation is O(tail block), and the parser call itself stays within the perf budget.
-- `streamClose` on an unknown/closed id is a no-op; `streamAppend` on one throws.
+- `streamClose` on an unknown/closed id is a no-op (returns `null`); `streamAppend` on one throws.
+- **`streamClose` returns `CoreChange | null` (v0.3 amendment — previously `void`).** When the
+  stream's withheld trailing high surrogate is flushed as U+FFFD on close (see "Unpaired
+  surrogates in payloads"), the resulting `CoreChange` is RETURNED so the view can apply it
+  under its skip annotation like any other core-driven change — before this amendment the flush
+  mutated the core but the change was silently dropped, desyncing the view's mirror. Returns
+  `null` in the common nothing-pending case. The flush edit belongs to the STREAM'S single undo
+  unit (it is the stream's last append), not a unit of its own. The surrogate buffering — and
+  therefore the flush — lives at the adapter/mock layer: the raw wasm binding never buffers
+  (surrogate policy is enforced JS-side before text crosses the boundary), so its own
+  `streamClose` has nothing to return; the TS adapter produces the returned change.
 
 ## New edit origins
 
@@ -608,7 +630,14 @@ Stale revision, overlapping splices, or out-of-bounds positions: throw (wasm: `E
 exception). The view treats any core exception as a mirror-desync emergency: re-`load()` from
 the view buffer and log loudly. Never continue silently.
 
-Two validation-refusal error names (v0.3):
+Position arguments are additionally bounded to `u32::MAX` at the wasm boundary (wasm32's
+`usize` is 32 bits; a larger value would otherwise silently truncate — `2^32 + 6` becoming
+`6` — and edit the wrong range). Since any integer above `u32::MAX` is necessarily beyond the
+document, such a position throws the ordinary `OutOfBounds: position X beyond document length
+Y (UTF-16 code units)` — the same error the mock, whose numbers have no 32-bit cliff, reaches
+via its document-bounds check. Positions are NEVER silently truncated, wrapped, or clamped.
+
+Three validation-refusal error names (v0.3):
 
 - `InvalidArgs` — thrown by the wasm adapter/mock argument layer, before dispatch, when a raw
   argument is malformed (non-integer or negative numbers, a missing command argument, a
@@ -616,10 +645,18 @@ Two validation-refusal error names (v0.3):
 - `InvalidArgument` — thrown by the core when a value is semantically outside its documented
   domain (e.g. a heading level above 6 at the core API; an inline-toggle range spanning more
   than one leaf block).
+- `InvalidPayload` — thrown by the adapter/mock payload layer when a STRUCTURED payload is
+  malformed before it can cross the boundary: mis-shaped or non-serializable `splices` /
+  `selections` (e.g. a negative or non-integer field — wasm:
+  ``InvalidPayload: malformed splices: invalid value: integer `-1`, expected u32``; the mock
+  mirrors the name and `malformed splices` / `malformed selections` prefixes), and text
+  payloads carrying unpaired surrogates (see "Unpaired surrogates in payloads" below).
 
-Both are refusals thrown WITHOUT mutating the core; callers should treat them as consumed
+All three are refusals thrown WITHOUT mutating the core; callers should treat them as consumed
 no-ops (log and move on — never fall back to a default action, never resync), per the
-Commands section's no-mutation-on-throw rule.
+Commands section's no-mutation-on-throw rule. This carve-out applies from EVERY entry point,
+`applyEdit` and `decorations` included: the desync-emergency rule above governs exceptions the
+core throws once a well-formed call is underway, not these named pre-dispatch refusals.
 
 ## Unpaired surrogates in payloads (v0.3 addition)
 
@@ -634,7 +671,8 @@ itself never contains an unpaired surrogate code unit:
   withheld code unit is prepended to the next chunk. A lone surrogate anywhere else in a
   chunk throws `InvalidPayload: ...` (and clears the stream's pending buffer).
 - `streamClose` flushes a still-pending high surrogate as one U+FFFD before closing — it can
-  never be completed, and the document invariant must hold.
+  never be completed, and the document invariant must hold. The flush's `CoreChange` is
+  `streamClose`'s return value (`null` when nothing was pending) — see the Streaming rules.
 - Empty chunks — including a chunk fully withheld as a pending surrogate — and all-no-op edit
   batches return with the revision unchanged and create no undo unit.
 
@@ -664,8 +702,18 @@ list:
 - **Undo-coalescing region rule** — v0.1 clarification 4 amended: a single-splice `user`/`ime`
   edit coalesces when it falls within (or touches the ends of) the top undo unit's undo
   region, not merely when it touches the previous edit's end position.
-- **Error names `InvalidArgs` / `InvalidArgument`** — argument-layer vs. core-level semantic
-  validation refusals; both consumed no-ops. See "Error handling".
+- **Error names `InvalidArgs` / `InvalidArgument` / `InvalidPayload`** — argument-layer,
+  core-level-semantic, and payload-layer validation refusals; all consumed no-ops (no resync
+  obligation, from any entry point). Position arguments are bounded to `u32::MAX` at the wasm
+  boundary (over-u32 values throw the ordinary `OutOfBounds`, never a silent truncation).
+  See "Error handling".
+- **`streamClose(id): CoreChange | null`** — previously `void`; the U+FFFD surrogate-flush
+  change produced on close is now returned so the view can apply it (it was silently dropped,
+  desyncing the mirror). The flush belongs to the stream's single undo unit. See the Streaming
+  rules.
+- **Replacement-at-anchor bias pinned** — a replacement splice at an anchor's exact position
+  leaves the anchor before the inserted text regardless of bias (differs from CM6 `assoc: 1`).
+  See the Anchors section.
 - **Unpaired-surrogate payload rules** — see "Unpaired surrogates in payloads" above.
 - **Incremental-reparse complexity note** — the amendment under "Performance budget" pinning
   how `applyEdit`'s "O(edit + dirty block)" clause holds (windowed reparse, realignment,

@@ -32,7 +32,7 @@ use std::ops::Range;
 
 use crate::composition::Composition;
 use crate::parser::{Node, NodeKind};
-use crate::text::TextBuffer;
+use crate::text::{SrcBytes, TextBuffer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkStyle {
@@ -166,6 +166,45 @@ fn touches(a: usize, b: usize, from: usize, to: usize) -> bool {
     a <= to && b >= from
 }
 
+/// Start of the last blank (whitespace-only) line at/before `from`, or 0 —
+/// the windowing FLOOR for `compute`'s viewport filter. Found by a backward
+/// byte scan (chunk-cached via [`SrcBytes`]: O(bytes back to the previous
+/// blank line), which is exactly the region whose nodes can still overlap
+/// the viewport). A `\r\n` pair is ONE terminator — the empty "segment"
+/// between `\r` and `\n` must not read as a blank line, or the floor could
+/// land where the spans-no-blank-line invariant doesn't hold.
+fn blank_line_floor(text: &TextBuffer, from: usize) -> usize {
+    let src = SrcBytes::new(text);
+    // Start of the line containing `from` (which may sit mid-line).
+    let mut ls = from.min(src.len());
+    while ls > 0 && !matches!(src.byte(ls - 1), b'\n' | b'\r') {
+        ls -= 1;
+    }
+    loop {
+        if ls == 0 {
+            return 0;
+        }
+        // Step onto the previous line: skip its terminator (`\n`, `\r`, or
+        // the two-byte `\r\n`), then scan that line's content back to its
+        // own start, checking for anything non-blank.
+        let mut p = ls - 1;
+        if src.byte(p) == b'\n' && p > 0 && src.byte(p - 1) == b'\r' {
+            p -= 1;
+        }
+        let mut blank = true;
+        while p > 0 && !matches!(src.byte(p - 1), b'\n' | b'\r') {
+            if !matches!(src.byte(p - 1), b' ' | b'\t') {
+                blank = false;
+            }
+            p -= 1;
+        }
+        if blank {
+            return p;
+        }
+        ls = p;
+    }
+}
+
 pub fn compute(
     nodes: &[Node],
     text: &TextBuffer,
@@ -174,7 +213,41 @@ pub fn compute(
     composition: Option<&Composition>,
 ) -> Vec<Decoration> {
     let mut out = Vec::new();
-    for node in nodes {
+    // Viewport window over the overlay — O(window + log n), not a linear
+    // scan of every node per call. `nodes` is sorted by `extent.start`
+    // (`parse_document` stable-sorts; the editor's tail/incremental splice
+    // paths preserve the order), so the window END is a plain
+    // `partition_point`. The START cannot be: a node may begin BEFORE the
+    // viewport and still overlap it, and such nodes are NOT a contiguous
+    // suffix of the prefix — counterexample: `"> **a\n> b\n> c** d"` with a
+    // viewport inside the third line has the strong node (spanning all
+    // three lines) overlapping, but the per-line quote node of line two
+    // (later start, no overlap) sits between it and the viewport, so
+    // "back-scan until the first non-overlapping node" would drop the
+    // strong. Instead the start is lower-bounded by a parser-wide
+    // invariant: NO node's extent spans a blank (whitespace-only) line —
+    // line-oriented kinds (headings, quote/fence/code lines, markers,
+    // breaks) are single-line by construction, and inline kinds live inside
+    // one leaf block (paragraph/heading/table row), which a blank line
+    // always terminates. Every node overlapping the viewport therefore
+    // starts at/after the last blank line at/before `viewport.start`
+    // (anything starting earlier and ending inside the viewport would
+    // contain that whole blank line). Both bounds are asserted in debug
+    // builds, so every debug test run enforces the invariants this
+    // windowing relies on.
+    debug_assert!(
+        nodes.windows(2).all(|w| w[0].extent.start <= w[1].extent.start),
+        "compute requires the overlay sorted by extent.start"
+    );
+    let floor = blank_line_floor(text, viewport.start);
+    let lo = nodes.partition_point(|n| n.extent.start < floor);
+    let hi = nodes.partition_point(|n| n.extent.start < viewport.end);
+    debug_assert!(
+        nodes[..lo].iter().all(|n| n.extent.end <= viewport.start),
+        "windowing floor violated: a node below the floor overlaps the \
+         viewport (some extent spans a blank line?)"
+    );
+    for node in &nodes[lo..hi] {
         // Half-open overlap with the viewport; nodes have non-empty extents.
         if node.extent.start >= viewport.end || node.extent.end <= viewport.start {
             continue;

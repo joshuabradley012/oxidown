@@ -114,6 +114,36 @@ fn bias_does_not_disambiguate_replacements_at_the_anchor() {
 }
 
 #[test]
+fn replacement_starting_exactly_at_an_after_anchor_stays_before_the_insert() {
+    // Pinned contract behavior (documented in docs/boundary-v0.md): a
+    // REPLACEMENT splice starting exactly at the anchor (`at == anchor`,
+    // `delete > 0`, non-empty insert) leaves the anchor at the replacement
+    // START — BEFORE the inserted text — for BOTH biases. Bias only ever
+    // disambiguates a PURE insertion (zero-delete splice) landing exactly on
+    // the anchor. This deliberately DIFFERS from CodeMirror 6's `assoc: 1`
+    // mapping, which treats the replacement's insert like an insertion at
+    // the position and would move the anchor to 8 (after "xyz").
+    let mut ed = Editor::new(1);
+    let rev = ed.load("0123456789");
+    let after = ed.create_anchor(5, Bias::After).unwrap();
+    let before = ed.create_anchor(5, Bias::Before).unwrap();
+    ed.apply_edit(
+        rev,
+        &[Splice { at: 5, delete: 3, insert: "xyz".into() }],
+        EditOrigin::User,
+        0.0,
+    )
+    .unwrap();
+    assert_eq!(ed.get_text(), "01234xyz89");
+    assert_eq!(
+        ed.resolve_anchor(after),
+        Some(5),
+        "after-bias stays at the replacement start, NOT past the insert (CM6 assoc:1 would say 8)"
+    );
+    assert_eq!(ed.resolve_anchor(before), Some(5), "before-bias likewise");
+}
+
+#[test]
 fn anchor_position_inside_surrogate_pair_snaps_by_bias() {
     let mut ed = Editor::new(1);
     ed.load("😀x");

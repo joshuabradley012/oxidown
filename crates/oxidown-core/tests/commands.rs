@@ -236,6 +236,46 @@ fn toggle_innermost_when_same_kind_nests() {
 }
 
 #[test]
+fn toggle_extend_over_mixed_flavor_nested_same_kind_nodes() {
+    // `_…_` and `*…*` are both Emphasis, so same-KIND nodes nest here even
+    // though same-DELIMITER emphasis cannot: the ON/EXTEND batch's delimiter
+    // deletes must be emitted in POSITION order, not node order (the outer
+    // node's closing delimiter sits after both inner spans). Pre-fix the
+    // batch was non-ascending and silently corrupted the text (`*a b c_ *`)
+    // AND its undo inverse (`_a* *b c__ `).
+    let mut ed = Editor::new(1);
+    ed.load("_a *b* c_ x");
+    run(&mut ed, Command::ToggleEm { from: 0, to: 11 }).unwrap();
+    assert_eq!(ed.get_text(), "*a b c x*");
+
+    // Undo restores the original exactly, mirror-verified.
+    let mut mirror = ed.get_text();
+    let u = ed.undo().unwrap();
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "_a *b* c_ x", "undo restores the original exactly");
+    assert_eq!(mirror, ed.get_text(), "undo splices valid on view buffer");
+
+    // Double-toggle on the (canonical) result is byte-identical.
+    ed.redo().unwrap();
+    assert_eq!(ed.get_text(), "*a b c x*");
+    run(&mut ed, Command::ToggleEm { from: 3, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "a b c x");
+    run(&mut ed, Command::ToggleEm { from: 0, to: 7 }).unwrap();
+    assert_eq!(ed.get_text(), "*a b c x*", "canonical double-toggle is byte-identical");
+
+    // Same shape for Strong (`__…__` outer, `**…**` inner).
+    let mut ed = Editor::new(1);
+    ed.load("__a **b** c__ x");
+    run(&mut ed, Command::ToggleStrong { from: 0, to: 15 }).unwrap();
+    assert_eq!(ed.get_text(), "**a b c x**");
+    let mut mirror = ed.get_text();
+    let u = ed.undo().unwrap();
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "__a **b** c__ x", "undo restores the original exactly");
+    assert_eq!(mirror, ed.get_text());
+}
+
+#[test]
 fn toggle_em_strips_only_em_from_bold_italic() {
     let mut ed = Editor::new(1);
     ed.load("***x***"); // em(strong(x)) per CommonMark
@@ -275,6 +315,42 @@ fn toggle_code_pads_edge_backticks() {
     ed.load("`edge");
     run(&mut ed, Command::ToggleCode { from: 0, to: 5 }).unwrap();
     assert_eq!(ed.get_text(), "`` `edge ``");
+}
+
+#[test]
+fn toggle_code_off_strips_the_padding_pair_on_padded_spans() {
+    // ON pads edge-backtick content per CommonMark; OFF must shed the pad
+    // pair too (iff the content has BOTH a leading and trailing space and
+    // is not all spaces — the exact unpadding condition), or ON→OFF leaves
+    // two stray spaces instead of round-tripping byte-identically.
+    let mut ed = Editor::new(1);
+    ed.load("`edge");
+    run(&mut ed, Command::ToggleCode { from: 0, to: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "`` `edge ``");
+    run(&mut ed, Command::ToggleCode { from: 5, to: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "`edge", "ON→OFF byte-identical for edge-backtick content");
+
+    // A padded span wrapping nested backticks strips clean the same way.
+    let mut ed = Editor::new(1);
+    ed.load("`` `x` ``");
+    let change = run(&mut ed, Command::ToggleCode { from: 4, to: 4 }).unwrap();
+    assert_eq!(ed.get_text(), "`x`", "no stray pad spaces around the inner span");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (0, 3), "selection covers the unpadded content");
+
+    // Plain unpadded spans keep the delimiter-only strip: byte-identical.
+    let mut ed = Editor::new(1);
+    ed.load("`code`");
+    run(&mut ed, Command::ToggleCode { from: 3, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "code");
+    run(&mut ed, Command::ToggleCode { from: 0, to: 4 }).unwrap();
+    assert_eq!(ed.get_text(), "`code`", "unpadded round-trip stays byte-identical");
+
+    // All-space content is never unpadded (CommonMark keeps it verbatim).
+    let mut ed = Editor::new(1);
+    ed.load("` `");
+    run(&mut ed, Command::ToggleCode { from: 1, to: 1 }).unwrap();
+    assert_eq!(ed.get_text(), " ", "only the ticks go; the space is content");
 }
 
 #[test]
@@ -337,6 +413,63 @@ fn toggle_inline_across_leaf_blocks_errors_without_mutating() {
     ed.load("> a\n> b\n");
     run(&mut ed, Command::ToggleEm { from: 2, to: 7 }).unwrap();
     assert_eq!(ed.get_text(), "> *a\n> b*\n");
+}
+
+#[test]
+fn toggle_inline_does_not_apply_in_code_contexts() {
+    // Single-line range on a fenced-code line: `single_leaf_block`
+    // short-circuits true for single-line ranges, so the fence refusal must
+    // fire on its own. Ok(None) like `set_heading`'s code check (the
+    // nearest analog) — no mutation, no burned revision, unlike the
+    // multi-block InvalidArgument throw.
+    let doc = "```\ncode\n```\n";
+    let mut ed = Editor::new(1);
+    ed.load(doc);
+    let rev = ed.revision();
+    assert!(ed.command(Command::ToggleStrong { from: 4, to: 8 }).unwrap().is_none());
+    assert_eq!(ed.get_text(), doc, "no delimiters written into the fence");
+    assert_eq!(ed.revision(), rev, "refusal must not burn a revision");
+    // The fence line itself (backticks) is equally off limits, for every kind.
+    assert!(ed.command(Command::ToggleCode { from: 0, to: 3 }).unwrap().is_none());
+    assert_eq!(ed.get_text(), doc);
+
+    // Range strictly inside an inline code span: the delimiters would be
+    // literal content (`` `c**od**e` ``), and a re-toggle would stack.
+    let mut ed = Editor::new(1);
+    ed.load("`code`");
+    let rev = ed.revision();
+    assert!(ed.command(Command::ToggleStrong { from: 2, to: 4 }).unwrap().is_none());
+    assert_eq!(ed.get_text(), "`code`", "no mutation inside the code span");
+    assert_eq!(ed.revision(), rev, "refusal must not burn a revision");
+    // A cursor inside the span (the stacking re-toggle shape) is refused too.
+    assert!(ed.command(Command::ToggleStrong { from: 3, to: 3 }).unwrap().is_none());
+    assert_eq!(ed.get_text(), "`code`");
+
+    // ...but endpoints AT the span's extent boundaries wrap the WHOLE span,
+    // which parses fine (strong containing code).
+    let mut ed = Editor::new(1);
+    ed.load("`code`");
+    run(&mut ed, Command::ToggleStrong { from: 0, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "**`code`**");
+}
+
+#[test]
+fn empty_pair_cursor_retoggle_nests_another_pair() {
+    // Pins the module-doc-documented ACCEPTED behavior: an empty-range
+    // toggle inserts a non-parsing empty pair, and a second cursor toggle
+    // between the delimiters nests another pair rather than removing the
+    // first — the empty pair parses as no node, so there is nothing to
+    // strip. If this drifts, the module doc must change with it.
+    let mut ed = Editor::new(1);
+    ed.load("ab");
+    let change = run(&mut ed, Command::ToggleStrong { from: 1, to: 1 }).unwrap();
+    assert_eq!(ed.get_text(), "a****b");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (3, 3), "cursor between the delimiters");
+    let change = run(&mut ed, Command::ToggleStrong { from: 3, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "a********b", "second press nests, not unwraps");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (5, 5), "cursor between the inner pair");
 }
 
 #[test]
@@ -413,6 +546,68 @@ fn set_heading_does_not_apply_inside_code_or_lists() {
     let mut ed = Editor::new(1);
     ed.load("    indented code\n");
     assert!(ed.command(Command::SetHeading { pos: 8, level: 1 }).unwrap().is_none());
+}
+
+#[test]
+fn set_heading_handles_atx_with_legal_leading_indent() {
+    // 1-3 spaces of leading indent are legal ATX indentation (CommonMark):
+    // relevel and remove must find the hash run past them. Pre-fix both
+    // returned Ok(None) because the heading's delimiter doesn't start at
+    // the line start.
+    let mut ed = Editor::new(1);
+    ed.load("  # foo\n");
+    run(&mut ed, Command::SetHeading { pos: 4, level: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "  ## foo\n", "indented ATX relevels in place");
+
+    let mut ed = Editor::new(1);
+    ed.load("  # foo\n");
+    run(&mut ed, Command::SetHeading { pos: 4, level: 0 }).unwrap();
+    assert_eq!(ed.get_text(), "  foo\n", "level 0 removes the indented hash run");
+
+    // 3 spaces is the maximum; the hash run still resolves.
+    let mut ed = Editor::new(1);
+    ed.load("   ## bar\n");
+    run(&mut ed, Command::SetHeading { pos: 6, level: 1 }).unwrap();
+    assert_eq!(ed.get_text(), "   # bar\n");
+
+    // 4 spaces is indented code in the v0 grammar (pulldown parses it as an
+    // indented code block, so the BlockKind gate refuses): unchanged.
+    let mut ed = Editor::new(1);
+    ed.load("    # foo\n");
+    let rev = ed.revision();
+    assert!(ed.command(Command::SetHeading { pos: 6, level: 2 }).unwrap().is_none());
+    assert_eq!(ed.get_text(), "    # foo\n");
+    assert_eq!(ed.revision(), rev);
+}
+
+#[test]
+fn set_heading_on_an_empty_quote_line_is_null_like_a_blank_line() {
+    // A quote line with EMPTY content must behave like a blank paragraph
+    // line: nothing to promote. Pre-fix `">"` + level 1 produced `"># "` —
+    // an empty heading inside the empty quote line.
+    for doc in [">", "> ", "> x\n>\n"] {
+        let mut ed = Editor::new(1);
+        ed.load(doc);
+        let rev = ed.revision();
+        let pos = doc.len() - if doc.ends_with('\n') { 1 } else { 0 };
+        assert!(
+            ed.command(Command::SetHeading { pos, level: 1 }).unwrap().is_none(),
+            "{doc:?}"
+        );
+        assert_eq!(ed.get_text(), doc, "no mutation for {doc:?}");
+        assert_eq!(ed.revision(), rev);
+    }
+    // The blank-paragraph-line control keeps returning None.
+    let mut ed = Editor::new(1);
+    ed.load("x\n\ny\n");
+    assert!(ed.command(Command::SetHeading { pos: 2, level: 1 }).unwrap().is_none());
+    assert_eq!(ed.get_text(), "x\n\ny\n");
+    // ...while a NON-empty quote line still promotes (the guard is about
+    // content emptiness, not quotes).
+    let mut ed = Editor::new(1);
+    ed.load("> quoted\n");
+    run(&mut ed, Command::SetHeading { pos: 4, level: 1 }).unwrap();
+    assert_eq!(ed.get_text(), "> # quoted\n");
 }
 
 #[test]

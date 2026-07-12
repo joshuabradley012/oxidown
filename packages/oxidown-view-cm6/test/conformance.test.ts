@@ -7,8 +7,10 @@
  *    (wasm-pack --target web). It is loaded Node-side via `initSync` on the
  *    raw .wasm bytes and wrapped with the PRODUCTION adapter
  *    (`adaptWasmCore`), so the JS-side surrogate policy applies to both
- *    cores identically. A missing/unloadable pkg SKIPS the wasm side with a
- *    log line — it never fails the suite.
+ *    cores identically. In local dev a missing/unloadable pkg SKIPS the
+ *    wasm side with a log line; in CI (process.env.CI truthy) it FAILS the
+ *    suite — ci.yml builds the pkg precisely so these cases exercise the
+ *    real wasm binary, and a silent skip would let CI go green without it.
  *
  * The cases pin the boundary-contract parity semantics (docs/boundary-v0.md
  * plus the M1 review's pinned clarifications): error-message prefixes and,
@@ -25,9 +27,9 @@
 import { describe, expect, it } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { MockCore } from "../src/mock-core";
+import { MockCore, applySplices } from "../src/mock-core";
 import { adaptWasmCore } from "../src/wasm-core";
-import type { Decoration, OxidownCore, RangeCommandName } from "../src/protocol";
+import type { CoreChange, Decoration, OxidownCore, RangeCommandName } from "../src/protocol";
 
 type CoreFactory = () => OxidownCore;
 
@@ -37,6 +39,12 @@ type CoreFactory = () => OxidownCore;
 // file:// in Node. Same pkg the view loads in the browser (wasm-core.ts).
 // ---------------------------------------------------------------------------
 
+// In CI the wasm side is MANDATORY: ci.yml builds crates/oxidown-wasm/pkg
+// before running this suite, so a missing or unloadable pkg there means the
+// wasm binary was never exercised — fail loudly instead of green-skipping.
+// Local dev keeps the skip + console.log convenience.
+const REQUIRE_WASM = Boolean(process.env.CI);
+
 async function loadWasmFactory(): Promise<CoreFactory | null> {
   const jsPath = fileURLToPath(
     new URL("../../../crates/oxidown-wasm/pkg/oxidown_wasm.js", import.meta.url),
@@ -44,7 +52,15 @@ async function loadWasmFactory(): Promise<CoreFactory | null> {
   const wasmPath = fileURLToPath(
     new URL("../../../crates/oxidown-wasm/pkg/oxidown_wasm_bg.wasm", import.meta.url),
   );
-  if (!existsSync(jsPath) || !existsSync(wasmPath)) return null;
+  if (!existsSync(jsPath) || !existsSync(wasmPath)) {
+    if (REQUIRE_WASM) {
+      throw new Error(
+        "[conformance] CI requires the wasm side: crates/oxidown-wasm/pkg is missing " +
+          "(build it with wasm-pack before running the conformance suite)",
+      );
+    }
+    return null;
+  }
   try {
     const mod = (await import(/* @vite-ignore */ jsPath)) as {
       initSync: (arg: { module: BufferSource }) => unknown;
@@ -53,6 +69,11 @@ async function loadWasmFactory(): Promise<CoreFactory | null> {
     mod.initSync({ module: readFileSync(wasmPath) });
     return () => adaptWasmCore(new mod.OxidownCore());
   } catch (err) {
+    if (REQUIRE_WASM) {
+      throw new Error(
+        `[conformance] CI requires the wasm side: crates/oxidown-wasm/pkg is present but failed to load: ${String(err)}`,
+      );
+    }
     console.log(
       "[conformance] crates/oxidown-wasm/pkg present but failed to load — wasm side skipped:",
       err,
@@ -218,6 +239,34 @@ for (const [coreName, makeCore] of factories) {
       expect(core.getText()).toBe("hello world"); // command() throws WITHOUT mutating
     });
 
+    it("previously-u32-typed numeric paths validate identically (InvalidArgs / InvalidRange / OutOfBounds, no silent u32 coercion)", () => {
+      // These arguments used to be typed u32 at the wasm-bindgen boundary,
+      // where a negative/fractional/huge JS number would be rejected (or
+      // wrapped) by wasm-bindgen's own conversion instead of the shared
+      // validation layer. Pinned to the MOCK's behavior (the boundary
+      // contract's): the wasm arg layer is being aligned to it — until the
+      // rebuilt pkg lands, the WasmCore side of this case may fail.
+      const core = boot("hello world"); // length 11
+      expect(thrownMessage(() => core.createAnchor(-1, "before"))).toBe(
+        "InvalidArgs: pos must be a non-negative integer, got -1",
+      );
+      expect(thrownMessage(() => core.createAnchor(1.5, "before"))).toBe(
+        "InvalidArgs: pos must be a non-negative integer, got 1.5",
+      );
+      expect(thrownMessage(() => core.decorations(core.revision(), 1.9, 3, []))).toBe(
+        "InvalidArgs: from must be a non-negative integer, got 1.9",
+      );
+      // 2**32 is a well-formed integer: it must flow into the ordinary
+      // range/bounds checks, never wrap to 0 through a u32.
+      expect(thrownMessage(() => core.decorations(core.revision(), 2 ** 32, 5, []))).toBe(
+        "InvalidRange: from 4294967296 > to 5",
+      );
+      expect(thrownMessage(() => core.command("toggleStrong", 2 ** 32 + 6, 2 ** 32 + 11))).toBe(
+        "OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)",
+      );
+      expect(core.getText()).toBe("hello world"); // nothing mutated
+    });
+
     it("setHeading level validation throws InvalidArgs", () => {
       const core = boot("Title");
       expect(
@@ -374,16 +423,44 @@ for (const [coreName, makeCore] of factories) {
       expect(core.getText()).toBe("ok");
     });
 
-    it("streamClose flushes a still-pending high surrogate as one U+FFFD", () => {
+    it("streamClose flushes a still-pending high surrogate as one U+FFFD and RETURNS the flush's CoreChange", () => {
       const core = boot("");
       const id = core.streamOpen(0);
-      core.streamAppend(id, "a");
-      core.streamAppend(id, HIGH); // withheld, never completed
-      core.streamClose(id);
+      // Mirror what a view does with every streaming CoreChange: apply the
+      // returned splices to a shadow buffer. If streamClose's flush change
+      // were dropped (the original bug), the mirror would end one code unit
+      // short of the core doc.
+      let mirror = "";
+      const track = (change: CoreChange | null): void => {
+        if (change) mirror = applySplices(mirror, change.splices);
+      };
+      track(core.streamAppend(id, "a"));
+      track(core.streamAppend(id, HIGH)); // withheld, never completed
+      const flush = core.streamClose(id);
+      expect(flush).not.toBeNull();
+      expect(flush!.splices).toEqual([{ at: 1, delete: 0, insert: "�" }]);
+      // Streaming changes omit the selection, streamClose's flush included.
+      expect(flush!.selection ?? null).toBeNull();
+      track(flush);
       expect(core.getText()).toBe("a�");
+      expect(mirror).toBe(core.getText()); // applying the returned change reconciles the mirror
       expect(thrownMessage(() => core.streamAppend(id, "x"))).toBe(
         `UnknownStream: stream ${id} is unknown or already closed`,
       );
+      // The flush belongs to the stream's single undo unit: one undo drops
+      // the whole stream, U+FFFD included.
+      core.undo();
+      expect(core.getText()).toBe("");
+    });
+
+    it("streamClose returns null when no flush was needed (and on unknown ids)", () => {
+      const core = boot("x");
+      const id = core.streamOpen(1);
+      core.streamAppend(id, "complete"); // nothing withheld
+      expect(core.streamClose(id)).toBeNull();
+      expect(core.streamClose(id)).toBeNull(); // already closed: no-op, null
+      expect(core.streamClose(999)).toBeNull(); // never opened: no-op, null
+      expect(core.getText()).toBe("xcomplete");
     });
 
     it("streamAppend on a never-opened id throws UnknownStream; streamClose no-ops", () => {
@@ -574,5 +651,168 @@ for (const [coreName, makeCore] of factories) {
     const fromMock = normalize(mock.decorations(mock.revision(), 0, FIXTURE.length, []));
     const fromWasm = normalize(wasm.decorations(wasm.revision(), 0, FIXTURE.length, []));
     expect(fromMock).toEqual(fromWasm);
+  });
+
+  // ---- decoration OFFSETS on astral-plane content -------------------------
+
+  it("both cores emit identical decoration offsets on astral-plane content (emoji in styled text)", () => {
+    // Every position below 😀 differs between UTF-16 code units (the
+    // boundary's unit) and UTF-8 bytes (the Rust core's internal unit): any
+    // conversion slip shifts an offset by 2. Full decoration-list equality,
+    // not just spot fields.
+    const doc = `**${EMOJI} a** _b${EMOJI}_`;
+    const mock: OxidownCore = new MockCore();
+    const wasm = wasmFactory!();
+    mock.load(doc);
+    wasm.load(doc);
+    const fromMock = normalize(mock.decorations(mock.revision(), 0, doc.length, []));
+    const fromWasm = normalize(wasm.decorations(wasm.revision(), 0, doc.length, []));
+    expect(fromMock).toEqual(fromWasm);
+    // The payload is non-trivial (both inline nodes actually decorated).
+    expect(fromMock.length).toBeGreaterThan(0);
+  });
+
+  // ---- revealed-state equivalence (selection-driven reveal) ----------------
+
+  it("both cores agree on selection-driven reveal state", () => {
+    const doc = ["see [text](url) end", "- item one", "---", ""].join("\n");
+    const cases: Array<[label: string, pos: number]> = [
+      ["cursor inside the link (delim/url/delim split)", doc.indexOf("text") + 1],
+      ["cursor on the list line", doc.indexOf("item") + 2],
+      ["cursor on the hr line", doc.indexOf("---") + 1],
+    ];
+    for (const [label, pos] of cases) {
+      const mock: OxidownCore = new MockCore();
+      const wasm = wasmFactory!();
+      mock.load(doc);
+      wasm.load(doc);
+      const sel = [{ anchor: pos, head: pos }];
+      const fromMock = normalize(mock.decorations(mock.revision(), 0, doc.length, sel));
+      const fromWasm = normalize(wasm.decorations(wasm.revision(), 0, doc.length, sel));
+      expect(fromMock, label).toEqual(fromWasm);
+    }
+  });
+
+  // ---- command CoreChange OUTPUT equivalence (splices AND selection) -------
+
+  it("both cores return the same command CoreChange (splices and selection)", () => {
+    const fixtures: Array<{
+      label: string;
+      doc: string;
+      run: (core: OxidownCore) => CoreChange | null;
+    }> = [
+      {
+        label: "toggleStrong wraps a plain selection",
+        doc: "hello world",
+        run: (c) => c.command("toggleStrong", 6, 11),
+      },
+      {
+        label: "toggleStrong unwraps when the selection is the inner content",
+        doc: "hello **world**",
+        run: (c) => c.command("toggleStrong", 8, 13),
+      },
+      {
+        label: "toggleEm wraps a plain selection",
+        doc: "hello world",
+        run: (c) => c.command("toggleEm", 0, 5),
+      },
+      {
+        label: "toggleCode wraps a plain selection",
+        doc: "hello world",
+        run: (c) => c.command("toggleCode", 6, 11),
+      },
+      {
+        label: "setHeading adds a prefix to a plain line",
+        doc: "plain line",
+        run: (c) => c.command("setHeading", 4, 2),
+      },
+      {
+        label: "setHeading level 0 strips an existing prefix",
+        doc: "## heading",
+        run: (c) => c.command("setHeading", 5, 0),
+      },
+      {
+        label: "toggleTask checks an unchecked item",
+        doc: "- [ ] task",
+        run: (c) => c.command("toggleTask", 3),
+      },
+      {
+        label: "toggleTask unchecks a checked item",
+        doc: "- [x] done",
+        run: (c) => c.command("toggleTask", 8),
+      },
+    ];
+    for (const { label, doc, run } of fixtures) {
+      const mock: OxidownCore = new MockCore();
+      const wasm = wasmFactory!();
+      mock.load(doc);
+      wasm.load(doc);
+      const fromMock = run(mock);
+      const fromWasm = run(wasm);
+      expect(fromMock === null, label).toBe(fromWasm === null);
+      if (fromMock && fromWasm) {
+        expect(fromMock.splices, label).toEqual(fromWasm.splices);
+        expect(fromMock.selection ?? null, label).toEqual(fromWasm.selection ?? null);
+      }
+      expect(mock.getText(), label).toBe(wasm.getText());
+    }
+  });
+
+  // ---- stream-undo cascade under multi-splice interleaved edits ------------
+
+  it("stream + multi-splice user edits interleaved, then a full undo/redo drain, match across cores", () => {
+    // The case that would have caught the mock's coarse-diff cascade bug: a
+    // MULTI-cursor applyEdit batch with splices on BOTH sides of the stream
+    // insertion point, interleaved with appends. The undo cascade must map
+    // the streamed spans through the recorded per-edit batches exactly
+    // (history.rs record_stream_append); a prefix/suffix whole-text diff
+    // teleports the streamed text to the batch's first difference.
+    const run = (core: OxidownCore): string[] => {
+      const out: string[] = [];
+      const step = (): void => {
+        out.push(core.getText());
+      };
+      core.load("aaaa bbbb cccc");
+      const id = core.streamOpen(7); // between "bb" and "bb"
+      core.streamAppend(id, "S1");
+      step();
+      // Multi-cursor batch: one splice on each side of the stream point.
+      core.applyEdit(
+        core.revision(),
+        [
+          { at: 2, delete: 1, insert: "XX" },
+          { at: 12, delete: 2, insert: "Y" },
+        ],
+        "user",
+      );
+      step();
+      core.streamAppend(id, "S2");
+      step();
+      // A second multi-splice batch, again straddling the (mapped) anchor.
+      core.applyEdit(
+        core.revision(),
+        [
+          { at: 0, delete: 0, insert: "P" },
+          { at: core.docLength(), delete: 0, insert: "Q" },
+        ],
+        "user",
+      );
+      step();
+      core.streamAppend(id, "S3");
+      expect(core.streamClose(id)).toBeNull();
+      step();
+      for (;;) {
+        const change = core.undo();
+        if (change === null) break;
+        step();
+      }
+      for (;;) {
+        const change = core.redo();
+        if (change === null) break;
+        step();
+      }
+      return out;
+    };
+    expect(run(new MockCore())).toEqual(run(wasmFactory!()));
   });
 });

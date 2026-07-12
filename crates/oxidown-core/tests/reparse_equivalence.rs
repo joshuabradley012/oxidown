@@ -26,15 +26,20 @@ fn fuzz_edits(default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Mixed-markdown corpus (same shape as perf_baseline.rs's generator):
+/// Mixed-markdown corpus (superset of perf_baseline.rs's generator):
 /// headings, inline-marked paragraphs, nested blockquotes, fenced code,
-/// nested/task/ordered lists, thematic breaks, CJK + emoji.
+/// nested/task/ordered lists, thematic breaks, CJK + emoji — plus GFM
+/// tables, HTML blocks, indented (4-space) code blocks, and a
+/// blockquote-heavy run, so `BlockKind::Table`/`HtmlBlock`/indented
+/// `CodeBlock` (which the v0 parser recognizes as blocks but emits no
+/// overlay nodes for) and the parser's per-line blockquote pass all flow
+/// through `match_spans` and the convergence certificate under fuzz.
 fn generate_mixed_doc(target_bytes: usize) -> String {
     let mut doc = String::with_capacity(target_bytes + 2048);
     doc.push_str("# Equivalence corpus\n\nMixed constructs for reparse fuzzing.\n\n");
     let mut i = 0usize;
     while doc.len() < target_bytes {
-        match i % 6 {
+        match i % 10 {
             0 => {
                 doc.push_str(&format!("## Section {i}\n\n"));
                 doc.push_str(&format!(
@@ -67,9 +72,39 @@ fn generate_mixed_doc(target_bytes: usize) -> String {
                      - nested beta\n- [ ] a task\n- [x] done task\n1. ordered one\n2. ordered two\n\n"
                 ));
             }
-            _ => {
+            5 => {
                 doc.push_str(&format!(
                     "### Subsection {i}\n\nA paragraph with ~~strike~~ and *style*.\n\n---\n\n"
+                ));
+            }
+            6 => {
+                // GFM table (header + delimiter + body rows): parses as
+                // BlockKind::Table; M1 emits no overlay nodes for it, but
+                // the block must still splice/match correctly.
+                doc.push_str(&format!(
+                    "| col a | col b {i} |\n| --- | ---: |\n| one | **two** |\n| 你好 | 😀 {i} |\n\n"
+                ));
+            }
+            7 => {
+                // HTML block: BlockKind::HtmlBlock, no overlay nodes.
+                doc.push_str(&format!(
+                    "<div class=\"sec-{i}\">\n  <p>raw html {i}</p>\n</div>\n\n"
+                ));
+            }
+            8 => {
+                // Indented (4-space) code block: BlockKind::CodeBlock with
+                // no fence lines (fenced blocks are arm 3), no overlay nodes.
+                doc.push_str(&format!(
+                    "    indented code {i}\n    second indented line\n\n"
+                ));
+            }
+            _ => {
+                // Blockquote-heavy run: several short quote blocks with
+                // varying nesting, keeping the parser's per-line blockquote
+                // pass (the two-pointer interval scan) under differential
+                // fuzz.
+                doc.push_str(&format!(
+                    "> q{i} one\n> q{i} two\n\n> > nested {i}\n> > > deeper *em*\n> shallow\n\n> single {i}\n\n"
                 ));
             }
         }
@@ -111,6 +146,13 @@ const INSERTS: &[&str] = &[
     "你好",
     "-",
     "x# ",
+    // Table / HTML-block shapes: constructs the v0 parser recognizes as
+    // blocks (Table / HtmlBlock) without emitting overlay nodes — inserting
+    // or breaking them mid-document must still converge.
+    "| a | b |\n| - | - |\n",
+    "| x |",
+    "<div>\n",
+    "</div>\n\n",
 ];
 
 /// Snap `pos` down to a char boundary of `s`.

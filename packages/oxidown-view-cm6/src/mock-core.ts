@@ -134,6 +134,82 @@ export function diffSplices(from: string, to: string): Splice[] {
   return [{ at: start, delete: endFrom - start, insert: to.slice(start, endTo) }];
 }
 
+/**
+ * Exact inverse of an ascending splice batch: applying the result to
+ * `applySplices(doc, splices)` restores `doc`. Positions are in POST-edit
+ * coordinates (the frame where the corresponding undo unit sits on top of
+ * the stack) — the TS counterpart of what editor.rs records per edit.
+ */
+function invertSplices(doc: string, splices: Splice[]): Splice[] {
+  const out: Splice[] = [];
+  let delta = 0;
+  for (const s of splices) {
+    out.push({
+      at: s.at + delta,
+      delete: s.insert.length,
+      insert: doc.slice(s.at, s.at + s.delete),
+    });
+    delta += s.insert.length - s.delete;
+  }
+  return out;
+}
+
+/**
+ * Rewrite an inverse batch as if a pure insertion of `len` code units at
+ * `at` (same frame as the batch) had always been present — a direct
+ * transcription of history.rs `map_batch_through_insertion`:
+ *
+ * * splices starting at or after `at` shift right by `len` (an insertion
+ *   exactly at a splice's start is NOT owned by that splice — streamed text
+ *   must never be deleted by a non-stream unit);
+ * * a delete-span strictly containing `at` splits around the inserted
+ *   region, the restore text staying with the first piece.
+ */
+function mapBatchThroughInsertion(batch: Splice[], at: number, len: number): Splice[] {
+  const out: Splice[] = [];
+  for (const s of batch) {
+    const end = s.at + s.delete;
+    if (at <= s.at) {
+      out.push({ at: s.at + len, delete: s.delete, insert: s.insert });
+    } else if (at >= end) {
+      out.push(s);
+    } else {
+      out.push({ at: s.at, delete: at - s.at, insert: s.insert });
+      out.push({ at: at + len, delete: end - at, insert: "" });
+    }
+  }
+  return out;
+}
+
+/**
+ * Insert a pure delete `[at, at+len)` into an ascending, non-overlapping
+ * inverse batch, coalescing with pure-delete neighbors it touches (the
+ * caller guarantees — via `mapBatchThroughInsertion` — that no existing
+ * splice overlaps the new range). Transcribes history.rs `merge_delete`.
+ */
+function mergeDelete(batch: Splice[], at: number, len: number): void {
+  const absorbNext = (idx: number): void => {
+    if (idx + 1 < batch.length) {
+      const end = batch[idx].at + batch[idx].delete;
+      if (batch[idx + 1].at === end && batch[idx + 1].insert === "") {
+        batch[idx].delete += batch[idx + 1].delete;
+        batch.splice(idx + 1, 1);
+      }
+    }
+  };
+  let idx = 0;
+  while (idx < batch.length && batch[idx].at + batch[idx].delete < at) idx++;
+  if (idx < batch.length && batch[idx].at + batch[idx].delete === at && batch[idx].insert === "") {
+    batch[idx].delete += len;
+    absorbNext(idx);
+    return;
+  }
+  let insertAt = 0;
+  while (insertAt < batch.length && batch[insertAt].at < at) insertAt++;
+  batch.splice(insertAt, 0, { at, delete: len, insert: "" });
+  absorbNext(insertAt);
+}
+
 /** Map a position through an ascending splice batch (original → new coordinates). */
 function mapPos(pos: number, splices: Splice[], assoc: -1 | 1): number {
   let shift = 0;
@@ -918,6 +994,18 @@ interface StreamSession {
  */
 interface UndoUnit {
   before: string;
+  /**
+   * The unit's EXACT inverse splice batch, in this unit's frame coordinates
+   * (the doc state where the unit is on top of its stack): applying it there
+   * yields `before`. The stream-append cascade maps positions through it —
+   * history.rs maps through the recorded per-edit batches, and a coarse
+   * whole-text diff is NOT equivalent (a multi-splice batch collapses to one
+   * prefix/suffix splice, teleporting any stream position strictly inside
+   * it). Undefined when unknown (a coalesced typing run — single-splice, so
+   * the diff fallback is safe there); kept in sync by the cascade via
+   * `mapBatchThroughInsertion`.
+   */
+  inverse?: Splice[];
   streamId?: number;
 }
 
@@ -1000,9 +1088,14 @@ export class MockCore implements OxidownCore {
         // break a group while an IME session is open.
         (this.composing || t - this.lastEditTime <= COALESCE_MS);
       if (!coalesce) {
-        this.undoStack.push({ before: this.doc });
+        this.undoStack.push({ before: this.doc, inverse: invertSplices(this.doc, batch) });
         // A paste is a closed unit: nothing may coalesce into it.
         this.hasOpenUnit = origin !== "paste";
+      } else {
+        // The absorbing unit's exact inverse is no longer the one recorded
+        // at creation; invalidate it so the stream cascade falls back to
+        // the (single-splice, hence safe) diff for this unit.
+        this.undoStack[this.undoStack.length - 1].inverse = undefined;
       }
       this.redoStack = [];
     } else {
@@ -1011,7 +1104,7 @@ export class MockCore implements OxidownCore {
       // "undo"/"redo" origins are not expected through applyEdit when the
       // view uses core-driven history. Defensively record them as isolated,
       // non-coalescing units — new edit origins never coalesce (v0.2).
-      this.undoStack.push({ before: this.doc });
+      this.undoStack.push({ before: this.doc, inverse: invertSplices(this.doc, batch) });
       this.hasOpenUnit = false;
       this.redoStack = [];
     }
@@ -1075,8 +1168,12 @@ export class MockCore implements OxidownCore {
   redo(): CoreChange | null {
     const unit = this.redoStack.pop();
     if (!unit) return null;
-    this.undoStack.push({ before: this.doc, streamId: unit.streamId });
     const splices = diffSplices(this.doc, unit.after);
+    this.undoStack.push({
+      before: this.doc,
+      inverse: invertSplices(this.doc, splices),
+      streamId: unit.streamId,
+    });
     this.mutateDoc(splices);
     this.hasOpenUnit = false;
     this.lastOrigin = null;
@@ -1427,21 +1524,27 @@ export class MockCore implements OxidownCore {
     return this.applyStreamText(id, session, text);
   }
 
-  streamClose(id: number): void {
+  streamClose(id: number): CoreChange | null {
     checkNonNegInt("id", id);
     const session = this.streams.get(id);
-    if (!session) return; // no-op on unknown/closed id
+    if (!session) return null; // no-op on unknown/closed id
+    let flushChange: CoreChange | null = null;
     if (session.pending !== "") {
       // A dangling high surrogate can never be completed: flush it as one
-      // U+FFFD so the document invariant (no lone surrogates) holds.
+      // U+FFFD so the document invariant (no lone surrogates) holds. The
+      // flush is the stream's final append (same undo unit), and its
+      // CoreChange is RETURNED — the view must apply it like any
+      // streamAppend result, or its buffer silently falls one unit behind
+      // the core doc.
       session.pending = "";
-      this.applyStreamText(id, session, "�");
+      flushChange = this.applyStreamText(id, session, "�");
     }
     this.anchors.delete(session.anchorId); // internal anchor: bypass dropAnchor's guard
     this.streams.delete(id);
     // Close the group so nothing after streamClose accidentally coalesces
     // into the stream's unit (mirrors compositionEnd).
     this.hasOpenUnit = false;
+    return flushChange;
   }
 
   /**
@@ -1451,10 +1554,18 @@ export class MockCore implements OxidownCore {
    * the stream's unit (interleaved user edits) sit above it; their snapshots
    * must gain the chunk (their undo must not delete streamed text), while
    * the stream unit's own snapshot stays chunk-free (its undo removes the
-   * whole stream). The insertion position is cascaded down frame by frame:
-   * each unit's `before` IS the doc of the frame below it, so mapping
-   * through `diffSplices(frameDoc, before)` translates the position exactly
-   * like the Rust core's map-through-old-inverse step.
+   * whole stream). The insertion position is cascaded down frame by frame,
+   * exactly like the Rust core: for each unit above the stream's, the
+   * position maps through that unit's RECORDED inverse batch (Bias before —
+   * an insertion exactly at restored text stays before it, so no other
+   * unit's undo ever deletes streamed text), and the unit's inverse is
+   * rewritten as if the insertion had always been present in its frame
+   * (`mapBatchThroughInsertion`). A coarse whole-text diff is NOT an
+   * acceptable substitute for the recorded batch: it collapses a
+   * multi-splice edit (multi-cursor) to one prefix/suffix splice, so a
+   * stream position strictly inside that span would teleport to its start.
+   * The diff remains only as the fallback for units whose exact inverse was
+   * invalidated by coalescing (always single-splice, where it is safe).
    */
   private applyStreamText(id: number, session: StreamSession, text: string): CoreChange {
     const pos = this.resolveInternal(session.anchorId);
@@ -1473,8 +1584,13 @@ export class MockCore implements OxidownCore {
     if (idx === -1) {
       // First append, or the stream's unit was undone away: fresh unit,
       // tagged so later appends merge into it. It is never coalescible by
-      // user/ime edits.
-      this.undoStack.push({ before: this.doc, streamId: id });
+      // user/ime edits. Its exact inverse is the chunk's deletion (in the
+      // top frame, where this unit now sits).
+      this.undoStack.push({
+        before: this.doc,
+        inverse: [{ at: pos, delete: text.length, insert: "" }],
+        streamId: id,
+      });
       this.hasOpenUnit = false;
       this.lastOrigin = "ai";
       this.lastEditEnd = -1;
@@ -1484,13 +1600,26 @@ export class MockCore implements OxidownCore {
       for (let k = this.undoStack.length - 1; k > idx; k--) {
         const unit = this.undoStack[k];
         const oldBefore = unit.before;
-        const inverse = diffSplices(frameDoc, oldBefore);
-        // Bias before: an insertion exactly at restored text stays before it,
-        // so no other unit's undo ever deletes streamed text.
-        const deeper = mapPos(p, inverse, -1);
+        // Frame translation uses the unit's OLD inverse (history.rs
+        // `record_stream_append`): the recorded exact batch when available,
+        // else the single-splice diff fallback for coalesced units.
+        const oldInverse = unit.inverse ?? diffSplices(frameDoc, oldBefore);
+        const deeper = mapPos(p, oldInverse, -1);
+        if (unit.inverse) {
+          unit.inverse = mapBatchThroughInsertion(unit.inverse, p, text.length);
+        }
         unit.before = oldBefore.slice(0, deeper) + text + oldBefore.slice(deeper);
         frameDoc = oldBefore;
         p = deeper;
+      }
+      // The stream unit's own frame: the chunk's inverse (delete it) merges
+      // into the recorded batch, which is first rewritten through the
+      // insertion — history.rs's final step. `before` stays chunk-free (its
+      // undo removes the whole stream).
+      const streamUnit = this.undoStack[idx];
+      if (streamUnit.inverse) {
+        streamUnit.inverse = mapBatchThroughInsertion(streamUnit.inverse, p, text.length);
+        mergeDelete(streamUnit.inverse, p, text.length);
       }
       // The user-coalescing state tracks the TOP unit, which this append did
       // not replace — only remap the adjacency position through the insert.
@@ -1507,8 +1636,9 @@ export class MockCore implements OxidownCore {
   // Command implementations (naive text transforms; correct on simple cases)
   // ---------------------------------------------------------------------------
 
-  private pushCommandUndoUnit(): void {
-    this.undoStack.push({ before: this.doc });
+  /** Called with the command's forward splices, BEFORE they are applied. */
+  private pushCommandUndoUnit(splices: Splice[]): void {
+    this.undoStack.push({ before: this.doc, inverse: invertSplices(this.doc, splices) });
     this.redoStack = [];
     this.hasOpenUnit = false;
     this.lastOrigin = "command";
@@ -1594,7 +1724,7 @@ export class MockCore implements OxidownCore {
         { at: from - len, delete: len, insert: "" },
         { at: to, delete: len, insert: "" },
       ];
-      this.pushCommandUndoUnit();
+      this.pushCommandUndoUnit(splices);
       this.mutateDoc(splices);
       return { revision: this.rev, splices, selection: { anchor: from - len, head: to - len } };
     }
@@ -1610,7 +1740,7 @@ export class MockCore implements OxidownCore {
         { at: from, delete: len, insert: "" },
         { at: innerTo, delete: len, insert: "" },
       ];
-      this.pushCommandUndoUnit();
+      this.pushCommandUndoUnit(splices);
       this.mutateDoc(splices);
       return { revision: this.rev, splices, selection: { anchor: from, head: innerTo - len } };
     }
@@ -1620,7 +1750,7 @@ export class MockCore implements OxidownCore {
       { at: from, delete: 0, insert: delim },
       { at: to, delete: 0, insert: delim },
     ];
-    this.pushCommandUndoUnit();
+    this.pushCommandUndoUnit(splices);
     this.mutateDoc(splices);
     return { revision: this.rev, splices, selection: { anchor: from + len, head: to + len } };
   }
@@ -1641,7 +1771,7 @@ export class MockCore implements OxidownCore {
     const prefixLen = m ? m[1].length + 1 : 0; // "#".repeat(n) + " "
     const newPrefix = level === 0 ? "" : "#".repeat(level) + " ";
     const splice: Splice = { at: lineStart, delete: prefixLen, insert: newPrefix };
-    this.pushCommandUndoUnit();
+    this.pushCommandUndoUnit([splice]);
     this.mutateDoc([splice]);
     const shift = newPrefix.length - prefixLen;
     const cursor = Math.max(lineStart, pos + shift);
@@ -1662,7 +1792,7 @@ export class MockCore implements OxidownCore {
     const checkboxInnerAt = lineStart + listM.contentFrom + 1; // the char inside "[ ]"
     const next = taskM[1] === " " ? "x" : " ";
     const splice: Splice = { at: checkboxInnerAt, delete: 1, insert: next };
-    this.pushCommandUndoUnit();
+    this.pushCommandUndoUnit([splice]);
     this.mutateDoc([splice]);
     return { revision: this.rev, splices: [splice], selection: null };
   }
@@ -1779,7 +1909,7 @@ export class MockCore implements OxidownCore {
     const belowRewrite = this.belowLineRewrite(doc, affected, firstDepth, newCol, delta, indent);
     if (belowRewrite) splices.push(belowRewrite);
 
-    this.pushCommandUndoUnit();
+    this.pushCommandUndoUnit(splices);
     this.mutateDoc(splices);
     const anchor = mapPos(from, splices, 1);
     const head = mapPos(to, splices, 1);
@@ -1901,7 +2031,7 @@ export class MockCore implements OxidownCore {
     const isBlank = (s: string): boolean => /^[ \t]*$/.test(s);
 
     const finish = (splices: Splice[], cursor: number): CoreChange => {
-      this.pushCommandUndoUnit();
+      this.pushCommandUndoUnit(splices);
       this.mutateDoc(splices);
       return { revision: this.rev, splices, selection: { anchor: cursor, head: cursor } };
     };

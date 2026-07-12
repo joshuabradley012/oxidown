@@ -348,6 +348,63 @@ fn stream_block_ids_stay_sticky_across_appends() {
     assert_ne!(blocks[2].id, tail_id, "split piece gets a fresh id");
 }
 
+/// Regression (found by differential fuzz): a blank-line append at the tail
+/// block's start, under a List (or FootnoteDefinition) that already ends
+/// with a blank line, must not leave the absorber's cached span short.
+/// pulldown-cmark reports List/FootnoteDefinition spans INCLUDING trailing
+/// blank lines, so the appended blank line extends the span of the block
+/// ABOVE the tail slice — invisible to the standalone tail parse the fast
+/// path runs. Minimized from the fuzz failure (`"\r\n"` streamed between a
+/// loose-ended list and the next block left `List 0..5` cached vs `List
+/// 0..7` from a full parse, a 2-byte gap before the following block).
+/// Checked node-for-node (block kinds + spans, overlay) against a
+/// from-scratch parse.
+#[test]
+fn blank_line_append_at_tail_start_under_a_list_matches_full_parse() {
+    // (doc, stream-open position (UTF-16 == bytes, all-ASCII), chunk)
+    let cases: &[(&str, usize, &str)] = &[
+        // The minimized fuzz repro: CRLF appended right where the tail
+        // block starts, list above ending in a blank line.
+        ("- a\n\npara", 5, "\r\n"),
+        // Same with a lone LF, and with a code fence as the tail block
+        // (the original failure's shape: List then CodeBlock).
+        ("- a\n\npara", 5, "\n"),
+        ("- a\n\n```\ncode\n```", 5, "\r\n"),
+        // Footnote definitions absorb trailing blank lines the same way.
+        ("[^a]: note\n\npara", 12, "\n"),
+        // Multi-line chunk whose FIRST line is blank: still hazardous.
+        ("- a\n\npara", 5, "\n\nmore"),
+        // Control: non-blank first line — the list cannot absorb it, so
+        // the fast path may fire; either way it must match a full parse.
+        ("- a\n\npara", 5, "x\n"),
+    ];
+    for (i, &(doc, at, chunk)) in cases.iter().enumerate() {
+        let mut ed = Editor::new(1);
+        ed.load(doc);
+        let id = ed.stream_open(at).unwrap();
+        ed.stream_append(id, chunk).unwrap();
+        ed.stream_close(id);
+
+        let text = ed.get_text();
+        let expect = oxidown_core::parser::parse_document(&text);
+        let got_blocks: Vec<_> = ed
+            .block_index()
+            .blocks()
+            .iter()
+            .map(|b| (b.kind, b.span.clone()))
+            .collect();
+        assert_eq!(
+            got_blocks, expect.blocks,
+            "case {i} ({doc:?} + {chunk:?}): block index diverges from full parse"
+        );
+        assert_eq!(
+            ed.overlay_nodes(),
+            expect.nodes.as_slice(),
+            "case {i} ({doc:?} + {chunk:?}): overlay diverges from full parse"
+        );
+    }
+}
+
 #[test]
 fn stream_internal_anchor_is_invisible_to_the_public_anchor_api() {
     // The stream's insertion anchor shares the id counter with public

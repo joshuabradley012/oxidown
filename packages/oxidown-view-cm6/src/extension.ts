@@ -32,12 +32,15 @@ import { oxidownTheme } from "./theme.js";
 export { changesToSplices, endOfLastSplice } from "./splices.js";
 
 /**
- * Private annotation tagging transactions produced by core-driven changes
- * (undo/redo, commands, streaming). The change-forwarding path skips these —
- * the core already applied them; echoing them back into applyEdit would
- * double-apply the edit and desync revisions.
+ * Annotation tagging transactions produced by core-driven changes (undo/redo,
+ * commands, streaming). The change-forwarding path skips these — the core
+ * already applied them; echoing them back into applyEdit would double-apply
+ * the edit and desync revisions. Exported so host changeFilters/
+ * transactionFilters can recognize oxidown-annotated transactions (which the
+ * contract requires them to leave intact), and so tests can construct
+ * multi-transaction updates containing core-driven changes.
  */
-const oxidownSkip = Annotation.define<true>();
+export const oxidownSkip = Annotation.define<true>();
 
 /**
  * Apply a CoreChange (the shape shared by undo/redo/command/streamAppend) to
@@ -240,7 +243,18 @@ class TaskCheckboxWidget extends WidgetType {
     // Not focusable: Tab must stay with the editor (it indents), never jump
     // into embedded widgets. Clicking still works.
     input.tabIndex = -1;
+    // tabIndex=-1 removes it from the tab order but not the accessibility
+    // tree — give screen readers a name for what the click toggles.
+    input.setAttribute("aria-label", "task checkbox");
     input.checked = this.checked;
+    input.addEventListener("mousedown", (event) => {
+      // Chrome focuses form controls on mousedown; the post-toggle
+      // decoration rebuild then replaces the focused input, dropping focus
+      // to <body> and killing subsequent typing. preventDefault keeps focus
+      // in the editor (the standard CM6 checkbox-widget pattern) — the
+      // click event below still fires and performs the toggle.
+      event.preventDefault();
+    });
     input.addEventListener("click", (event) => {
       // Prevent the browser's own default checkbox toggle: the core is the
       // only source of truth for `checked` — the next decoration rebuild
@@ -490,6 +504,18 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
         // 1) Forward every doc change to the core — synchronously, in order,
         //    one applyEdit per transaction (splices are in each transaction's
         //    original-doc coordinates, matching ChangeSet semantics).
+        //
+        // The LAST doc-changing transaction is the only one whose newDoc is
+        // the update's final doc — the skip-annotated mirror check below must
+        // only run there. The core applied every core-driven change BEFORE
+        // this update ran, so when a host batches several transactions into
+        // one update, core.docLength() is already the FINAL length while a
+        // non-last tr.newDoc is an intermediate state: comparing those would
+        // false-positive and needlessly wipe undo history/anchors via load().
+        let lastDocChanged: Transaction | null = null;
+        for (const tr of update.transactions) {
+          if (tr.docChanged) lastDocChanged = tr;
+        }
         for (const tr of update.transactions) {
           if (!tr.docChanged) continue;
           if (tr.annotation(oxidownSkip)) {
@@ -503,8 +529,10 @@ function oxidownPlugin(core: OxidownCore, options: OxidownOptions): Extension {
             // notice via the check below — and only then if verifyMirror is
             // on. Run the same length check immediately instead of waiting:
             // the core already applied the change, so lengths must match
-            // right now.
-            if (verifyMirror && core.docLength() !== tr.newDoc.length) {
+            // right now — but only against the update's FINAL doc (the last
+            // doc-changing transaction; see `lastDocChanged` above), never a
+            // batched update's intermediate per-transaction doc.
+            if (verifyMirror && tr === lastDocChanged && core.docLength() !== tr.newDoc.length) {
               console.error(
                 `[oxidown] mirror desync on a core-driven change (core=${core.docLength()} view=${tr.newDoc.length}) — ` +
                   "a host changeFilter/transactionFilter may have altered an oxidown-annotated " +
@@ -847,7 +875,23 @@ function historyKeymap(core: OxidownCore): Extension {
   const run =
     (kind: "undo" | "redo") =>
     (view: EditorView): boolean => {
-      const result = kind === "undo" ? core.undo() : core.redo();
+      let result: CoreChange | null;
+      try {
+        result = kind === "undo" ? core.undo() : core.redo();
+      } catch (err) {
+        // Contract "Error handling": unlike command() (transactional,
+        // no-mutation-on-throw — see runCoreCommand), undo/redo mutate the
+        // core BEFORE returning splices, so an exception leaves the mirror
+        // in an unknown state. Treat it like the applyEdit/decorations
+        // sites: a desync emergency — log loudly and re-load from the view
+        // buffer.
+        console.error(
+          `[oxidown] core error during ${kind} — re-loading core from view buffer:`,
+          err,
+        );
+        core.load(view.state.doc.toString());
+        return true;
+      }
       if (result) applyCoreChange(view, result, kind);
       return true; // always consume; never fall through to native undo
     };

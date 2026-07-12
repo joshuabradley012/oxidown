@@ -1432,6 +1432,103 @@ describe("MockCore streaming (v0.2)", () => {
     expect(core.redo()).toBeNull();
   });
 
+  it("FIX: the undo cascade maps stream positions through MULTI-SPLICE user batches exactly (multi-cursor)", () => {
+    // A single multi-cursor applyEdit batch with splices on BOTH sides of
+    // the stream insertion point. The cascade must map the append position
+    // through the RECORDED splice batch (history.rs record_stream_append);
+    // the old coarse prefix/suffix diff collapsed the whole batch to one
+    // splice spanning both edits, so a stream position strictly inside that
+    // span teleported to the splice's start — undoing the user edit moved
+    // the streamed text to the wrong place.
+    const { core, clock } = makeCore("aaaa bbbb cccc");
+    const id = core.streamOpen(7); // between "bb" and "bb"
+    core.streamAppend(id, "Y"); // creates the stream's (single) undo unit
+    expect(core.getText()).toBe("aaaa bbYbb cccc");
+    clock.advance(10);
+    // ONE user batch, splices on BOTH sides of the stream point (anchor 8).
+    core.applyEdit(
+      core.revision(),
+      [
+        { at: 2, delete: 0, insert: "11" },
+        { at: 12, delete: 0, insert: "22" },
+      ],
+      "user",
+    );
+    expect(core.getText()).toBe("aa11aa bbYbb c22ccc");
+    // Second chunk: its position must cascade through the user unit's
+    // RECORDED two-splice batch (down to 8 in that unit's `before` frame),
+    // not through a coarse whole-text diff (which spans [2, 16) here and
+    // would collapse the position to 2).
+    const change = core.streamAppend(id, "Z");
+    expect(change.splices).toEqual([{ at: 10, delete: 0, insert: "Z" }]);
+    expect(core.getText()).toBe("aa11aa bbYZbb c22ccc");
+    core.streamClose(id);
+
+    core.undo(); // the user batch pops; the streamed text stays put EXACTLY
+    expect(core.getText()).toBe("aaaa bbYZbb cccc");
+    core.undo(); // the stream's single unit reverts both chunks
+    expect(core.getText()).toBe("aaaa bbbb cccc");
+    expect(core.undo()).toBeNull();
+
+    // Redo round trip is exact too.
+    core.redo();
+    expect(core.getText()).toBe("aaaa bbYZbb cccc");
+    core.redo();
+    expect(core.getText()).toBe("aa11aa bbYZbb c22ccc");
+    expect(core.redo()).toBeNull();
+  });
+
+  it("FIX: the cascade stays exact across SEVERAL interleaved multi-splice batches and appends", () => {
+    const { core, clock } = makeCore("head middle tail");
+    const id = core.streamOpen("head m".length); // 6, inside "middle"
+    core.streamAppend(id, "A");
+    clock.advance(10);
+    // Batch 1: splices before and after the stream point.
+    core.applyEdit(
+      core.revision(),
+      [
+        { at: 0, delete: 4, insert: "H" },
+        { at: 12, delete: 0, insert: "!" },
+      ],
+      "user",
+    );
+    core.streamAppend(id, "B");
+    clock.advance(600); // never coalesce with the previous batch
+    // Batch 2: another straddling multi-splice batch.
+    core.applyEdit(
+      core.revision(),
+      [
+        { at: 2, delete: 1, insert: "" },
+        { at: core.docLength(), delete: 0, insert: "$" },
+      ],
+      "user",
+    );
+    core.streamAppend(id, "C");
+    core.streamClose(id);
+
+    const finalText = core.getText();
+    // Drain the history fully, then replay it: every frame must round-trip.
+    const frames: string[] = [finalText];
+    for (;;) {
+      const change = core.undo();
+      if (change === null) break;
+      frames.push(core.getText());
+    }
+    expect(frames[frames.length - 1]).toBe("head middle tail");
+    const replay: string[] = [];
+    for (;;) {
+      const change = core.redo();
+      if (change === null) break;
+      replay.push(core.getText());
+    }
+    expect(replay).toEqual(frames.slice(0, -1).reverse());
+    expect(core.getText()).toBe(finalText);
+    // The first undo (batch 2) must keep ALL streamed chunks intact and in
+    // order between the surviving neighbors.
+    core.undo();
+    expect(core.getText().replace(/[^ABC]/g, "")).toBe("ABC");
+  });
+
   it("a user edit INSIDE the streamed region never loses text to the stream's undo", () => {
     // The cascade must keep every unit's snapshot sound: undoing the user
     // edit first, then the stream, restores the exact original document.
