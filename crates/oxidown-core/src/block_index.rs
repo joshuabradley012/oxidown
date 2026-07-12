@@ -44,8 +44,8 @@
 //!      something above it changed, keeps its ID); a collapsed old span
 //!      scores by point-containment;
 //!    - a **split** (one old block overlapping two new blocks) gives the
-//!      larger-overlap piece the old ID and allocates exactly one fresh ID
-//!      for the other piece;
+//!      larger-overlap piece the old ID (ties: the earlier piece) and
+//!      allocates exactly one fresh ID for the other piece;
 //!    - a new block overlapping nothing (fresh content, or the very first
 //!      parse) gets a fresh ID.
 //!
@@ -148,16 +148,25 @@ impl BlockIndex {
 /// Both inputs are document-ordered with non-overlapping spans internally,
 /// so each new span's overlap candidates are a contiguous old-span run;
 /// `i` only ever advances, giving O(old + new + overlaps) total.
+///
+/// The split/merge rule is symmetric in both directions of ambiguity: an
+/// old block DONATES its ID to the new span it overlaps most (a split's
+/// larger-overlap piece keeps the ID, ties to the earlier piece — the
+/// module docs' promise; a plain document-order greedy would instead hand
+/// it to whichever piece comes first); a new span TAKES the largest-overlap
+/// donor among the old blocks that chose it (a merge's larger side wins,
+/// ties to the earlier block). Old blocks that donate nowhere, or lose a
+/// merge, retire — IDs are never reused.
 fn match_spans(
     mapped_old: &[(Range<usize>, BlockId)],
     new_spans: Vec<(BlockKind, Range<usize>)>,
     replica: u16,
     next_counter: &mut u64,
 ) -> Vec<Block> {
-    let mut claimed = vec![false; mapped_old.len()];
-    let mut result = Vec::with_capacity(new_spans.len());
+    // (new index, old index, overlap) edges from the two-pointer walk.
+    let mut edges: Vec<(usize, usize, usize)> = Vec::new();
     let mut i = 0usize;
-    for (kind, span) in new_spans {
+    for (n, (_, span)) in new_spans.iter().enumerate() {
         // Skip old spans entirely before `span`. A collapsed old span
         // sitting exactly at `span.start` is NOT "before" — it matches this
         // span by point-containment, so only skip it when strictly before.
@@ -171,22 +180,33 @@ fn match_spans(
         } {
             i += 1;
         }
-        let mut best: Option<(usize, usize)> = None; // (overlap, old index)
         let mut j = i;
         while j < mapped_old.len() && mapped_old[j].0.start < span.end {
-            if !claimed[j] {
-                let ov = overlap_score(&mapped_old[j].0, &span);
-                if ov > 0 && best.is_none_or(|(b, _)| ov > b) {
-                    best = Some((ov, j));
-                }
+            let ov = overlap_score(&mapped_old[j].0, span);
+            if ov > 0 {
+                edges.push((n, j, ov));
             }
             j += 1;
         }
-        let id = match best {
-            Some((_, j)) => {
-                claimed[j] = true;
-                mapped_old[j].1
-            }
+    }
+    // Strictly-greater comparisons make both passes keep the FIRST maximum
+    // in document order (the tie rules above).
+    let mut donates_to: Vec<Option<(usize, usize)>> = vec![None; mapped_old.len()]; // (overlap, new idx)
+    for &(n, j, ov) in &edges {
+        if donates_to[j].is_none_or(|(best, _)| ov > best) {
+            donates_to[j] = Some((ov, n));
+        }
+    }
+    let mut taken: Vec<Option<(usize, usize)>> = vec![None; new_spans.len()]; // (overlap, old idx)
+    for &(n, j, ov) in &edges {
+        if donates_to[j] == Some((ov, n)) && taken[n].is_none_or(|(best, _)| ov > best) {
+            taken[n] = Some((ov, j));
+        }
+    }
+    let mut result = Vec::with_capacity(new_spans.len());
+    for (n, (kind, span)) in new_spans.into_iter().enumerate() {
+        let id = match taken[n] {
+            Some((_, j)) => mapped_old[j].1,
             None => {
                 let id = BlockId {
                     replica,
@@ -305,17 +325,32 @@ mod tests {
         let after = ids(&idx);
 
         assert_eq!(after.len(), 2);
-        let ids_after: Vec<BlockId> = after.iter().map(|(_, id)| *id).collect();
-        assert!(
-            ids_after.contains(&original_id),
-            "one half of the split keeps the original id"
-        );
-        assert_eq!(
-            ids_after.iter().filter(|id| **id == original_id).count(),
-            1,
-            "only one half keeps it"
-        );
-        assert_ne!(after[0].1, after[1].1, "the two halves have distinct ids");
+        // The LARGER-overlap piece keeps the ID ("one paragraph" = 14 bytes
+        // incl. its newline vs "of text" = 8) — not merely "some piece".
+        assert_eq!(after[0].1, original_id, "the larger (first) piece keeps the id");
+        assert_ne!(after[1].1, original_id, "the smaller piece gets a fresh id");
+    }
+
+    #[test]
+    fn split_gives_the_larger_overlap_piece_the_old_id_regardless_of_order() {
+        // Larger piece SECOND: a document-order greedy would hand the ID to
+        // the first piece; the documented rule must not.
+        let mut idx = BlockIndex::new(1);
+        reparse(&mut idx, "ab paragraph long text here\n", &[]);
+        let original = idx.blocks()[0].id;
+        let batch = [sp(2, 1, "\n\n")]; // replace the space after "ab"
+        reparse(&mut idx, "ab\n\nparagraph long text here\n", &batch);
+        assert_ne!(idx.blocks()[0].id, original, "smaller (first) piece: fresh id");
+        assert_eq!(idx.blocks()[1].id, original, "larger piece keeps the id despite coming second");
+
+        // Tie: equal-overlap halves — the earlier piece wins.
+        let mut idx = BlockIndex::new(1);
+        reparse(&mut idx, "aa bb\n", &[]);
+        let original = idx.blocks()[0].id;
+        let batch = [sp(2, 1, "\n\n")];
+        reparse(&mut idx, "aa\n\nbb\n", &batch);
+        assert_eq!(idx.blocks()[0].id, original, "tie goes to the earlier piece");
+        assert_ne!(idx.blocks()[1].id, original);
     }
 
     #[test]

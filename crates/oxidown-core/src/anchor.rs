@@ -13,6 +13,11 @@
 //!   dropped, or belong to a document that was since replaced by `load`
 //!   (the editor clears all anchors on `load` — a fresh document invalidates
 //!   every position expressed against the old one).
+//!
+//! The set also holds the core's own INTERNAL anchors (stream insertion
+//! points). They share the id counter but are invisible to the public API:
+//! `resolve`/`remove` treat an internal id exactly like an unknown one, so
+//! no id a caller can pass over the boundary ever disturbs core-owned state.
 
 use std::collections::HashMap;
 
@@ -22,11 +27,11 @@ use crate::text::ByteSplice;
 #[derive(Debug, Default)]
 pub struct AnchorSet {
     next_id: u64,
-    /// id → (byte position, bias). A HashMap (not a position-sorted
+    /// id → (byte position, bias, internal). A HashMap (not a position-sorted
     /// structure) because M1's anchor counts are small (cursors, stream
     /// insertion points, a handful of app bookmarks) and `map_through` is
     /// O(anchors × batch) either way.
-    anchors: HashMap<u64, (usize, Bias)>,
+    anchors: HashMap<u64, (usize, Bias, bool)>,
 }
 
 impl AnchorSet {
@@ -38,17 +43,45 @@ impl AnchorSet {
     }
 
     pub fn create(&mut self, byte_pos: usize, bias: Bias) -> u64 {
+        self.insert(byte_pos, bias, false)
+    }
+
+    /// Create a core-owned anchor (stream insertion points). Same id
+    /// counter, but the public `resolve`/`remove` treat the id as unknown.
+    pub fn create_internal(&mut self, byte_pos: usize, bias: Bias) -> u64 {
+        self.insert(byte_pos, bias, true)
+    }
+
+    fn insert(&mut self, byte_pos: usize, bias: Bias, internal: bool) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.anchors.insert(id, (byte_pos, bias));
+        self.anchors.insert(id, (byte_pos, bias, internal));
         id
     }
 
+    /// Public resolution: internal ids read as unknown (`None`).
     pub fn resolve(&self, id: u64) -> Option<usize> {
-        self.anchors.get(&id).map(|&(pos, _)| pos)
+        self.anchors
+            .get(&id)
+            .and_then(|&(pos, _, internal)| (!internal).then_some(pos))
     }
 
+    /// Core-internal resolution: any live id, internal or public.
+    pub fn resolve_internal(&self, id: u64) -> Option<usize> {
+        self.anchors.get(&id).map(|&(pos, _, _)| pos)
+    }
+
+    /// Public removal: internal ids are untouchable (no-op, like unknown).
     pub fn remove(&mut self, id: u64) {
+        if let Some(&(_, _, internal)) = self.anchors.get(&id) {
+            if !internal {
+                self.anchors.remove(&id);
+            }
+        }
+    }
+
+    /// Core-internal removal: any id (used by `stream_close`).
+    pub fn remove_internal(&mut self, id: u64) {
         self.anchors.remove(&id);
     }
 
@@ -69,7 +102,7 @@ impl AnchorSet {
     /// Map every anchor through an applied splice batch (ascending,
     /// non-overlapping, pre-edit byte coordinates).
     pub fn map_through(&mut self, batch: &[ByteSplice]) {
-        for (pos, bias) in self.anchors.values_mut() {
+        for (pos, bias, _) in self.anchors.values_mut() {
             *pos = mapping::map_pos(*pos, batch, *bias);
         }
     }
@@ -119,6 +152,19 @@ mod tests {
         set.map_through(&[sp(3, 6, "")]);
         assert_eq!(set.resolve(a), Some(3));
         assert_eq!(set.resolve(b), Some(3));
+    }
+
+    #[test]
+    fn internal_anchors_invisible_to_public_api() {
+        let mut set = AnchorSet::new();
+        let internal = set.create_internal(5, Bias::After);
+        assert_eq!(set.resolve(internal), None, "public resolve: unknown");
+        set.remove(internal); // public remove: no-op on internal ids
+        assert_eq!(set.resolve_internal(internal), Some(5), "still alive");
+        set.map_through(&[sp(0, 0, "ab")]);
+        assert_eq!(set.resolve_internal(internal), Some(7), "still mapped");
+        set.remove_internal(internal);
+        assert_eq!(set.resolve_internal(internal), None);
     }
 
     #[test]

@@ -291,11 +291,16 @@ impl Editor {
         }
         let start = self.text.utf16_to_byte_floor(from)?;
         let end = self.text.utf16_to_byte_ceil(to)?;
+        // Clarification 1: compositionBegin closes any open undo group; the
+        // session's own edits then coalesce into exactly one unit.
+        self.history.set_break();
         self.composition = Some(Composition { start, end });
         Ok(())
     }
 
     pub fn composition_end(&mut self) {
+        // Clarification 1: compositionEnd closes the session's undo group.
+        self.history.set_break();
         self.composition = None;
     }
 
@@ -318,10 +323,13 @@ impl Editor {
 
     /// Current position of the anchor (UTF-16), or `None` for unknown /
     /// dropped ids (or anchors invalidated by a subsequent `load`).
+    /// Core-internal anchors (stream insertion points) read as unknown.
     pub fn resolve_anchor(&self, id: u64) -> Option<usize> {
         self.anchors.resolve(id).map(|b| self.text.byte_to_utf16(b))
     }
 
+    /// No-op on unknown ids — and on core-internal anchor ids (stream
+    /// insertion points), which no boundary caller may disturb.
     pub fn drop_anchor(&mut self, id: u64) {
         self.anchors.remove(id);
     }
@@ -351,13 +359,12 @@ impl Editor {
                 let (lo, hi) = (from.min(to), from.max(to));
                 let from_b = self.text.utf16_to_byte(lo)?;
                 let to_b = self.text.utf16_to_byte(hi)?;
-                commands::toggle_inline(&self.overlay, &src, kind, from_b, to_b)
+                commands::toggle_inline(&self.overlay, &src, kind, from_b, to_b)?
             }
             Command::SetHeading { pos, level } => {
                 if level > 6 {
-                    return Err(CoreError::InvalidRange {
-                        from: level as usize,
-                        to: 6,
+                    return Err(CoreError::InvalidArgument {
+                        detail: format!("setHeading level {level} is out of range 0..=6"),
                     });
                 }
                 let pos_b = self.text.utf16_to_byte_floor(pos)?;
@@ -415,7 +422,7 @@ impl Editor {
     /// becomes an internal after-bias anchor that maps through all edits.
     pub fn stream_open(&mut self, pos: usize) -> Result<u64, CoreError> {
         let byte = self.text.utf16_to_byte(pos)?;
-        let anchor = self.anchors.create(byte, Bias::After);
+        let anchor = self.anchors.create_internal(byte, Bias::After);
         let id = self.next_stream_id;
         self.next_stream_id += 1;
         self.streams.insert(id, StreamState { anchor });
@@ -437,10 +444,13 @@ impl Editor {
                 selection: None,
             });
         }
-        let at_b = self
-            .anchors
-            .resolve(stream.anchor)
-            .expect("internal stream anchor is never dropped while the stream is open");
+        let Some(at_b) = self.anchors.resolve_internal(stream.anchor) else {
+            // Invariant: the internal anchor lives as long as its stream
+            // (public drop_anchor cannot touch internal ids). Fail soft if
+            // it ever breaks — a panic would cross the wasm boundary.
+            debug_assert!(false, "internal anchor missing for open stream {id}");
+            return Err(CoreError::UnknownStream { id });
+        };
         let at16 = self.text.byte_to_utf16(at_b);
         let splices16 = vec![Splice {
             at: at16,
@@ -452,7 +462,11 @@ impl Editor {
             delete: 0,
             insert: chunk.to_string(),
         }];
-        let fast_region = self.tail_fast_path_region(at_b);
+        // Same first-line hazard analysis as apply_edit (the append is an
+        // insert-only splice): appending into the tail block's first line
+        // can merge it with the block above — de-interruption, setext,
+        // indent capture — which a standalone tail-slice parse cannot see.
+        let fast_region = self.tail_edit_fast_path_region(&batch[0]);
         self.apply_bytes(&batch, EditOrigin::Ai);
         self.history.record_stream_append(id, at_b, chunk.len());
         match fast_region {
@@ -472,7 +486,7 @@ impl Editor {
     /// Close a stream. No-op on unknown/already-closed ids (per contract).
     pub fn stream_close(&mut self, id: u64) {
         if let Some(stream) = self.streams.remove(&id) {
-            self.anchors.remove(stream.anchor);
+            self.anchors.remove_internal(stream.anchor);
         }
     }
 
@@ -543,8 +557,22 @@ impl Editor {
             });
             delta += s.insert.len() as isize - s.delete as isize;
         }
+        // Op::splice's invariant: each op is valid against the document
+        // state produced by its parent op. A batch's splices share PRE-batch
+        // coordinates, so each one is rebased through the cumulative delta
+        // of its predecessors (ascending + non-overlapping makes a plain
+        // delta shift exact) before it is logged.
+        let mut op_delta: isize = 0;
         for s in batch {
-            self.oplog.append(origin, s.clone());
+            self.oplog.append(
+                origin,
+                ByteSplice {
+                    at: usize::try_from(s.at as isize + op_delta).unwrap_or(0),
+                    delete: s.delete,
+                    insert: s.insert.clone(),
+                },
+            );
+            op_delta += s.insert.len() as isize - s.delete as isize;
         }
         if let Some(comp) = self.composition.as_mut() {
             comp.map_through(batch, origin == EditOrigin::Ime);
@@ -614,12 +642,13 @@ impl Editor {
         self.block_index.update(parsed.blocks, batch);
     }
 
-    /// Streaming fast path precondition (boundary v0.2: "an append that only
-    /// extends the open tail block must not force full-document work"): the
-    /// insertion lands at/after the LAST top-level block's start, and that
-    /// block starts at a line boundary (an indented code block's span starts
-    /// mid-line and would not re-parse equivalently as a standalone slice).
-    /// Returns the region start to re-parse from, or `None` → full reparse.
+    /// Weak tail fast path precondition (the shared base of
+    /// [`Editor::tail_edit_fast_path_region`], which BOTH `apply_edit` and
+    /// `stream_append` go through): the edit lands at/after the LAST
+    /// top-level block's start, and that block starts at a line boundary (an
+    /// indented code block's span starts mid-line and would not re-parse
+    /// equivalently as a standalone slice). Returns the region start to
+    /// re-parse from, or `None` → the ordinary reparse path.
     ///
     /// Correctness note (documented Phase-A fast-path assumption): parsing
     /// the tail slice standalone is decoration-equivalent because top-level
@@ -649,10 +678,11 @@ impl Editor {
         }
     }
 
-    /// Tail fast path for `apply_edit` (interactive typing). STRICTER than
-    /// the streaming precondition above, because editing the tail block's
-    /// FIRST LINE can change how the block relates to the block ABOVE it —
-    /// which a standalone tail-slice reparse cannot see:
+    /// Tail fast path for `apply_edit` (interactive typing) and
+    /// `stream_append` (an insert-only splice). STRICTER than the weak
+    /// precondition above, because editing the tail block's FIRST LINE can
+    /// change how the block relates to the block ABOVE it — which a
+    /// standalone tail-slice reparse cannot see:
     ///
     /// * de-interruption: `"para\n# head"` — deleting the `#` (or making the
     ///   line `"-x"`, `"x# head"`, …) turns the line into a lazy

@@ -439,6 +439,169 @@ fn fence_open_mid_doc_degrades_gracefully() {
     );
 }
 
+// ---- Stage C: streaming append fast path ------------------------------------
+
+/// Streaming analog of `tail_edits_match_full_reparse_node_for_node`:
+/// streams opened at directed + random positions (document start/end, block
+/// starts, just after block boundaries, mid-block), fed random small appends
+/// including newline-bearing and hazard-shaped chunks — after EVERY append
+/// the overlay AND block index (spans + kinds) must match a from-scratch
+/// parse of the current text.
+#[test]
+fn stream_appends_match_full_reparse_node_for_node() {
+    const CHUNKS: &[&str] = &[
+        "x",
+        "words and more ",
+        "\n",
+        "\n\n",
+        "\r\n",
+        "# ",
+        "## head\n",
+        "- ",
+        "- item\n",
+        "1. ",
+        "> quoted\n",
+        "===\n",
+        "---\n",
+        "**",
+        "*em",
+        "em*",
+        "`",
+        "```",
+        "    ",
+        "😀",
+        "你好",
+        "x# ",
+        "-",
+    ];
+    // Hazard-shaped document tails: the last block sits directly against a
+    // paragraph (no insulating blank line) or under an absorbing list, so a
+    // stream opened on its first line exercises exactly the merge hazards
+    // the fast path must refuse.
+    const HAZARD_TAILS: &[&str] = &[
+        "tail para\n# head",
+        "para *em\n# head*",
+        "prose words\n- item",
+        "- item one\n\ntail para",
+        "closing words\nlast",
+    ];
+    let mut rng = StdRng::seed_from_u64(0x57e4_a11f);
+    let appends = fuzz_edits(24);
+    let mut total_tail = 0u64;
+    for round in 0..24usize {
+        let mut doc = generate_mixed_doc(512 + (round % 6) * 1024);
+        if round % 2 == 1 {
+            doc.push_str(HAZARD_TAILS[rng.gen_range(0..HAZARD_TAILS.len())]);
+        }
+        // Candidate open positions: every top-level block's start /
+        // just-after-start / end / middle (so streams open at block
+        // boundaries, right past them, before headings/lists, and
+        // mid-block), plus doc start/end and a few purely random interior
+        // points — biased toward the LAST two blocks, where the tail fast
+        // path (and its hazard analysis) lives.
+        let blocks = parser::parse_document(&doc).blocks;
+        let mut candidates: Vec<usize> = vec![0, doc.len()];
+        let push_block = |candidates: &mut Vec<usize>, span: &std::ops::Range<usize>| {
+            candidates.push(span.start);
+            candidates.push(floor_char(&doc, (span.start + 1).min(doc.len())));
+            candidates.push(span.end);
+            candidates.push(floor_char(&doc, (span.start + span.end) / 2));
+        };
+        for (_, span) in &blocks {
+            push_block(&mut candidates, span);
+        }
+        for (_, span) in blocks.iter().rev().take(2) {
+            for _ in 0..4 {
+                push_block(&mut candidates, span); // tail-region bias
+            }
+        }
+        for _ in 0..4 {
+            candidates.push(floor_char(&doc, rng.gen_range(0..=doc.len())));
+        }
+        let open_b = floor_char(&doc, candidates[rng.gen_range(0..candidates.len())]);
+
+        let mut ed = Editor::new(1);
+        ed.load(&doc);
+        let id = ed.stream_open(utf16_at(&doc, open_b)).unwrap();
+        for step in 0..appends {
+            let chunk = CHUNKS[rng.gen_range(0..CHUNKS.len())];
+            ed.stream_append(id, chunk).unwrap();
+            assert_equivalent(
+                &ed,
+                &format!("stream round {round} (open at byte {open_b}) append {step} {chunk:?}"),
+            );
+        }
+        ed.stream_close(id);
+        total_tail += ed.reparse_counts().tail;
+    }
+    assert!(total_tail > 0, "the streaming tail fast path never fired");
+}
+
+/// Deterministic regressions for the streaming fast path's first-line
+/// hazards: an append into the tail block's FIRST line can merge it with the
+/// block above (de-interruption / lazy continuation), which a standalone
+/// tail-slice parse cannot see — `stream_append` must run the same hazard
+/// analysis as `apply_edit` and fall back. Pre-fix, the weak precondition
+/// took the fast path and both the overlay (missing emphasis marks) and the
+/// block index diverged from a full parse.
+#[test]
+fn stream_append_first_line_hazards_fall_back_and_stay_correct() {
+    // (doc, stream-open position (UTF-16 == bytes, all-ASCII), chunk)
+    let cases: &[(&str, usize, &str)] = &[
+        // De-interruption: "x# head" is a lazy continuation — one paragraph.
+        ("para\n# head", 5, "x"),
+        // Same shape with an emphasis pair spanning the merge: the merged
+        // paragraph gains em marks the fast path used to drop entirely.
+        ("para *em\n# head*", 9, "x"),
+        // De-listing: "x- item" merges into the paragraph above.
+        ("para\n- item", 5, "x"),
+        // Indent capture: "    para" is absorbed by the list ABOVE the
+        // insulating blank line.
+        ("- item\n\npara", 8, "    "),
+        // Newline-bearing chunk at the tail block's start (safe shape — the
+        // block above is a paragraph — so the fast path may fire; either
+        // way the result must match a full parse).
+        ("alpha\n\npara", 7, "# h\nx"),
+    ];
+    for (i, &(doc, at, chunk)) in cases.iter().enumerate() {
+        let mut ed = Editor::new(1);
+        ed.load(doc);
+        let id = ed.stream_open(at).unwrap();
+        ed.stream_append(id, chunk).unwrap();
+        assert_equivalent(&ed, &format!("stream hazard case {i}: {doc:?} + {chunk:?}"));
+        ed.stream_close(id);
+    }
+}
+
+/// Perf-shape guard: safe appends at EOF must keep taking the tail fast
+/// path (no full-document reparse), with the stricter hazard analysis in
+/// place.
+#[test]
+fn safe_eof_stream_appends_take_the_tail_path() {
+    let doc = generate_mixed_doc(4 * 1024);
+    let mut ed = Editor::new(1);
+    ed.load(&doc);
+    let full_before = ed.reparse_counts().full;
+    let id = ed.stream_open(ed.doc_len_utf16()).unwrap();
+    let chunks = [
+        "streamed words ",
+        "more **bold** here",
+        "\nsecond line",
+        "\n\n## streamed head\n\nfresh para",
+    ];
+    for chunk in chunks {
+        ed.stream_append(id, chunk).unwrap();
+        assert_equivalent(&ed, "safe eof append");
+    }
+    ed.stream_close(id);
+    let counts = ed.reparse_counts();
+    assert_eq!(counts.full, full_before, "no full reparse: {counts:?}");
+    assert!(
+        counts.tail >= chunks.len() as u64,
+        "every safe EOF append re-parsed only the tail: {counts:?}"
+    );
+}
+
 /// Multi-splice batches take the same incremental path with a UNION dirty
 /// region — several splices across different blocks, checked node-for-node.
 #[test]

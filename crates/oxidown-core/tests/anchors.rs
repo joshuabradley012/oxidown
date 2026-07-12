@@ -91,6 +91,29 @@ fn load_invalidates_all_anchors() {
 }
 
 #[test]
+fn bias_does_not_disambiguate_replacements_at_the_anchor() {
+    // Pinned behavior: bias only disambiguates PURE insertions (zero-delete
+    // splices) landing exactly on the anchor. A replacement splice
+    // (delete > 0) starting at the anchor deletes forward from it, and the
+    // anchor stays at the replacement start for BOTH biases — After does
+    // not absorb the replacement text.
+    let mut ed = Editor::new(1);
+    let rev = ed.load("abcdefgh");
+    let before = ed.create_anchor(3, Bias::Before).unwrap();
+    let after = ed.create_anchor(3, Bias::After).unwrap();
+    ed.apply_edit(
+        rev,
+        &[Splice { at: 3, delete: 2, insert: "XYZ".into() }],
+        EditOrigin::User,
+        0.0,
+    )
+    .unwrap();
+    assert_eq!(ed.get_text(), "abcXYZfgh");
+    assert_eq!(ed.resolve_anchor(before), Some(3));
+    assert_eq!(ed.resolve_anchor(after), Some(3), "replacement is not absorbed");
+}
+
+#[test]
 fn anchor_position_inside_surrogate_pair_snaps_by_bias() {
     let mut ed = Editor::new(1);
     ed.load("😀x");

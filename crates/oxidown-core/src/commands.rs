@@ -237,6 +237,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use crate::block_index::BlockKind;
+use crate::error::CoreError;
 use crate::mapping::{self, Bias};
 use crate::parser::{self, Node, NodeKind};
 use crate::text::{ByteSplice, SrcBytes};
@@ -307,13 +308,76 @@ fn ins(at: usize, text: String) -> ByteSplice {
     }
 }
 
+/// Whether `[from_b, to_b]` stays within ONE leaf block's inline content.
+/// Inline delimiters cannot cross a leaf-block boundary — `**a\n\nb**` does
+/// not parse as strong, and a re-toggle would then stack delimiters — so
+/// `toggle_inline` refuses multi-block selections. Softbreaks WITHIN one
+/// paragraph are fine (`**a\nb**` parses), so the walk is per physical
+/// line: a blank line, a line carrying a line-terminated construct
+/// (heading, thematic break, fence/code line), a fresh list-item marker on
+/// a later line, or a blockquote-depth change all mark a boundary.
+/// Detection covers the constructs the overlay knows; the overlay lookups
+/// binary-search per line like `quote_context`/`line_marker`.
+fn single_leaf_block(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> bool {
+    let line_terminated = |k: &NodeKind| {
+        matches!(
+            k,
+            NodeKind::Heading(_)
+                | NodeKind::ThematicBreak
+                | NodeKind::CodeFenceLine
+                | NodeKind::CodeBlockLine
+        )
+    };
+    let line_has = |line: &Range<usize>, pred: &dyn Fn(&NodeKind) -> bool| {
+        let lo = nodes.partition_point(|n| n.extent.start < line.start);
+        let hi = nodes.partition_point(|n| n.extent.start < line.end);
+        nodes[lo..hi].iter().any(|n| pred(&n.kind))
+    };
+    let first = line_containing(src, from_b);
+    if to_b <= first.end {
+        return true; // a single line is at most one leaf block's inlines
+    }
+    if is_blank(src, first.clone()) || line_has(&first, &line_terminated) {
+        return false;
+    }
+    let (depth, _) = quote_context(nodes, first.start);
+    let mut line = first;
+    while to_b > line.end {
+        let Some(next) = next_line(src, line.end) else {
+            return false; // defensive: to_b past the last terminator
+        };
+        if is_blank(src, next.clone())
+            || line_has(&next, &|k| {
+                line_terminated(k) || matches!(k, NodeKind::ListMarker { .. })
+            })
+            || quote_context(nodes, next.start).0 != depth
+        {
+            return false;
+        }
+        line = next;
+    }
+    true
+}
+
 pub fn toggle_inline(
     nodes: &[Node],
     src: &SrcBytes,
     kind: InlineKind,
     from_b: usize,
     to_b: usize,
-) -> Option<CommandPlan> {
+) -> Result<Option<CommandPlan>, CoreError> {
+    // Block-boundary guard (see `single_leaf_block`): a selection spanning
+    // more than one leaf block errors instead of planning — the wrapped
+    // text could never parse as one inline node, and a re-toggle would
+    // stack delimiters. A thrown command is a consumed no-op for the view
+    // (contract: `command()` throws WITHOUT mutating; views must not
+    // resync), so nothing is lost relative to silently doing nothing, and
+    // the caller can tell "refused" from "didn't apply" (`Ok(None)`).
+    if !single_leaf_block(nodes, src, from_b, to_b) {
+        return Err(CoreError::InvalidArgument {
+            detail: "inline toggle range spans more than one leaf block".into(),
+        });
+    }
     // OFF: innermost same-kind node whose closed extent contains the range
     // (rfind on the document-ordered overlay = last-starting = innermost).
     let containing = nodes.iter().rfind(|n| {
@@ -326,10 +390,10 @@ pub fn toggle_inline(
         let d0 = &node.delims[0];
         let d1 = &node.delims[1];
         let open_len = d0.end - d0.start;
-        return Some(CommandPlan {
+        return Ok(Some(CommandPlan {
             batch: vec![del(d0), del(d1)],
             selection: Some((node.content.start - open_len, node.content.end - open_len)),
-        });
+        }));
     }
 
     // ON / EXTEND: union with every touched same-kind node.
@@ -368,10 +432,10 @@ pub fn toggle_inline(
     // kind (same-delimiter emphasis cannot directly nest); with the open
     // insert at t_start ≤ first delim and the close insert at t_end ≥ last
     // delim end, the batch is ascending and non-overlapping as built.
-    Some(CommandPlan {
+    Ok(Some(CommandPlan {
         batch,
         selection: Some((t_start + open_len, t_end - deleted + open_len)),
-    })
+    }))
 }
 
 /// Canonical delimiter pair for an ON/EXTEND toggle. For code, the run is
@@ -1102,9 +1166,14 @@ fn is_blank(src: &SrcBytes, range: Range<usize>) -> bool {
 /// if any — gives direct access to that line's per-level `"> "` delimiter
 /// spans (`enter`'s QUOTE EXIT rule drops only the LAST one).
 fn blockquote_line_node(nodes: &[Node], line_start: usize) -> Option<&Node> {
-    nodes
+    // Binary-search jump like `quote_context` (extent-start-sorted overlay,
+    // runs per keypress): a line's BlockQuoteLine node starts exactly at
+    // `line_start`.
+    let lo = nodes.partition_point(|n| n.extent.start < line_start);
+    let hi = nodes.partition_point(|n| n.extent.start <= line_start);
+    nodes[lo..hi]
         .iter()
-        .find(|n| matches!(n.kind, NodeKind::BlockQuoteLine(_)) && n.extent.start == line_start)
+        .find(|n| matches!(n.kind, NodeKind::BlockQuoteLine(_)))
 }
 
 /// `enter`'s EXIT/OUTDENT rule for a NESTED empty item (marker column > 0):
@@ -1200,22 +1269,32 @@ pub fn enter(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Opti
     let ctx = list_line_ctx(nodes, src, line_range.clone());
 
     if let Some((item_start, token_width)) = ctx.marker {
-        let marker_node = nodes.iter().find(|n| {
-            matches!(n.kind, NodeKind::ListMarker { .. })
-                && n.extent.start <= item_start
-                && item_start < n.extent.end
-        })?;
+        // Same binary-search jump as `quote_context`/`line_marker` (the
+        // overlay is extent-start-sorted; this runs per keypress): the
+        // marker node starts on this line, at or before the glyph.
+        let marker_node = {
+            let lo = nodes.partition_point(|n| n.extent.start < line_range.start);
+            let hi = nodes.partition_point(|n| n.extent.start < line_range.end);
+            nodes[lo..hi].iter().find(|n| {
+                matches!(n.kind, NodeKind::ListMarker { .. })
+                    && n.extent.start <= item_start
+                    && item_start < n.extent.end
+            })?
+        };
         let task = matches!(marker_node.kind, NodeKind::ListMarker { task: true, .. });
         let after_glyphs = item_start + token_width;
         let content_start = if task {
             // Read the checkbox's own extent rather than assuming a fixed
             // width, so any (CommonMark-tolerated) extra pre-checkbox
-            // whitespace is still handled correctly.
-            let widget = nodes.iter().find(|n| {
-                matches!(n.kind, NodeKind::TaskWidget { .. })
-                    && n.extent.start >= after_glyphs
-                    && n.extent.start < line_range.end
-            })?;
+            // whitespace is still handled correctly. Binary search like the
+            // marker lookup above.
+            let widget = {
+                let lo = nodes.partition_point(|n| n.extent.start < after_glyphs);
+                let hi = nodes.partition_point(|n| n.extent.start < line_range.end);
+                nodes[lo..hi]
+                    .iter()
+                    .find(|n| matches!(n.kind, NodeKind::TaskWidget { .. }))?
+            };
             widget.extent.end + 1 // the checkbox's required trailing space
         } else {
             after_glyphs

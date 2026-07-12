@@ -224,23 +224,91 @@ fn typing_then_backspace_coalesces() {
 }
 
 #[test]
-fn composition_pauses_coalescing() {
+fn composition_session_is_exactly_one_undo_unit() {
+    // Contract clarification 1: compositionBegin closes any open undo
+    // group; while composing the 500ms window does not break the group;
+    // compositionEnd closes the group — one session, ONE unit.
     let mut ed = Editor::new(1);
     let mut rev = ed.load("");
     rev = ed.apply_edit(rev, &ins(0, "a"), EditOrigin::User, 0.0).unwrap();
     ed.composition_begin(1, 1).unwrap();
-    rev = ed.apply_edit(rev, &ins(1, "b"), EditOrigin::Ime, 50.0).unwrap();
-    rev = ed.apply_edit(rev, &ins(2, "c"), EditOrigin::Ime, 100.0).unwrap();
-    assert_eq!(
-        ed.history_depths().0,
-        3,
-        "edits during composition each form their own unit"
-    );
+    // Three IME updates, deliberately spaced far past the 500ms window.
+    rev = ed.apply_edit(rev, &ins(1, "k"), EditOrigin::Ime, 1_000.0).unwrap();
+    rev = ed
+        .apply_edit(rev, &[Splice { at: 1, delete: 1, insert: "か".into() }], EditOrigin::Ime, 3_000.0)
+        .unwrap();
+    rev = ed
+        .apply_edit(rev, &[Splice { at: 1, delete: 1, insert: "漢字".into() }], EditOrigin::Ime, 9_000.0)
+        .unwrap();
     ed.composition_end();
-    // After the session, quick adjacent typing coalesces again (new unit).
-    rev = ed.apply_edit(rev, &ins(3, "d"), EditOrigin::User, 150.0).unwrap();
-    ed.apply_edit(rev, &ins(4, "e"), EditOrigin::User, 200.0).unwrap();
-    assert_eq!(ed.history_depths().0, 4);
+    assert_eq!(ed.get_text(), "a漢字");
+    assert_eq!(ed.history_depths().0, 2, "'a' unit + ONE session unit");
+
+    // compositionEnd closed the group: quick typing right after starts a
+    // fresh unit instead of merging into the session's.
+    ed.apply_edit(rev, &ins(3, "b"), EditOrigin::User, 9_050.0).unwrap();
+    assert_eq!(ed.history_depths().0, 3);
+
+    let mut mirror = ed.get_text();
+    let u = ed.undo().unwrap();
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "a漢字");
+    let u = ed.undo().unwrap();
+    apply_to_mirror(&mut mirror, &u.splices);
+    assert_eq!(ed.get_text(), "a", "one undo reverts the whole session");
+    assert_eq!(mirror, ed.get_text());
+}
+
+#[test]
+fn composition_begin_breaks_the_open_group() {
+    // "a" typed, an EMPTY composition session, then "b" within the window:
+    // compositionBegin must close "a"'s open group → 2 units, not 1.
+    let mut ed = Editor::new(1);
+    let mut rev = ed.load("");
+    rev = ed.apply_edit(rev, &ins(0, "a"), EditOrigin::User, 0.0).unwrap();
+    ed.composition_begin(1, 1).unwrap();
+    ed.composition_end();
+    ed.apply_edit(rev, &ins(1, "b"), EditOrigin::User, 100.0).unwrap();
+    assert_eq!(ed.history_depths().0, 2, "compositionBegin broke the group");
+    ed.undo().unwrap();
+    assert_eq!(ed.get_text(), "a");
+    ed.undo().unwrap();
+    assert_eq!(ed.get_text(), "");
+}
+
+#[test]
+fn coalescing_to_a_noop_drops_the_unit() {
+    let mut ed = Editor::new(1);
+    let mut rev = ed.load("base");
+    rev = ed.apply_edit(rev, &ins(4, "a"), EditOrigin::User, 0.0).unwrap();
+    assert_eq!(ed.history_depths().0, 1);
+    // Backspace the just-typed char within the window: the unit's inverse
+    // shrinks to a pure no-op — the unit must be dropped entirely, so no
+    // later undo() applies an empty batch, burns a revision, and eats the
+    // keypress.
+    ed.apply_edit(rev, &del(4, 1), EditOrigin::User, 100.0).unwrap();
+    assert_eq!(ed.get_text(), "base");
+    assert_eq!(ed.history_depths(), (0, 0), "no-op unit dropped");
+    let rev_now = ed.revision();
+    assert!(ed.undo().is_none(), "nothing left to undo");
+    assert_eq!(ed.revision(), rev_now, "failed undo must not bump the revision");
+}
+
+#[test]
+fn coalescing_replacement_back_to_empty_still_restores_original() {
+    // Counterpart of the no-op drop: select-and-replace then backspace is
+    // NOT a no-op — the unit still restores the originally deleted text.
+    let mut ed = Editor::new(1);
+    let mut rev = ed.load("xy tail");
+    rev = ed
+        .apply_edit(rev, &[Splice { at: 0, delete: 2, insert: "a".into() }], EditOrigin::User, 0.0)
+        .unwrap();
+    assert_eq!(ed.get_text(), "a tail");
+    ed.apply_edit(rev, &del(0, 1), EditOrigin::User, 100.0).unwrap();
+    assert_eq!(ed.get_text(), " tail");
+    assert_eq!(ed.history_depths().0, 1, "unit survives: it still restores 'xy'");
+    ed.undo().unwrap();
+    assert_eq!(ed.get_text(), "xy tail");
 }
 
 #[test]
@@ -353,4 +421,46 @@ fn oplog_records_every_edit_including_undo_redo() {
     assert!(ops[0].id.counter < ops[1].id.counter);
     assert!(ops[0].lamport < ops[1].lamport);
     assert_eq!(ops[1].parent_counter, ops[0].id.counter);
+}
+
+#[test]
+fn oplog_multi_splice_batch_ops_are_valid_against_their_parents() {
+    // Op::splice's invariant: each op is valid against the document state
+    // produced by its parent op. For a multi-splice batch that means each
+    // splice is rebased through its predecessors — replaying the ops one by
+    // one (each against the text its parent produced) must reproduce the
+    // editor's final text.
+    let mut ed = Editor::new(1);
+    let rev = ed.load("aa bb cc dd");
+    let batch = vec![
+        Splice { at: 0, delete: 2, insert: "XXXX".into() },
+        Splice { at: 3, delete: 2, insert: "Y".into() },
+        Splice { at: 9, delete: 0, insert: "ZZ".into() },
+    ];
+    ed.apply_edit(rev, &batch, EditOrigin::User, 0.0).unwrap();
+
+    let mut replay = String::from("aa bb cc dd");
+    for op in ed.oplog().ops() {
+        assert_eq!(op.parent_counter, op.id.counter - 1, "parent chain is sequential");
+        let s = &op.splice;
+        assert!(
+            s.at + s.delete <= replay.len(),
+            "op {:?} out of bounds in its parent's doc state",
+            op.id
+        );
+        replay.replace_range(s.at..s.at + s.delete, &s.insert);
+    }
+    assert_eq!(replay, ed.get_text(), "sequential replay reproduces the document");
+
+    // Undo/redo inverses are multi-splice batches too — replay must still
+    // hold across them.
+    ed.undo().unwrap();
+    ed.redo().unwrap();
+    let mut replay = String::from("aa bb cc dd");
+    for op in ed.oplog().ops() {
+        let s = &op.splice;
+        assert!(s.at + s.delete <= replay.len());
+        replay.replace_range(s.at..s.at + s.delete, &s.insert);
+    }
+    assert_eq!(replay, ed.get_text(), "replay holds across undo/redo ops");
 }

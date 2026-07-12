@@ -232,7 +232,7 @@ pub fn parse(src: &str) -> Vec<Node> {
 /// is a single reparse).
 pub fn parse_document(src: &str) -> ParseResult {
     let bytes = src.as_bytes();
-    let mut nodes = Vec::new();
+    let mut nodes: Vec<Node> = Vec::new();
     let mut blocks: Vec<(BlockKind, Range<usize>)> = Vec::new();
     // Container nesting depth over *all* tags — only `depth == 0` Starts are
     // top-level blocks.
@@ -289,23 +289,6 @@ pub fn parse_document(src: &str) -> ParseResult {
 
         if let Some((item, item_depth, item_number)) = pending_item.take() {
             let item_start = item.start;
-            // Nested items (depth >= 2): the run of spaces/tabs immediately
-            // before the marker is its own node — a `line:list-item` line
-            // decoration (per-depth padding in the view) + concealed spaces.
-            // Scanning back only over blanks keeps blockquote `>` markers
-            // (their own nodes) out of the span.
-            let mut ws_start = item_start;
-            while ws_start > 0 && matches!(bytes[ws_start - 1], b' ' | b'\t') {
-                ws_start -= 1;
-            }
-            if item_depth >= 2 && ws_start < item_start {
-                nodes.push(leaf(
-                    NodeKind::ListItemIndent { depth: item_depth },
-                    ws_start..item_start,
-                    item_start..item_start,
-                    vec![],
-                ));
-            }
             // Reveal is LINE-level (matching headings, contract v0.3): a
             // cursor/selection touching ANY part of the item's first line
             // reveals its marker constructs — the marker glyphs, the task
@@ -313,12 +296,39 @@ pub fn parse_document(src: &str) -> ParseResult {
             // lockstep. (Replaces the earlier glyph-adjacency model: reveal
             // no longer depends on which character the caret touches.)
             let line = line_bounds(bytes, item_start);
-            if item_depth >= 2 && ws_start < item_start {
-                if let Some(last) = nodes.last_mut() {
-                    if matches!(last.kind, NodeKind::ListItemIndent { .. }) {
-                        last.reveal_extent = Some(line.clone());
-                    }
+            // Nested items (depth >= 2): the run of spaces/tabs immediately
+            // before the marker is its own node — a `line:list-item` line
+            // decoration (per-depth padding in the view) + concealed spaces.
+            // The back-scan is clamped to this line's own bytes and to the
+            // end of anything already claimed on it — the blockquote marker
+            // run (whose `> `'s trailing space is otherwise indistinguishable
+            // from indent) and any earlier item's marker on the same line
+            // (`"- - a"`) — because Conceal/Widget decorations are exclusive
+            // byte claims that must never overlap each other.
+            let mut ws_start = item_start;
+            while ws_start > line.start && matches!(bytes[ws_start - 1], b' ' | b'\t') {
+                ws_start -= 1;
+            }
+            if let Some(m) = blockquote_markers(bytes, line.clone()).last() {
+                ws_start = ws_start.max(m.end.min(item_start));
+            }
+            for n in nodes.iter().rev() {
+                if n.extent.start < line.start {
+                    break; // earlier lines: nothing there shares this line
                 }
+                if n.extent.start < item_start {
+                    ws_start = ws_start.max(n.extent.end.min(item_start));
+                }
+            }
+            if item_depth >= 2 && ws_start < item_start {
+                let mut indent = leaf(
+                    NodeKind::ListItemIndent { depth: item_depth },
+                    ws_start..item_start,
+                    item_start..item_start,
+                    vec![],
+                );
+                indent.reveal_extent = Some(line.clone());
+                nodes.push(indent);
             }
             if let Event::TaskListMarker(checked) = &event {
                 if range.start > item_start {
@@ -353,7 +363,15 @@ pub fn parse_document(src: &str) -> ParseResult {
                 // still consumed their `list_seq` slot at `Start(Item)`, so
                 // ordered numbering counts them like any sibling.
                 let marker_end = if range.start > item_start {
-                    range.start
+                    // Clamped to the marker's own line: when the marker line
+                    // has no content of its own (`"-\n  foo"`), the next
+                    // event starts on a LATER line and the raw lookahead
+                    // would sweep the terminator and the following line's
+                    // indent into the marker span — a bullet widget would
+                    // then conceal the newline and visually merge two lines.
+                    // (`line_bounds` honors `\n`, `\r\n`, and lone `\r`, per
+                    // contract clarification 5.)
+                    range.start.min(line.end)
                 } else {
                     empty_item_marker_end(bytes, item_start)
                 };
@@ -383,7 +401,11 @@ pub fn parse_document(src: &str) -> ParseResult {
                 nodes.extend(inline_delim_node(bytes, range.clone(), NodeKind::Emphasis, b'*', 1));
             }
             Event::Start(Tag::Strikethrough) => {
-                nodes.extend(inline_delim_node(bytes, range.clone(), NodeKind::Strike, b'~', 2));
+                // GFM strikethrough delimiters are one OR two tildes (`~x~`
+                // and `~~x~~` both parse as Strikethrough); the run length
+                // is read from the source, never assumed to be 2.
+                let dlen = tilde_run_len(bytes, &range);
+                nodes.extend(inline_delim_node(bytes, range.clone(), NodeKind::Strike, b'~', dlen));
             }
             Event::Code(_) => {
                 nodes.extend(code_node(bytes, range.clone()));
@@ -400,7 +422,7 @@ pub fn parse_document(src: &str) -> ParseResult {
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 if kind.is_fenced() {
-                    nodes.extend(fenced_code_lines(bytes, range.clone()));
+                    nodes.extend(fenced_code_lines(bytes, range.clone(), bq_depth));
                 }
             }
             Event::Rule => {
@@ -453,7 +475,12 @@ pub fn parse_document(src: &str) -> ParseResult {
             if line_depth == 0 {
                 continue;
             }
-            let delims = blockquote_markers(bytes, line.clone());
+            // Runs beyond the line's logical depth are CONTENT, not markers
+            // (`> > x` inside a fenced block in a depth-1 quote: the second
+            // `> ` belongs to the code), so the conceal set is capped at
+            // `line_depth` runs.
+            let mut delims = blockquote_markers(bytes, line.clone());
+            delims.truncate(line_depth as usize);
             let _ = depth; // depth of the enclosing top-level interval; line_depth is authoritative
             // Reveal is LINE-level (matching headings, contract v0.3): the
             // node's extent IS the line (terminator excluded by split_lines),
@@ -526,22 +553,57 @@ fn heading_node(bytes: &[u8], range: Range<usize>, level: HeadingLevel) -> Optio
         extent_end -= 1;
     }
     let delim_end = delim_end.min(extent_end).max(start);
-    let delims = vec![Range {
+    // CommonMark optional CLOSING sequence — spaces/tabs, a run of `#`,
+    // then only spaces/tabs to EOL — is not content. It must be preceded
+    // by a space/tab (`# foo#` has none) or abut the opening delimiter
+    // (`## ##` is an empty heading). Emitted as a second delimiter span,
+    // concealing/revealing with the same line-level semantics as the
+    // opening run.
+    let mut close_start = extent_end;
+    let mut p = extent_end;
+    while p > delim_end && matches!(bytes[p - 1], b' ' | b'\t') {
+        p -= 1;
+    }
+    let run_end = p;
+    while p > delim_end && bytes[p - 1] == b'#' {
+        p -= 1;
+    }
+    if p < run_end && (p == delim_end || matches!(bytes[p - 1], b' ' | b'\t')) {
+        while p > delim_end && matches!(bytes[p - 1], b' ' | b'\t') {
+            p -= 1;
+        }
+        close_start = p;
+    }
+    let mut delims = vec![Range {
         start,
         end: delim_end,
     }];
+    if close_start < extent_end {
+        delims.push(close_start..extent_end);
+    }
     Some(leaf(
         NodeKind::Heading(heading_level_u8(level)),
         start..extent_end,
-        delim_end..extent_end,
+        delim_end..close_start,
         delims,
     ))
 }
 
-/// Strong/emphasis (`dlen` 2/1, char `*` or `_`) or strikethrough (`dlen` 2,
-/// char `~`). The event span covers the whole node including delimiters; the
-/// delimiter bytes are verified against the source (defensive: a mismatch
-/// drops the node rather than emitting wrong spans).
+/// Length (1 or 2) of the tilde run opening a strikethrough at
+/// `range.start` — GFM's two valid delimiter flavors; 3+ tildes never parse
+/// as strikethrough upstream, so the cap is defensive only.
+fn tilde_run_len(bytes: &[u8], range: &Range<usize>) -> usize {
+    let mut n = 0;
+    while n < 2 && range.start + n < range.end && bytes.get(range.start + n) == Some(&b'~') {
+        n += 1;
+    }
+    n.max(1) // 0 only on a corrupt span; inline_delim_node then drops it
+}
+
+/// Strong/emphasis (`dlen` 2/1, char `*` or `_`) or strikethrough (`dlen`
+/// 1 or 2, char `~`). The event span covers the whole node including
+/// delimiters; the delimiter bytes are verified against the source
+/// (defensive: a mismatch drops the node rather than emitting wrong spans).
 fn inline_delim_node(
     bytes: &[u8],
     range: Range<usize>,
@@ -624,51 +686,135 @@ fn link_node(bytes: &[u8], range: Range<usize>, link_type: LinkType) -> Option<N
             if bytes.get(start) != Some(&b'[') || bytes.get(end - 1) != Some(&b')') {
                 return None;
             }
-            // Scan backward from the closing ')' tracking paren depth to
-            // find the matching '(' that opens the destination part —
-            // handles balanced parens inside the URL itself.
-            let mut i = end - 1;
-            let mut depth = 0i32;
-            let paren_open = loop {
+            // Forward parse. A backward paren-depth scan from the closing
+            // ')' mis-pairs parens inside quoted titles (`[t](u "a)b")`,
+            // `[t](u "(a")` — both valid), so the seam is located from the
+            // FRONT instead: match the opening '[' by bracket depth
+            // (skipping backslash escapes and backtick code spans, whose
+            // contents may hold unbalanced brackets), then parse
+            // `(<whitespace> destination <whitespace> title? )` forward.
+            // pulldown already validated the span; anything this parse
+            // can't follow is defensively dropped rather than mis-spanned.
+            let mut i = start + 1;
+            let mut depth = 1usize;
+            let close_bracket = loop {
+                if i >= end - 1 {
+                    return None;
+                }
                 match bytes[i] {
-                    b')' => depth += 1,
-                    b'(' => {
+                    b'\\' => i += 2,
+                    b'`' => {
+                        let run_start = i;
+                        while i < end && bytes[i] == b'`' {
+                            i += 1;
+                        }
+                        let n = i - run_start;
+                        // Skip to just past the matching closing run, if any
+                        // (an unmatched run is literal text: scan on).
+                        let mut j = i;
+                        while j < end {
+                            if bytes[j] == b'`' {
+                                let rs = j;
+                                while j < end && bytes[j] == b'`' {
+                                    j += 1;
+                                }
+                                if j - rs == n {
+                                    i = j;
+                                    break;
+                                }
+                            } else {
+                                j += 1;
+                            }
+                        }
+                    }
+                    b'[' => {
+                        depth += 1;
+                        i += 1;
+                    }
+                    b']' => {
                         depth -= 1;
                         if depth == 0 {
                             break i;
                         }
+                        i += 1;
                     }
-                    _ => {}
+                    _ => i += 1,
                 }
-                if i == start {
-                    return None;
-                }
-                i -= 1;
             };
-            if paren_open == start || bytes.get(paren_open - 1) != Some(&b']') {
+            if bytes.get(close_bracket + 1) != Some(&b'(') {
                 return None;
             }
-            let close_bracket = paren_open - 1;
             let text = (start + 1)..close_bracket;
-            let dest_start = paren_open + 1;
-            let mut j = dest_start;
-            while j < end - 1 && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
+            let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r');
+            let mut j = close_bracket + 2;
+            while j < end - 1 && is_ws(bytes[j]) {
                 j += 1;
             }
+            // Destination: angle-bracketed, or raw with balanced parens
+            // (ends at whitespace or at an unmatched ')').
             let url = if bytes.get(j) == Some(&b'<') {
                 let mut k = j + 1;
                 while k < end - 1 && bytes[k] != b'>' {
+                    if bytes[k] == b'\\' {
+                        k += 1;
+                    }
                     k += 1;
                 }
-                let close = (k + 1).min(end - 1);
-                j..close
+                if bytes.get(k) != Some(&b'>') {
+                    return None;
+                }
+                let url = j..k + 1;
+                j = k + 1;
+                url
             } else {
                 let mut k = j;
-                while k < end - 1 && !matches!(bytes[k], b' ' | b'\t' | b'\n' | b'\r') {
+                let mut pdepth = 0usize;
+                while k < end - 1 {
+                    match bytes[k] {
+                        b'\\' => k += 1,
+                        b'(' => pdepth += 1,
+                        b')' if pdepth == 0 => break,
+                        b')' => pdepth -= 1,
+                        b if is_ws(b) => break,
+                        _ => {}
+                    }
                     k += 1;
                 }
-                j..k
+                let url = j..k;
+                j = k;
+                url
             };
+            // Optional whitespace + quoted title ("…", '…', or (…)), then
+            // nothing but whitespace before the final ')'.
+            let mut t = j;
+            while t < end - 1 && is_ws(bytes[t]) {
+                t += 1;
+            }
+            if t < end - 1 {
+                let closer = match bytes[t] {
+                    b'"' => b'"',
+                    b'\'' => b'\'',
+                    b'(' => b')',
+                    _ => return None,
+                };
+                let mut k = t + 1;
+                while k < end - 1 && bytes[k] != closer {
+                    if bytes[k] == b'\\' {
+                        k += 1;
+                    }
+                    k += 1;
+                }
+                if k >= end - 1 || bytes[k] != closer {
+                    return None;
+                }
+                t = k + 1;
+                while t < end - 1 && is_ws(bytes[t]) {
+                    t += 1;
+                }
+                if t != end - 1 {
+                    return None;
+                }
+            }
             let mut node = leaf(
                 NodeKind::Link { autolink: false },
                 start..end,
@@ -802,6 +948,14 @@ fn empty_item_marker_end(bytes: &[u8], item_start: usize) -> usize {
 /// in every real call site the digit run terminates well before `end`
 /// regardless.
 fn ordered_marker_delim(bytes: &[u8], start: usize, end: usize) -> Option<u8> {
+    // pulldown can fold up to 3 bytes of incidental leading whitespace into
+    // a sibling item's span (`"1. a\n 2. b"`), so the digit run may begin
+    // past `start` — skip blanks first, like `empty_item_marker_end` and
+    // `commands::line_marker`.
+    let mut start = start;
+    while start < end && matches!(bytes.get(start), Some(b' ' | b'\t')) {
+        start += 1;
+    }
     let at = |i: usize| if i < end { bytes.get(i).copied() } else { None };
     // A bullet glyph at `start` also yields `Some(MarkerShape)` from
     // `scan_marker` (with `delim: None`), but that still nets out to `None`
@@ -928,6 +1082,33 @@ fn is_closing_fence(bytes: &[u8], line: Range<usize>, fence_ch: u8, fence_len: u
     bytes[p..line.end].iter().all(|&b| b == b' ' || b == b'\t')
 }
 
+/// Byte offset just past `line`'s blockquote marker run, capped at
+/// `bq_depth` runs — runs beyond the container's own nesting depth are
+/// content (e.g. a literal `> ` inside fenced code in a quote), never a
+/// prefix to strip.
+fn bq_prefix_end(bytes: &[u8], line: &Range<usize>, bq_depth: u8) -> usize {
+    let runs = blockquote_markers(bytes, line.clone());
+    let capped = runs.len().min(bq_depth as usize);
+    capped
+        .checked_sub(1)
+        .map_or(line.start, |last| runs[last].end)
+}
+
+/// `line` with its enclosing containers' prefix removed: the blockquote
+/// marker runs (up to `bq_depth`), then up to `indent` spaces of list-item
+/// indentation — CommonMark strips up to the OPENING fence's indentation
+/// from every line of a fenced block; a line indented less keeps what it
+/// has.
+fn strip_container_prefix(bytes: &[u8], line: &Range<usize>, bq_depth: u8, indent: usize) -> Range<usize> {
+    let mut p = bq_prefix_end(bytes, line, bq_depth);
+    let mut stripped = 0;
+    while p < line.end && stripped < indent && bytes[p] == b' ' {
+        p += 1;
+        stripped += 1;
+    }
+    p..line.end
+}
+
 /// Fenced code block: opening fence line (`line:code-fence`), body lines
 /// (`line:code-block` + `mark:code`), and — if present — the closing fence
 /// line (`line:code-fence`). Fence lines carry a BLOCK-level reveal extent
@@ -937,13 +1118,30 @@ fn is_closing_fence(bytes: &[u8], line: Range<usize>, fence_ch: u8, fence_len: u
 /// (already the full fence-to-fence span at `Start` time), not from `Text`
 /// event payloads — robust to however pulldown chunks the body into `Text`
 /// events.
-fn fenced_code_lines(bytes: &[u8], range: Range<usize>) -> Vec<Node> {
+///
+/// The enclosing containers' per-line prefix is stripped BEFORE classifying
+/// fence vs body lines and before emitting spans: pulldown's event span
+/// starts at the opening fence char, but every following line still carries
+/// its blockquote `> ` runs and/or list-item indent (`> ``` ` would fail
+/// `is_closing_fence` and fall through as a body line; a list-nested
+/// closing fence can carry >= 4 leading spaces, defeating the 3-space
+/// allowance; and body `mark:code` would cover marker/indent bytes that
+/// belong to the containers' own decorations).
+fn fenced_code_lines(bytes: &[u8], range: Range<usize>, bq_depth: u8) -> Vec<Node> {
     let mut out = Vec::new();
     let block = range.clone();
+    // List-indent width to strip per line = the opening fence's own column
+    // past its line's blockquote prefix (the event span starts at the fence
+    // char itself, so the first split line needs no stripping).
+    let first_full_line = line_bounds(bytes, block.start);
+    let open_indent = block
+        .start
+        .saturating_sub(bq_prefix_end(bytes, &first_full_line, bq_depth));
     let lines = split_lines(bytes, range);
     if lines.is_empty() {
         return out;
     }
+    let strip = |line: &Range<usize>| strip_container_prefix(bytes, line, bq_depth, open_indent);
     let open = lines[0].clone();
     let mut open_node = leaf(NodeKind::CodeFenceLine, open.clone(), open.end..open.end, vec![]);
     open_node.reveal_extent = Some(block.clone());
@@ -952,22 +1150,24 @@ fn fenced_code_lines(bytes: &[u8], range: Range<usize>) -> Vec<Node> {
         // Malformed/unexpected: still emit the rest as body lines rather
         // than dropping them.
         for line in &lines[1..] {
-            out.push(leaf(NodeKind::CodeBlockLine, line.clone(), line.clone(), vec![]));
+            let l = strip(line);
+            out.push(leaf(NodeKind::CodeBlockLine, l.clone(), l, vec![]));
         }
         return out;
     };
     let mut body_end_idx = lines.len();
     if lines.len() > 1 {
-        let last = lines[lines.len() - 1].clone();
-        if is_closing_fence(bytes, last.clone(), fence_ch, fence_len) {
+        let last = strip(&lines[lines.len() - 1]);
+        if is_closing_fence(bytes, last, fence_ch, fence_len) {
             body_end_idx = lines.len() - 1;
         }
     }
     for line in &lines[1..body_end_idx] {
-        out.push(leaf(NodeKind::CodeBlockLine, line.clone(), line.clone(), vec![]));
+        let l = strip(line);
+        out.push(leaf(NodeKind::CodeBlockLine, l.clone(), l, vec![]));
     }
     if body_end_idx < lines.len() {
-        let close = lines[body_end_idx].clone();
+        let close = strip(&lines[body_end_idx]);
         let mut close_node = leaf(NodeKind::CodeFenceLine, close.clone(), close.end..close.end, vec![]);
         close_node.reveal_extent = Some(block);
         out.push(close_node);
@@ -1050,6 +1250,24 @@ mod tests {
     }
 
     #[test]
+    fn single_tilde_strikethrough_span() {
+        // Valid GFM: `~x~` parses as Strikethrough with 1-tilde delimiters.
+        let n = one("~x~");
+        assert_eq!(n.kind, NodeKind::Strike);
+        assert_eq!(n.delims, vec![0..1, 2..3]);
+        assert_eq!(n.content, 1..2);
+    }
+
+    #[test]
+    fn mixed_tilde_flavors_each_get_their_own_run_length() {
+        let nodes = parse("~~a~~ and ~b~\n");
+        let strikes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Strike).collect();
+        assert_eq!(strikes.len(), 2);
+        assert_eq!(strikes[0].delims, vec![0..2, 3..5]);
+        assert_eq!(strikes[1].delims, vec![10..11, 12..13]);
+    }
+
+    #[test]
     fn inline_link_span() {
         let n = one("[text](http://example.com)");
         assert_eq!(n.kind, NodeKind::Link { autolink: false });
@@ -1063,6 +1281,44 @@ mod tests {
     fn inline_link_with_title() {
         let n = one("[text](http://example.com \"title\")");
         assert_eq!(n.url, Some(7..25));
+    }
+
+    #[test]
+    fn inline_link_title_containing_parens_keeps_decorations() {
+        // A backward paren-depth scan mis-pairs these; the forward parse
+        // must not (both are valid links per pulldown/CommonMark).
+        let n = one("[t](u \"a)b\")");
+        assert_eq!(n.kind, NodeKind::Link { autolink: false });
+        assert_eq!(n.content, 1..2);
+        assert_eq!(n.delims, vec![0..1, 2..12]);
+        assert_eq!(n.url, Some(4..5));
+
+        let n = one("[t](u \"(a\")");
+        assert_eq!(n.url, Some(4..5));
+
+        // Paren-delimited title flavor.
+        let n = one("[t](u (ti))");
+        assert_eq!(n.url, Some(4..5));
+    }
+
+    #[test]
+    fn inline_link_balanced_parens_in_raw_destination() {
+        let n = one("[text](path/with/(parens)/in/it)");
+        assert_eq!(n.url, Some(7..31));
+    }
+
+    #[test]
+    fn inline_link_text_with_code_span_holding_a_bracket() {
+        // The `]` inside the code span is not the link text's closing
+        // bracket; the seam scan must skip code spans.
+        let doc = "[`]`](u)";
+        let nodes = parse(doc);
+        let link = nodes
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::Link { autolink: false }))
+            .expect("link node");
+        assert_eq!(link.content, 1..4);
+        assert_eq!(link.url, Some(6..7));
     }
 
     #[test]
@@ -1296,6 +1552,66 @@ mod tests {
     }
 
     #[test]
+    fn marker_only_line_extent_stops_at_the_line_end() {
+        // `-\n  foo`: the item's content event starts on the NEXT line, so
+        // the raw lookahead would sweep the newline + following indent into
+        // the marker span (a bullet widget would then conceal the newline
+        // and visually merge the two lines).
+        let nodes = parse("-\n  foo\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].extent, 0..1, "just the dash — never past the terminator");
+        assert_eq!(markers[0].reveal_extent, Some(0..1));
+    }
+
+    #[test]
+    fn marker_only_line_extent_stops_at_a_cr_terminator() {
+        // Contract clarification 5: lone `\r` (and `\r\n`) terminate lines.
+        let nodes = parse("-\r\n  foo\r\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].extent, 0..1);
+    }
+
+    #[test]
+    fn nested_item_indent_never_overlaps_the_quote_markers() {
+        // The indent back-scan must stop at the `> ` run's end — `> `'s own
+        // trailing space is the quote delimiter's byte, not item indent.
+        let nodes = parse("> - a\n>   - b\n");
+        let indents: Vec<_> = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::ListItemIndent { .. }))
+            .collect();
+        assert_eq!(indents.len(), 1);
+        assert_eq!(indents[0].extent, 8..10, "starts after the `> ` run (6..8)");
+    }
+
+    #[test]
+    fn directly_nested_item_claims_no_indent_from_the_outer_marker() {
+        // "- - a": the byte between the two markers belongs to the OUTER
+        // marker's own span; the inner item gets no indent node at all.
+        let nodes = parse("- - a\n");
+        assert!(
+            !nodes.iter().any(|n| matches!(n.kind, NodeKind::ListItemIndent { .. })),
+            "no indent node: {nodes:?}"
+        );
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0].extent, 0..2);
+        assert_eq!(markers[1].extent, 2..4);
+    }
+
+    #[test]
+    fn folded_leading_space_sibling_still_reads_its_ordered_delim() {
+        // pulldown folds the incidental 1-space indent into the second
+        // item's span; the delimiter scan must skip it.
+        let nodes = parse("1. a\n 2. b\n");
+        let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(ordered_number_delim(markers[1]), (Some(2), Some(b'.')));
+    }
+
+    #[test]
     fn task_list_marker_and_widget() {
         let nodes = parse("- [ ] todo\n- [x] done\n");
         let markers: Vec<_> = nodes.iter().filter(|n| matches!(n.kind, NodeKind::ListMarker { .. })).collect();
@@ -1396,6 +1712,84 @@ mod tests {
         assert_eq!(body.len(), 2);
         assert_eq!(body[0].extent, 4..9);
         assert_eq!(body[1].extent, 10..14);
+    }
+
+    #[test]
+    fn fenced_code_in_blockquote_strips_the_quote_prefix_per_line() {
+        // "> ```\n> code\n> ```\n": the event span's lines carry `> `
+        // prefixes; fence classification and spans must see past them —
+        // the closing `> ``` ` is a FENCE line, and body/close spans start
+        // after the marker bytes (which the blockquote's own per-line nodes
+        // conceal).
+        let doc = "> ```\n> code\n> ```\n";
+        let nodes = parse(doc);
+        let fences: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::CodeFenceLine).collect();
+        let body: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::CodeBlockLine).collect();
+        assert_eq!(fences.len(), 2, "closing `> ``` ` classifies as a fence: {nodes:?}");
+        assert_eq!(fences[0].extent, 2..5);
+        assert_eq!(fences[1].extent, 15..18);
+        assert_eq!(body.len(), 1);
+        assert_eq!(&doc[body[0].extent.clone()], "code", "mark:code excludes the `> `");
+        // Block-level reveal extent covers the whole fenced block.
+        assert_eq!(fences[0].reveal_extent, fences[1].reveal_extent);
+    }
+
+    #[test]
+    fn literal_quote_marker_inside_fenced_code_is_content_not_a_delimiter() {
+        // The `> > x` body line's second `> ` is code content; the line's
+        // conceal set is capped at its logical quote depth (1).
+        let doc = "> ```\n> > x\n> ```\n";
+        let nodes = parse(doc);
+        let line2: Vec<_> = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::BlockQuoteLine(_)) && n.extent.start == 6)
+            .collect();
+        assert_eq!(line2.len(), 1);
+        assert_eq!(line2[0].delims, vec![6..8], "one marker run, not two: {line2:?}");
+        let body: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::CodeBlockLine).collect();
+        assert_eq!(&doc[body[0].extent.clone()], "> x");
+    }
+
+    #[test]
+    fn fenced_code_in_a_list_strips_the_item_indent_per_line() {
+        // Depth-2 nesting puts 4 leading spaces on every fence/body line —
+        // enough to defeat is_closing_fence's 3-space allowance unless the
+        // item indent is stripped first.
+        let doc = "- a\n  - b\n    ```\n    code\n    ```\n";
+        let nodes = parse(doc);
+        let fences: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::CodeFenceLine).collect();
+        let body: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::CodeBlockLine).collect();
+        assert_eq!(fences.len(), 2, "{nodes:?}");
+        assert_eq!(body.len(), 1);
+        assert_eq!(&doc[body[0].extent.clone()], "code", "mark:code excludes the indent");
+        assert_eq!(&doc[fences[1].extent.clone()], "```");
+    }
+
+    #[test]
+    fn atx_closing_hash_run_is_a_delimiter_not_content() {
+        // Per CommonMark the closing sequence (spaces + `#` run + trailing
+        // spaces at EOL) is not content.
+        let n = one("# Title ##\n");
+        assert_eq!(n.kind, NodeKind::Heading(1));
+        assert_eq!(n.content, 2..7, "just \"Title\"");
+        assert_eq!(n.delims, vec![0..2, 7..10]);
+
+        // Trailing spaces after the closing run join the delimiter.
+        let n = one("## t ## \n");
+        assert_eq!(n.content, 3..4);
+        assert_eq!(n.delims, vec![0..3, 4..8]);
+
+        // Empty heading: the closing run may abut the opening delimiter.
+        let n = one("## ##\n");
+        assert_eq!(n.content, 3..3);
+        assert_eq!(n.delims, vec![0..3, 3..5]);
+    }
+
+    #[test]
+    fn hash_not_preceded_by_space_is_content_not_a_closing_run() {
+        let n = one("# foo#\n");
+        assert_eq!(n.content, 2..6, "\"foo#\" — no closing sequence");
+        assert_eq!(n.delims, vec![0..2]);
     }
 
     #[test]

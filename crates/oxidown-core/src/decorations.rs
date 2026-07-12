@@ -146,9 +146,9 @@ pub enum WidgetKind {
     Task { checked: bool },
     /// An unordered list item's bullet, replacing the whole marker span
     /// (glyph + trailing whitespace, e.g. `"- "`). Withheld as
-    /// `mark:list-marker` on reveal. Reveal is STRICT containment (the
-    /// cursor sitting at the item text's first character does not reveal),
-    /// so ordinary typing at the item start never flashes the raw marker.
+    /// `mark:list-marker` on reveal. Reveal is LINE-level (contract v0.3,
+    /// matching every other marker construct): a cursor/selection touching
+    /// any part of the item's line shows the raw marker instead.
     Bullet,
     /// An ordered list item's marker, replacing the whole marker span
     /// (digits + delimiter + trailing whitespace, e.g. `"1. "`) with the
@@ -200,8 +200,17 @@ pub fn compute(
                 });
                 let from = text.byte_to_utf16(node.extent.start);
                 let to = text.byte_to_utf16(node.extent.end);
-                let is_bullet =
-                    matches!(text.byte_at(node.extent.start), Some(b'-' | b'*' | b'+'));
+                // pulldown folds up to 3 bytes of incidental leading
+                // whitespace into a sibling item's span (`"- a\n - b"`), so
+                // the marker glyph may sit past extent.start — probe past
+                // blanks (mirrors commands.rs's `line_marker`).
+                let mut glyph = node.extent.start;
+                while glyph < node.extent.end
+                    && matches!(text.byte_at(glyph), Some(b' ' | b'\t'))
+                {
+                    glyph += 1;
+                }
+                let is_bullet = matches!(text.byte_at(glyph), Some(b'-' | b'*' | b'+'));
                 let in_composition = composition
                     .is_some_and(|c| touches(c.start, c.end, node.extent.start, node.extent.end));
                 // Reveal is LINE-level (`revealed` uses the marker node's

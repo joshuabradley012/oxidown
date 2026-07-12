@@ -289,6 +289,57 @@ fn toggle_with_cjk_and_emoji_content() {
 }
 
 #[test]
+fn toggle_strike_strips_single_tilde_delimiters() {
+    // `~del~` is valid GFM strikethrough (single-tilde flavor): toggle OFF
+    // must strip the source tildes — never wrap to `~~~del~~~`. The
+    // canonical `~~` cycle is then byte-identical, matching the `__x__`
+    // normalization rule for non-canonical flavors.
+    let mut ed = Editor::new(1);
+    ed.load("~del~");
+    run(&mut ed, Command::ToggleStrike { from: 2, to: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "del");
+    run(&mut ed, Command::ToggleStrike { from: 0, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "~~del~~");
+    run(&mut ed, Command::ToggleStrike { from: 3, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "del", "canonical double-toggle is byte-identical");
+}
+
+#[test]
+fn toggle_inline_across_leaf_blocks_errors_without_mutating() {
+    // `**a\n\nb**` does not parse as strong (and a re-toggle would stack
+    // delimiters), so a selection spanning more than one leaf block is
+    // refused with InvalidArgument. A thrown command is a consumed no-op
+    // for the view — the core must not have mutated anything.
+    for doc in [
+        "a\n\nb\n",                  // two paragraphs
+        "# h\nbody\n",               // heading + paragraph
+        "- a\n- b\n",                // two list items
+        "```\ncode\nmore\n```\n",    // fenced code lines
+        "> q\nplain para\n\nnext\n", // lazy quote paragraph, blank, paragraph
+    ] {
+        let mut ed = Editor::new(1);
+        ed.load(doc);
+        let rev = ed.revision();
+        let end = ed.doc_len_utf16();
+        let err = ed.command(Command::ToggleStrong { from: 0, to: end }).unwrap_err();
+        assert_eq!(err.name(), "InvalidArgument", "{doc:?}");
+        assert_eq!(ed.get_text(), doc, "thrown command must not mutate");
+        assert_eq!(ed.revision(), rev, "thrown command must not burn a revision");
+    }
+    // Multi-LINE within ONE paragraph still applies — a softbreak inside
+    // strong parses fine.
+    let mut ed = Editor::new(1);
+    ed.load("soft\nwrap\n");
+    run(&mut ed, Command::ToggleStrong { from: 0, to: 9 }).unwrap();
+    assert_eq!(ed.get_text(), "**soft\nwrap**\n");
+    // ...including inside a blockquote paragraph (same depth per line).
+    let mut ed = Editor::new(1);
+    ed.load("> a\n> b\n");
+    run(&mut ed, Command::ToggleEm { from: 2, to: 7 }).unwrap();
+    assert_eq!(ed.get_text(), "> *a\n> b*\n");
+}
+
+#[test]
 fn toggle_range_normalized_and_validated() {
     let mut ed = Editor::new(1);
     ed.load("hello");
@@ -1468,6 +1519,33 @@ fn enter_presses_never_coalesce() {
     run(&mut ed, Command::Enter { from: pos2, to: pos2 }).unwrap();
     let (undo2, _) = ed.history_depths();
     assert_eq!(undo2, undo1 + 1, "second press is its own undo unit");
+}
+
+#[test]
+fn enter_lookups_resolve_deep_in_a_large_overlay() {
+    // Regression guard for the binary-search conversion of `enter`'s
+    // marker-node / TaskWidget / BlockQuoteLine lookups: identical behavior
+    // to the linear scans, exercised far from the overlay's start so a
+    // wrong partition window would miss the nodes.
+    let mut doc = String::new();
+    for i in 0..200 {
+        doc.push_str(&format!("- item {i}\n"));
+    }
+    doc.push_str("- [x] task\n");
+    doc.push_str("> \n");
+    let mut ed = Editor::new(1);
+    ed.load(&doc);
+
+    // Continue the task item (ListMarker + TaskWidget lookups).
+    let pos = doc.find("task").unwrap() + 4;
+    run(&mut ed, Command::Enter { from: pos, to: pos }).unwrap();
+    assert!(ed.get_text().contains("- [x] task\n- [ ] \n"), "{:?}", ed.get_text());
+
+    // Exit the empty quote line (BlockQuoteLine lookup, rule 5).
+    let text = ed.get_text();
+    let qpos = text.rfind("> ").unwrap() + 2;
+    run(&mut ed, Command::Enter { from: qpos, to: qpos }).unwrap();
+    assert!(ed.get_text().ends_with("- [ ] \n\n"), "{:?}", ed.get_text());
 }
 
 #[test]

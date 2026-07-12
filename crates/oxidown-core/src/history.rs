@@ -6,13 +6,24 @@
 //! must be popped first, that state *is* the current document whenever the
 //! unit reaches the top.
 //!
-//! Coalescing (contract): consecutive `user`/`ime` edits within 500 ms that
-//! are positionally adjacent merge into one undo unit; `paste` (and undo/redo,
-//! `command`, `ai`) never coalesce; coalescing pauses while a composition
-//! session is active. "Positionally adjacent" is implemented as: the new
-//! single splice falls entirely within (or touches the ends of) the region
-//! the unit's undo would remove — which covers typing runs, insert-at-front,
-//! and backspace runs over just-typed text.
+//! Coalescing: a consecutive `user`/`ime` edit merges into the top undo unit
+//! when (a) it is a single splice falling entirely within (or touching the
+//! ends of) the region the unit's undo would remove — which covers typing
+//! runs, insert-at-front, and backspace runs over just-typed text; this
+//! region rule is deliberately broader than the contract's "touches the
+//! previous edit's end position" wording, and the code's behavior is the
+//! pinned one — and (b) it arrives within 500 ms of the unit's last absorbed
+//! edit. `paste` (and undo/redo, `command`, `ai`) never coalesce;
+//! multi-splice batches never coalesce. A coalesce that shrinks the unit's
+//! inverse to a pure no-op (type a char, backspace it) drops the unit from
+//! history entirely — undoing a nothing would burn a revision and eat the
+//! keypress.
+//!
+//! Composition (boundary v0.1 clarification 1): `composition_begin` closes
+//! any open group (history break, set by the editor); edits made while a
+//! session is active coalesce regardless of the 500 ms window; and
+//! `composition_end` closes the group — a composition session is exactly
+//! one undo unit.
 //!
 //! ## Stream units (M1, plan.md §5.9 + boundary v0.2 clarification 2)
 //!
@@ -89,7 +100,8 @@ impl History {
     /// * `inverse` — the batch's inverse splices in post-edit coordinates.
     /// * `forward_single` — `(at, delete, insert_len)` of the batch's only
     ///   splice in pre-edit byte coordinates, when the batch has exactly one.
-    /// * `composing` — whether a composition session was active.
+    /// * `composing` — whether a composition session was active; a session's
+    ///   edits coalesce regardless of the 500 ms window (clarification 1).
     ///
     /// Any new edit clears the redo stack.
     pub fn record_edit(
@@ -101,11 +113,11 @@ impl History {
         composing: bool,
     ) {
         self.redo.clear();
-        let eligible = matches!(origin, EditOrigin::User | EditOrigin::Ime) && !composing;
+        let eligible = matches!(origin, EditOrigin::User | EditOrigin::Ime);
 
         if eligible && !self.break_next {
             if let Some((at, delete, insert_len)) = forward_single {
-                if self.try_coalesce(at, delete, insert_len, now_ms) {
+                if self.try_coalesce(at, delete, insert_len, now_ms, composing) {
                     return;
                 }
             }
@@ -172,14 +184,24 @@ impl History {
         merge_delete(&mut unit.inverse, pos, len);
     }
 
-    fn try_coalesce(&mut self, at: usize, delete: usize, insert_len: usize, now_ms: f64) -> bool {
+    fn try_coalesce(
+        &mut self,
+        at: usize,
+        delete: usize,
+        insert_len: usize,
+        now_ms: f64,
+        composing: bool,
+    ) -> bool {
         let Some(top) = self.undo.last_mut() else {
             return false;
         };
         let Some(last_ms) = top.coalesce_last_ms else {
             return false;
         };
-        if now_ms - last_ms > COALESCE_WINDOW_MS || top.inverse.len() != 1 {
+        // While a composition session is active the 500 ms window does not
+        // break the group (clarification 1) — the session's boundaries are
+        // the breaks, set by composition_begin/composition_end.
+        if (!composing && now_ms - last_ms > COALESCE_WINDOW_MS) || top.inverse.len() != 1 {
             return false;
         }
         // The unit's undo would replace current-doc region [c_start, c_end)
@@ -191,7 +213,14 @@ impl History {
         let c_end = region.at + region.delete;
         if c_start <= at && at + delete <= c_end {
             region.delete = region.delete - delete + insert_len;
-            top.coalesce_last_ms = Some(now_ms);
+            if region.delete == 0 && region.insert.is_empty() {
+                // The unit's inverse is now a pure no-op (e.g. a char typed
+                // and backspaced away): a later undo would apply nothing yet
+                // bump the revision and consume the keypress. Drop the unit.
+                self.undo.pop();
+            } else {
+                top.coalesce_last_ms = Some(now_ms);
+            }
             true
         } else {
             false

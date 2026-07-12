@@ -71,6 +71,30 @@ fn ordered(from: usize, to: usize, number: u64, delim: u8) -> Decoration {
     }
 }
 
+/// Conceal/Widget spans are exclusive byte claims (hide-this / replace-this)
+/// and must never overlap each other — the same invariant
+/// corpus_conformance.rs asserts corpus-wide.
+fn assert_exclusive_disjoint(d: &[Decoration]) {
+    let mut spans: Vec<(usize, usize)> = d
+        .iter()
+        .filter_map(|x| match *x {
+            Decoration::Conceal { from, to } | Decoration::Widget { from, to, .. } => {
+                Some((from, to))
+            }
+            _ => None,
+        })
+        .collect();
+    spans.sort_unstable();
+    for w in spans.windows(2) {
+        assert!(
+            w[0].1 <= w[1].0,
+            "overlapping exclusive spans {:?} / {:?} in {d:?}",
+            w[0],
+            w[1]
+        );
+    }
+}
+
 // --------------------------------------------------------- strikethrough --
 
 #[test]
@@ -87,6 +111,26 @@ fn strikethrough_concealed_and_revealed() {
             mark(0, 2, MarkStyle::Delim),
             mark(2, 5, MarkStyle::Strike),
             mark(5, 7, MarkStyle::Delim),
+        ]
+    );
+}
+
+#[test]
+fn single_tilde_strikethrough_decorates() {
+    // `~x~` is valid GFM strikethrough; the 1-tilde delimiters conceal and
+    // reveal exactly like the `~~` flavor.
+    let d = decos("~x~", &[]);
+    assert_eq!(
+        d,
+        vec![conceal(0, 1), mark(1, 2, MarkStyle::Strike), conceal(2, 3)]
+    );
+    let d = decos("~x~", &[(1, 1)]);
+    assert_eq!(
+        d,
+        vec![
+            mark(0, 1, MarkStyle::Delim),
+            mark(1, 2, MarkStyle::Strike),
+            mark(2, 3, MarkStyle::Delim),
         ]
     );
 }
@@ -147,6 +191,21 @@ fn inline_link_with_title_revealed_keeps_title_in_delim() {
             mark(5, 11, MarkStyle::Delim), // " \"ti\")"
         ]
     );
+}
+
+#[test]
+fn link_title_containing_parens_keeps_decorations_and_reveals_url() {
+    // The backward paren-depth scan lost ALL link decorations on these.
+    let d = decos("[t](u \"a)b\")", &[]);
+    assert_eq!(
+        d,
+        vec![conceal(0, 1), mark(1, 2, MarkStyle::Link), conceal(2, 12)]
+    );
+    let d = decos("[t](u \"a)b\")", &[(1, 1)]);
+    assert!(d.contains(&mark(4, 5, MarkStyle::Url)), "{d:?}");
+
+    let d = decos("[t](u \"(a\")", &[(1, 1)]);
+    assert!(d.contains(&mark(4, 5, MarkStyle::Url)), "{d:?}");
 }
 
 #[test]
@@ -277,6 +336,45 @@ fn fenced_code_multi_line_body() {
             conceal(15, 18),
         ]
     );
+}
+
+#[test]
+fn fenced_code_in_blockquote_strips_the_quote_prefix_per_line() {
+    let doc = "> ```\n> code\n> ```\n";
+    let d = decos(doc, &[]);
+    // Both fence lines classify as fences (incl. the closing "> ```") and
+    // conceal only the fence bytes; body mark:code excludes the "> " run,
+    // which the blockquote's own per-line conceal claims instead.
+    assert!(d.contains(&block(2, BlockStyle::CodeFence)), "{d:?}");
+    assert!(d.contains(&conceal(2, 5)));
+    assert!(d.contains(&block(8, BlockStyle::CodeBlock)));
+    assert!(d.contains(&mark(8, 12, MarkStyle::Code)));
+    assert!(d.contains(&block(15, BlockStyle::CodeFence)));
+    assert!(d.contains(&conceal(15, 18)));
+    assert!(d.contains(&conceal(0, 2)));
+    assert!(d.contains(&conceal(6, 8)));
+    assert!(d.contains(&conceal(13, 15)));
+    assert_exclusive_disjoint(&d);
+    // BLOCK-level reveal: a cursor in the body reveals BOTH raw fences.
+    let d = decos(doc, &[(9, 9)]);
+    assert!(d.contains(&mark(2, 5, MarkStyle::Delim)), "{d:?}");
+    assert!(d.contains(&mark(15, 18, MarkStyle::Delim)));
+}
+
+#[test]
+fn fenced_code_in_a_list_strips_the_item_indent_per_line() {
+    // Depth-2 nesting: 4 leading spaces per fence/body line — enough to
+    // defeat the closing fence's 3-space allowance without stripping.
+    let doc = "- a\n  - b\n    ```\n    code\n    ```\n";
+    let d = decos(doc, &[]);
+    let fences = d
+        .iter()
+        .filter(|x| matches!(x, Decoration::Block { style: BlockStyle::CodeFence, .. }))
+        .count();
+    assert_eq!(fences, 2, "{d:?}");
+    let code_pos = doc.find("code").unwrap(); // all-ASCII: byte == CU
+    assert!(d.contains(&mark(code_pos, code_pos + 4, MarkStyle::Code)));
+    assert_exclusive_disjoint(&d);
 }
 
 // ------------------------------------------------------------------ lists --
@@ -515,6 +613,62 @@ fn nested_ordered_list_inside_a_quote_restarts_sequence() {
 }
 
 #[test]
+fn marker_only_line_bullet_never_conceals_the_newline() {
+    // `-\n  foo`: the item's content starts on the NEXT line; the bullet
+    // widget must replace only the dash — a marker span crossing the
+    // terminator would visually merge the two lines.
+    let d = decos("-\n  foo\n", &[]);
+    assert_eq!(d, vec![li(0, 1), bullet(0, 1)]);
+}
+
+#[test]
+fn nested_list_in_blockquote_keeps_exclusive_spans_disjoint() {
+    // Line 2 of "> - a\n>   - b\n": quote conceal (6..8), indent conceal
+    // (8..10), bullet widget (10..12) — three adjacent exclusive claims.
+    // The indent back-scan must not cross the `> ` run.
+    let doc = "> - a\n>   - b\n";
+    let d = decos(doc, &[]);
+    assert!(d.contains(&conceal(6, 8)), "{d:?}");
+    assert!(d.contains(&conceal(8, 10)));
+    assert!(d.contains(&bullet(10, 12)));
+    assert_exclusive_disjoint(&d);
+}
+
+#[test]
+fn directly_nested_bullets_keep_exclusive_spans_disjoint() {
+    // "- - a": the inner item claims no indent from the outer marker's
+    // own "- " span.
+    let d = decos("- - a\n", &[]);
+    assert!(d.contains(&bullet(0, 2)), "{d:?}");
+    assert!(d.contains(&bullet(2, 4)));
+    assert_exclusive_disjoint(&d);
+}
+
+#[test]
+fn folded_leading_space_siblings_still_get_widgets() {
+    // pulldown folds the incidental 1-space indent into the second item's
+    // span; the marker-glyph probe must skip it for bullets AND ordered.
+    let d = decos("- a\n - b\n", &[]);
+    let bullets = d
+        .iter()
+        .filter(|x| matches!(x, Decoration::Widget { kind: oxidown_core::WidgetKind::Bullet, .. }))
+        .count();
+    assert_eq!(bullets, 2, "{d:?}");
+
+    let d = decos("1. a\n 2. b\n", &[]);
+    let numbers: Vec<u64> = d
+        .iter()
+        .filter_map(|x| match x {
+            Decoration::Widget { kind: oxidown_core::WidgetKind::Ordered { number, .. }, .. } => {
+                Some(*number)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(numbers, vec![1, 2], "{d:?}");
+}
+
+#[test]
 fn task_item_widget_when_not_revealed() {
     let d = decos("- [ ] todo\n- [x] done\n", &[]);
     assert_eq!(
@@ -597,6 +751,22 @@ fn thematic_break_line_style_and_reveal() {
     assert!(d.contains(&block(3, BlockStyle::ThematicBreak)));
     assert!(d.contains(&mark(3, 6, MarkStyle::Delim)));
     assert!(!d.contains(&conceal(3, 6)));
+}
+
+// --------------------------------------------------------------- headings --
+
+#[test]
+fn heading_closing_hash_run_conceals_as_delimiter() {
+    // "# Title ##": the closing sequence (space + hash run) is not content.
+    let d = decos("# Title ##\n", &[]);
+    assert!(d.contains(&Decoration::Line { at: 0, level: 1 }), "{d:?}");
+    assert!(d.contains(&conceal(0, 2)));
+    assert!(d.contains(&conceal(7, 10)));
+    // Line-level reveal flips BOTH runs to delim marks together.
+    let d = decos("# Title ##\n", &[(4, 4)]);
+    assert!(d.contains(&mark(0, 2, MarkStyle::Delim)), "{d:?}");
+    assert!(d.contains(&mark(7, 10, MarkStyle::Delim)));
+    assert!(!d.iter().any(|x| matches!(x, Decoration::Conceal { .. })));
 }
 
 // --------------------------------------------------------- viewport/misc --

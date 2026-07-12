@@ -349,6 +349,34 @@ fn stream_block_ids_stay_sticky_across_appends() {
 }
 
 #[test]
+fn stream_internal_anchor_is_invisible_to_the_public_anchor_api() {
+    // The stream's insertion anchor shares the id counter with public
+    // anchors but is INTERNAL: resolve_anchor/drop_anchor must treat its id
+    // exactly like an unknown id, so no id passed over the boundary can
+    // disturb an open stream. (Pre-fix: drop_anchor removed the internal
+    // anchor and the next stream_append PANICKED across the wasm boundary.)
+    let mut ed = Editor::new(1);
+    ed.load("hello world");
+    let mut mirror = ed.get_text();
+    let public = ed.create_anchor(0, oxidown_core::Bias::Before).unwrap();
+    let id = ed.stream_open(5).unwrap();
+    // Sweep an id range that necessarily covers the stream's internal
+    // anchor id (ids are allocated from one sequential counter).
+    for probe in 0..=(public + 10) {
+        if probe == public {
+            continue;
+        }
+        assert_eq!(ed.resolve_anchor(probe), None, "internal/unknown id {probe} resolves None");
+        ed.drop_anchor(probe); // must be a no-op for the internal id
+    }
+    // The stream is unharmed: appends keep working at the right position.
+    append(&mut ed, &mut mirror, id, " there");
+    assert_eq!(ed.get_text(), "hello there world");
+    assert_eq!(ed.resolve_anchor(public), Some(0), "public anchor untouched");
+    ed.stream_close(id);
+}
+
+#[test]
 fn anchors_map_through_stream_appends() {
     let mut ed = Editor::new(1);
     ed.load("before after");
