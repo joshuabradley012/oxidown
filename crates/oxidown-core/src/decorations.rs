@@ -8,14 +8,29 @@
 //! (a cursor sitting immediately before or after a delimiter reveals).
 //! Revealed nodes emit `mark:delim` for their delimiter spans instead of
 //! `conceal`. Nodes reveal independently, so nesting works per-node.
+//! Line-prefix marker constructs (list markers, task widgets, nested indent,
+//! blockquote runs) use an alternate extent for this predicate — their WHOLE
+//! LINE (see `parser::Node::reveal_extent`; contract v0.3): a cursor anywhere
+//! on the line reveals all of its markers, matching heading semantics.
+//! Fence lines likewise use the whole fenced block (block-level reveal).
 //!
 //! Composition stability (contract, model rule 5): while a session is active,
 //! any conceal span intersecting the composition range is emitted as
 //! `mark:delim` instead — hence no *new* conceal span can appear inside the
-//! range either, since every one of them is diverted to `mark:delim`.
+//! range either, since every one of them is diverted to `mark:delim`. The
+//! same rule is applied to the task widget (composing over its checkbox
+//! span suppresses the widget in favor of `mark:delim`), so an IME session
+//! never has to fight a replace-range widget mid-composition.
+//!
+//! M0 decoration shapes (`Line`, and the existing `Mark`/`Conceal` styles)
+//! are unchanged from v0 — the M1 additions are new enum variants (`Block`,
+//! `Widget`) and new `MarkStyle` values, kept additive per
+//! docs/boundary-v0.md's v0.2 rule ("Views MUST ignore decoration styles and
+//! widget kinds they don't recognize").
 
 use std::ops::Range;
 
+use crate::block_index::Block;
 use crate::composition::Composition;
 use crate::parser::{Node, NodeKind};
 use crate::text::TextBuffer;
@@ -26,6 +41,15 @@ pub enum MarkStyle {
     Em,
     Code,
     Delim,
+    /// M1: strikethrough content (`~~x~~`).
+    Strike,
+    /// M1: a link's visible text (concealed state) or whole autolink span.
+    Link,
+    /// M1: a link's destination, emitted only when the link is revealed.
+    Url,
+    /// M1: a list item's bullet/number marker — always visible, never
+    /// concealed.
+    ListMarker,
 }
 
 impl MarkStyle {
@@ -35,6 +59,45 @@ impl MarkStyle {
             MarkStyle::Em => "em",
             MarkStyle::Code => "code",
             MarkStyle::Delim => "delim",
+            MarkStyle::Strike => "strike",
+            MarkStyle::Link => "link",
+            MarkStyle::Url => "url",
+            MarkStyle::ListMarker => "list-marker",
+        }
+    }
+}
+
+/// M1 line-level block styles beyond the M0 heading `Line` variant. Kept as
+/// a separate `Decoration::Block` variant (rather than folding into `Line`)
+/// so the M0 `Decoration::Line { at, level }` shape — and every M0 test that
+/// matches it — is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockStyle {
+    /// 1-based nesting depth.
+    BlockQuote(u8),
+    CodeBlock,
+    CodeFence,
+    ThematicBreak,
+    /// A NESTED list item's line (depth >= 2): the view supplies exact
+    /// per-depth padding while the raw indent whitespace conceals.
+    ListItem(u8),
+}
+
+impl BlockStyle {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BlockStyle::BlockQuote(_) => "blockquote",
+            BlockStyle::CodeBlock => "code-block",
+            BlockStyle::CodeFence => "code-fence",
+            BlockStyle::ThematicBreak => "hr",
+            BlockStyle::ListItem(_) => "list-item",
+        }
+    }
+
+    pub fn depth(&self) -> Option<u8> {
+        match self {
+            BlockStyle::BlockQuote(d) | BlockStyle::ListItem(d) => Some(*d),
+            _ => None,
         }
     }
 }
@@ -51,11 +114,52 @@ pub enum Decoration {
         from: usize,
         to: usize,
     },
+    /// M0: ATX heading line. Unchanged shape — see module docs.
     Line {
         at: usize,
         /// Heading level 1..=6 (boundary style string "h1".."h6").
         level: u8,
     },
+    /// M1: blockquote/code-fence/code-block/hr/list-item line chrome.
+    /// `revealed` is meaningful for `BlockQuote` and `ListItem`: the line's
+    /// marker region is being edited (caret adjacent), so the view drops the
+    /// line's decorative padding/bars and shows source geometry.
+    Block {
+        at: usize,
+        style: BlockStyle,
+        revealed: bool,
+    },
+    /// M1: a widget replacing a source span visually. Withheld (in favor of
+    /// a mark over the same span) when the node is revealed or under active
+    /// composition.
+    Widget {
+        from: usize,
+        to: usize,
+        kind: WidgetKind,
+    },
+}
+
+/// Widget vocabulary (wire: the `widget` field of `{kind:"widget", ...}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WidgetKind {
+    /// A task item's checkbox, replacing the `[ ]`/`[x]` source span.
+    /// Withheld as `mark:delim` on reveal.
+    Task { checked: bool },
+    /// An unordered list item's bullet, replacing the whole marker span
+    /// (glyph + trailing whitespace, e.g. `"- "`). Withheld as
+    /// `mark:list-marker` on reveal. Reveal is LINE-level (contract v0.3,
+    /// matching every other marker construct): a cursor/selection touching
+    /// any part of the item's line shows the raw marker instead.
+    Bullet,
+    /// An ordered list item's marker, replacing the whole marker span
+    /// (digits + delimiter + trailing whitespace, e.g. `"1. "`) with the
+    /// VIEW-COMPUTED CommonMark sequence number (contract v0.3 amendment;
+    /// research/07 §0/§1.2: CommonMark only gives a list's `start` number
+    /// meaning, so the core computes the displayed number from position-in-
+    /// run here rather than rewriting source digits, unlike Obsidian).
+    /// Withheld as `mark:list-marker` (raw source digits) on reveal —
+    /// LINE-level, matching every other marker construct.
+    Ordered { number: u64, delim: u8 },
 }
 
 /// Closed-interval intersection: empty ranges (cursors) at a boundary count.
@@ -63,22 +167,204 @@ fn touches(a: usize, b: usize, from: usize, to: usize) -> bool {
     a <= to && b >= from
 }
 
+/// Windowing FLOOR for `compute`'s viewport filter: the span start of the
+/// top-level block containing `from` (the last block starting at/before it),
+/// or 0 — one `partition_point` over the block index, O(log blocks).
+/// Replaces the previous backward byte scan to the last blank line, which
+/// cost O(bytes back to that line) and degraded to O(doc) on a document
+/// with no blank line above the viewport (one giant paragraph/blockquote/
+/// code block — measured ~2.4ms/call on a 2MB blank-line-free blockquote).
+///
+/// Validity: NO overlay node's extent crosses a top-level block START —
+/// every node is derived from a construct inside exactly one top-level
+/// block (line-oriented kinds are single-line by construction; inline kinds
+/// live inside one leaf block; the blank/gap bytes between blocks carry no
+/// nodes) — so every node overlapping the viewport starts at/after the
+/// block start this returns. When `from` sits in a blank gap AFTER the
+/// found block's span, its start is merely a looser (still sound) floor.
+/// `compute`'s debug_assert re-validates the chosen floor against the
+/// nodes themselves (the linear reference) on every debug run.
+fn block_floor(blocks: &[Block], from: usize) -> usize {
+    let idx = blocks.partition_point(|b| b.span.start <= from);
+    idx.checked_sub(1).map_or(0, |i| blocks[i].span.start)
+}
+
 pub fn compute(
     nodes: &[Node],
+    blocks: &[Block],
     text: &TextBuffer,
     viewport: Range<usize>,
     selections: &[(usize, usize)],
     composition: Option<&Composition>,
 ) -> Vec<Decoration> {
     let mut out = Vec::new();
-    for node in nodes {
-        // Half-open overlap with the viewport; nodes have non-empty extents.
-        if node.extent.start >= viewport.end || node.extent.end <= viewport.start {
+    // Viewport window over the overlay — O(window + log n) node filtering
+    // plus the O(log blocks) `block_floor` lookup, NOT a linear scan of
+    // every node per call. `nodes` is sorted by `extent.start`
+    // (`parse_document` stable-sorts; the editor's tail/incremental splice
+    // paths preserve the order), so the window END is a plain
+    // `partition_point`. The START cannot be: a node may begin BEFORE the
+    // viewport and still overlap it, and such nodes are NOT a contiguous
+    // suffix of the prefix — counterexample: `"> **a\n> b\n> c** d"` with a
+    // viewport inside the third line has the strong node (spanning all
+    // three lines) overlapping, but the per-line quote node of line two
+    // (later start, no overlap) sits between it and the viewport, so
+    // "back-scan until the first non-overlapping node" would drop the
+    // strong. Instead the start is lower-bounded by the parser-wide
+    // invariant `block_floor` documents: no node's extent crosses a
+    // top-level block start, so every node overlapping the viewport starts
+    // at/after `viewport.start`'s own block's start. Both bounds are
+    // asserted in debug builds, so every debug test run enforces the
+    // invariants this windowing relies on.
+    debug_assert!(
+        nodes.windows(2).all(|w| w[0].extent.start <= w[1].extent.start),
+        "compute requires the overlay sorted by extent.start"
+    );
+    let floor = block_floor(blocks, viewport.start);
+    let lo = nodes.partition_point(|n| n.extent.start < floor);
+    let hi = nodes.partition_point(|n| n.extent.start < viewport.end);
+    debug_assert!(
+        nodes[..lo].iter().all(|n| n.extent.end <= viewport.start),
+        "windowing floor violated: a node below the floor overlaps the \
+         viewport (some extent crosses a top-level block start?)"
+    );
+    for node in &nodes[lo..hi] {
+        // Half-open overlap with the viewport. Most nodes have non-empty
+        // extents, but a ZERO-WIDTH extent is legal (an empty fence-body
+        // line — see `parser::fenced_code_lines`) and must count as inside
+        // the viewport when it sits anywhere in [start, end), INCLUDING
+        // exactly at `viewport.start`: the general exclusive-end check
+        // (`extent.end <= viewport.start`) would otherwise drop it at the
+        // seam, losing its `line:code-block` decoration for exactly one
+        // viewport position. A zero-width node at `viewport.end` stays
+        // excluded (half-open: that position belongs to the next window),
+        // matching the `hi` partition bound above.
+        let inside = if node.extent.start == node.extent.end {
+            viewport.start <= node.extent.start && node.extent.start < viewport.end
+        } else {
+            node.extent.start < viewport.end && node.extent.end > viewport.start
+        };
+        if !inside {
             continue;
         }
+
+        let reveal_extent = node.reveal_extent.as_ref().unwrap_or(&node.extent);
         let revealed = selections
             .iter()
-            .any(|&(a, b)| touches(a, b, node.extent.start, node.extent.end));
+            .any(|&(a, b)| touches(a, b, reveal_extent.start, reveal_extent.end));
+
+        match node.kind {
+            NodeKind::ListMarker { task, depth, number, delim } => {
+                if node.extent.end <= node.extent.start {
+                    continue;
+                }
+                // Every list item line carries a list-item line decoration
+                // (all depths): the view uses it for hanging indent, so
+                // wrapped item text aligns with the first line's text.
+                out.push(Decoration::Block {
+                    at: text.byte_to_utf16(node.extent.start),
+                    style: BlockStyle::ListItem(depth),
+                    revealed,
+                });
+                let from = text.byte_to_utf16(node.extent.start);
+                let to = text.byte_to_utf16(node.extent.end);
+                // pulldown folds up to 3 bytes of incidental leading
+                // whitespace into a sibling item's span (`"- a\n - b"`), so
+                // the marker glyph may sit past extent.start — probe past
+                // blanks (mirrors commands.rs's `line_marker`).
+                let mut glyph = node.extent.start;
+                while glyph < node.extent.end
+                    && matches!(text.byte_at(glyph), Some(b' ' | b'\t'))
+                {
+                    glyph += 1;
+                }
+                let is_bullet = matches!(text.byte_at(glyph), Some(b'-' | b'*' | b'+'));
+                let in_composition = composition
+                    .is_some_and(|c| touches(c.start, c.end, node.extent.start, node.extent.end));
+                // Reveal is LINE-level (`revealed` uses the marker node's
+                // reveal_extent = the item's whole first line): the raw
+                // markers are editable whenever the cursor is on the line,
+                // never one keystroke away from surprise.
+                if is_bullet && task {
+                    // Task items: the checkbox alone represents the item;
+                    // the `- ` conceals/reveals in lockstep with it.
+                    if revealed || in_composition {
+                        out.push(Decoration::Mark {
+                            from,
+                            to,
+                            style: MarkStyle::Delim,
+                        });
+                    } else {
+                        out.push(Decoration::Conceal { from, to });
+                    }
+                } else if is_bullet {
+                    if revealed || in_composition {
+                        out.push(Decoration::Mark {
+                            from,
+                            to,
+                            style: MarkStyle::ListMarker,
+                        });
+                    } else {
+                        out.push(Decoration::Widget {
+                            from,
+                            to,
+                            kind: WidgetKind::Bullet,
+                        });
+                    }
+                } else if revealed || in_composition {
+                    // Revealed (line-level, matching every other marker
+                    // construct): raw source digits, unchanged from today.
+                    out.push(Decoration::Mark {
+                        from,
+                        to,
+                        style: MarkStyle::ListMarker,
+                    });
+                } else if let (Some(number), Some(delim)) = (number, delim) {
+                    // Concealed: a computed-number WIDGET replacing the whole
+                    // marker span — the view-computed display number
+                    // (contract v0.3 amendment, research/07 §0/§1.2), never
+                    // the item's raw source digits. Alignment (fixed-width,
+                    // right-aligned, tabular numerals) is the view's job, the
+                    // same box `mark:list-marker` used before.
+                    out.push(Decoration::Widget {
+                        from,
+                        to,
+                        kind: WidgetKind::Ordered { number, delim },
+                    });
+                } else {
+                    // Defensive: an ordered marker (is_bullet == false) always
+                    // carries number+delim from the parser; never silently
+                    // drop the marker if that invariant is somehow violated.
+                    out.push(Decoration::Mark {
+                        from,
+                        to,
+                        style: MarkStyle::ListMarker,
+                    });
+                }
+                continue;
+            }
+            NodeKind::TaskWidget { checked } => {
+                let in_composition = composition
+                    .is_some_and(|c| touches(c.start, c.end, node.extent.start, node.extent.end));
+                let from = text.byte_to_utf16(node.extent.start);
+                let to = text.byte_to_utf16(node.extent.end);
+                if revealed || in_composition {
+                    out.push(Decoration::Mark {
+                        from,
+                        to,
+                        style: MarkStyle::Delim,
+                    });
+                } else {
+                    out.push(Decoration::Widget {
+                        from,
+                        to,
+                        kind: WidgetKind::Task { checked },
+                    });
+                }
+                continue;
+            }
+            _ => {}
+        }
 
         let content_style = match node.kind {
             NodeKind::Heading(level) => {
@@ -91,6 +377,93 @@ pub fn compute(
             NodeKind::Strong => Some(MarkStyle::Strong),
             NodeKind::Emphasis => Some(MarkStyle::Em),
             NodeKind::Code => Some(MarkStyle::Code),
+            NodeKind::Strike => Some(MarkStyle::Strike),
+            NodeKind::Link { .. } => Some(MarkStyle::Link),
+            NodeKind::BlockQuoteLine(depth) => {
+                out.push(Decoration::Block {
+                    at: text.byte_to_utf16(node.extent.start),
+                    style: BlockStyle::BlockQuote(depth),
+                    revealed,
+                });
+                None
+            }
+            NodeKind::CodeFenceLine => {
+                out.push(Decoration::Block {
+                    at: text.byte_to_utf16(node.extent.start),
+                    style: BlockStyle::CodeFence,
+                    revealed: false,
+                });
+                // Like the thematic break: the raw fence (``` + info string)
+                // conceals unless the cursor is on the fence line — the
+                // styled fence line itself reads as the code block's edge.
+                let in_composition = composition
+                    .is_some_and(|c| touches(c.start, c.end, node.extent.start, node.extent.end));
+                let from = text.byte_to_utf16(node.extent.start);
+                let to = text.byte_to_utf16(node.extent.end);
+                if to > from {
+                    if revealed || in_composition {
+                        out.push(Decoration::Mark {
+                            from,
+                            to,
+                            style: MarkStyle::Delim,
+                        });
+                    } else {
+                        out.push(Decoration::Conceal { from, to });
+                    }
+                }
+                None
+            }
+            NodeKind::CodeBlockLine => {
+                out.push(Decoration::Block {
+                    at: text.byte_to_utf16(node.extent.start),
+                    style: BlockStyle::CodeBlock,
+                    revealed: false,
+                });
+                Some(MarkStyle::Code)
+            }
+            NodeKind::ListItemIndent { .. } => {
+                let in_composition = composition
+                    .is_some_and(|c| touches(c.start, c.end, node.extent.start, node.extent.end));
+                let from = text.byte_to_utf16(node.extent.start);
+                let to = text.byte_to_utf16(node.extent.end);
+                if revealed || in_composition {
+                    out.push(Decoration::Mark {
+                        from,
+                        to,
+                        style: MarkStyle::Delim,
+                    });
+                } else {
+                    out.push(Decoration::Conceal { from, to });
+                }
+                None
+            }
+            NodeKind::ThematicBreak => {
+                out.push(Decoration::Block {
+                    at: text.byte_to_utf16(node.extent.start),
+                    style: BlockStyle::ThematicBreak,
+                    revealed: false,
+                });
+                // The `---` source participates in reveal like any delimiter:
+                // concealed (the view draws the rule via the hr line style)
+                // unless the cursor is on the line or composition touches it.
+                let in_composition = composition
+                    .is_some_and(|c| touches(c.start, c.end, node.extent.start, node.extent.end));
+                let from = text.byte_to_utf16(node.extent.start);
+                let to = text.byte_to_utf16(node.extent.end);
+                if revealed || in_composition {
+                    out.push(Decoration::Mark {
+                        from,
+                        to,
+                        style: MarkStyle::Delim,
+                    });
+                } else {
+                    out.push(Decoration::Conceal { from, to });
+                }
+                None
+            }
+            NodeKind::ListMarker { .. } | NodeKind::TaskWidget { .. } => {
+                unreachable!("handled above with `continue`")
+            }
         };
         if let Some(style) = content_style {
             if node.content.end > node.content.start {
@@ -107,16 +480,48 @@ pub fn compute(
             }
             let in_composition = composition
                 .is_some_and(|c| touches(c.start, c.end, d.start, d.end));
-            let from = text.byte_to_utf16(d.start);
-            let to = text.byte_to_utf16(d.end);
-            if revealed || in_composition {
-                out.push(Decoration::Mark {
-                    from,
-                    to,
-                    style: MarkStyle::Delim,
+            if !(revealed || in_composition) {
+                out.push(Decoration::Conceal {
+                    from: text.byte_to_utf16(d.start),
+                    to: text.byte_to_utf16(d.end),
                 });
-            } else {
-                out.push(Decoration::Conceal { from, to });
+                continue;
+            }
+            // Revealed. A link's second conceal span (`](url)`) opens up as
+            // delim/url/delim PIECES (v0.2 clarification 4) — non-overlapping,
+            // with the destination as `mark:url` and any title tail staying
+            // delim. Everything else reveals as one whole delim mark.
+            let url_inside = match (&node.kind, &node.url) {
+                (NodeKind::Link { autolink: false }, Some(url))
+                    if d.start <= url.start && url.end <= d.end && url.end > url.start =>
+                {
+                    Some(url.clone())
+                }
+                _ => None,
+            };
+            match url_inside {
+                Some(url) => {
+                    for (piece_from, piece_to, style) in [
+                        (d.start, url.start, MarkStyle::Delim),
+                        (url.start, url.end, MarkStyle::Url),
+                        (url.end, d.end, MarkStyle::Delim),
+                    ] {
+                        if piece_to > piece_from {
+                            out.push(Decoration::Mark {
+                                from: text.byte_to_utf16(piece_from),
+                                to: text.byte_to_utf16(piece_to),
+                                style,
+                            });
+                        }
+                    }
+                }
+                None => {
+                    out.push(Decoration::Mark {
+                        from: text.byte_to_utf16(d.start),
+                        to: text.byte_to_utf16(d.end),
+                        style: MarkStyle::Delim,
+                    });
+                }
             }
         }
     }
@@ -127,7 +532,9 @@ pub fn compute(
 fn sort_key(d: &Decoration) -> (usize, u8, usize) {
     match d {
         Decoration::Line { at, level } => (*at, 0, *level as usize),
+        Decoration::Block { at, .. } => (*at, 0, 0),
         Decoration::Mark { from, to, .. } => (*from, 1, *to),
         Decoration::Conceal { from, to } => (*from, 1, *to),
+        Decoration::Widget { from, to, .. } => (*from, 1, *to),
     }
 }

@@ -1,10 +1,11 @@
-# Oxidown web demo (M0)
+# Oxidown web demo (M0 + M1)
 
 Full-page CodeMirror 6 editor wired to an Oxidown core through the boundary
-protocol (`docs/boundary-v0.md`). By default it runs against the TypeScript
-`MockCore`; add `?core=wasm` to the URL to try the real Rust/wasm core once
-`crates/oxidown-wasm/pkg` has been built (it falls back to the mock with a
-visible banner otherwise).
+protocol (`docs/boundary-v0.md`, v0 + the v0.2/M1 additions). By default it
+runs against the TypeScript `MockCore`; add `?core=wasm` to the URL to try the
+real Rust/wasm core once `crates/oxidown-wasm/pkg` has been built (it falls
+back to the mock with a visible banner otherwise). Streaming, commands, and
+task checkboxes all work identically against either core.
 
 ## Run
 
@@ -20,6 +21,44 @@ everything; `pnpm -r test` runs the library tests.
 
 ## What to test manually
 
+### Streaming — the thing to try first
+
+Click **"Stream AI text"**: a hardcoded ~55-line markdown answer (headings,
+bold/italic, a fenced code block, a task list, a blockquote) is delivered
+through `core.streamOpen` / `streamAppend` / `streamClose` in randomly-sized
+chunks (2–20 chars) at randomized delays (15–40ms) — deliberately misaligned
+with token or markdown boundaries, so you'll see things like an unterminated
+` ``` ` fence or a half-typed `**bold` render honestly for a moment before the
+next chunk completes them.
+
+**While it's streaming, click into the top of the document and keep
+typing.** Your own edits are never interrupted, never coalesced with the
+stream's undo unit, and the stream keeps appending exactly where it left off
+underneath your cursor — the core maps the stream's insertion point through
+your edits, and the view never moves your selection to follow the stream
+(only explicit core-driven changes like undo/redo/commands do that). The
+stream status + chunk rate are shown in the header; "Stop" closes the stream
+early (whatever streamed so far stays, as one undo unit — Cmd/Ctrl-Z removes
+it all in one step).
+
+### Formatting commands
+
+Select some text and press **Mod-B** (bold), **Mod-I** (italic),
+**Mod-Shift-X** (strikethrough), or **Mod-E** (inline code) to toggle
+delimiters via `core.command(...)` instead of typing them by hand. For
+canonical delimiter flavors (`**`, `*`, `~~`, matching backtick runs),
+toggling twice returns the exact original bytes (round-trip tested in the
+library suite); non-canonical flavors normalize on the way back — e.g.
+`__x__` deliberately re-wraps as `**x**` (see `crates/oxidown-core/README.md`).
+
+### Task lists
+
+Type a GFM task item (`- [ ] like this`) and click the rendered checkbox: it
+calls `core.command("toggleTask", pos)` and applies the result the same way
+undo/redo and streaming do — the checkbox is the project's first "widget
+island" (a CM6 replace decoration wrapping a real `<input type="checkbox">`).
+Clicking it never moves the text cursor.
+
 ### Reveal / conceal behavior
 
 - Click into `**bold text**`, `*italic*`, `` `inline code` ``, and the
@@ -31,9 +70,15 @@ everything; `pnpm -r test` runs the library tests.
   pair stays concealed until the cursor enters the italic span.
 - Watch line heights: revealing/concealing must cause **no vertical layout
   shift** (delimiters are collapsed with a tiny font-size, never removed from
-  the DOM).
+  the DOM). This also holds for the M1 additions below: blockquote markers,
+  code-fence/code-block lines, and the task checkbox widget never change a
+  line's height between concealed/revealed states.
 - Drag-select across several formatted spans: while the mouse button is down,
   reveal state must not flicker; it recomputes once on mouse-up.
+- M1 vocabulary: `~~strikethrough~~`, `[links](url)` (cursor in reveals the
+  destination as a separate styled span), `> blockquotes`, fenced code blocks,
+  list markers, and thematic breaks (`---`) all render live; try placing the
+  cursor inside a link to see the URL appear.
 
 ### Undo / redo (core-driven; CM6 history is disabled)
 

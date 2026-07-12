@@ -1,6 +1,7 @@
 {
   "name": "oxidown-workspace",
   "private": true,
+  "packageManager": "pnpm@11.9.0",
   "scripts": {
     "build:wasm": "wasm-pack build crates/oxidown-wasm --target web --out-dir pkg",
     "dev": "pnpm --filter web-demo dev",

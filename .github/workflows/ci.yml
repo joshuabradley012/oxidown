@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (test + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      # perf_smoke and stream_perf assert only loose ceilings (5-30x the
+      # contract budget), sized to absorb shared-runner noise — they gate:
+      # an order-of-magnitude regression fails CI, wall-time jitter does not.
+      # perf_baseline additionally carries tight (<1ms-scale) local trip-wires
+      # that WOULD flake on shared runners, so it stays informational.
+      - name: Perf gate (loose ceilings; perf_smoke + stream_perf)
+        run: |
+          echo "::group::perf gate (--ignored, release)"
+          cargo test --release -p oxidown-core --test perf_smoke --test stream_perf -- --ignored --nocapture
+          echo "::endgroup::"
+
+      - name: Perf baseline (informational, non-fatal)
+        run: |
+          echo "::group::perf baseline (--ignored, release, non-fatal)"
+          cargo test --release -p oxidown-core --test perf_baseline -- --ignored --nocapture || true
+          echo "::endgroup::"
+
+  wasm:
+    name: Wasm build + size budget
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Add wasm32-unknown-unknown target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@9a79470254ab1bfe1fa4cb61c6f6fb0bf86aeb3d # wasm-pack
+
+      - name: wasm-pack build
+        run: wasm-pack build crates/oxidown-wasm --target web --out-dir pkg
+
+      - name: Report wasm size + enforce budget
+        run: |
+          set -euo pipefail
+
+          WASM_FILE=$(find crates/oxidown-wasm/pkg -maxdepth 1 -name '*.wasm' | head -n1)
+          if [ -z "${WASM_FILE}" ]; then
+            echo "::error::No .wasm file found in crates/oxidown-wasm/pkg after wasm-pack build"
+            exit 1
+          fi
+
+          RAW_BYTES=$(wc -c < "${WASM_FILE}")
+          GZIP_BYTES=$(gzip -c "${WASM_FILE}" | wc -c)
+          BUDGET_BYTES=$((400 * 1024))
+
+          RAW_KB=$(awk "BEGIN { printf \"%.1f\", ${RAW_BYTES}/1024 }")
+          GZIP_KB=$(awk "BEGIN { printf \"%.1f\", ${GZIP_BYTES}/1024 }")
+          BUDGET_KB=$(awk "BEGIN { printf \"%.1f\", ${BUDGET_BYTES}/1024 }")
+
+          {
+            echo "### Wasm bundle size"
+            echo ""
+            echo "| File | Raw | Gzipped | Budget (gzip) |"
+            echo "|---|---|---|---|"
+            echo "| \`$(basename "${WASM_FILE}")\` | ${RAW_KB} KB | ${GZIP_KB} KB | ${BUDGET_KB} KB |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "raw:   ${RAW_BYTES} bytes (${RAW_KB} KB)"
+          echo "gzip:  ${GZIP_BYTES} bytes (${GZIP_KB} KB)"
+          echo "budget: ${BUDGET_BYTES} bytes (${BUDGET_KB} KB, gzipped)"
+
+          if [ "${GZIP_BYTES}" -gt "${BUDGET_BYTES}" ]; then
+            echo "::error::Gzipped wasm size ${GZIP_BYTES} bytes exceeds the ${BUDGET_BYTES}-byte (400KB) budget"
+            exit 1
+          fi
+
+      - name: Upload wasm pkg for the web job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: oxidown-wasm-pkg
+          path: crates/oxidown-wasm/pkg
+          if-no-files-found: error
+
+  web:
+    name: pnpm build + test
+    runs-on: ubuntu-latest
+    # Needs the built wasm pkg so the JS suite's wasm conformance tests run
+    # against the real artifact instead of silently skipping.
+    needs: wasm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Download wasm pkg
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: oxidown-wasm-pkg
+          path: crates/oxidown-wasm/pkg
+
+      # Reads the pnpm version from package.json's "packageManager" field.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm -r build
+
+      - name: Test
+        run: pnpm -r test

@@ -1,6 +1,7 @@
 //! wasm-bindgen boundary for `oxidown-core`, exposing the `OxidownCore`
-//! TypeScript interface from docs/boundary-v0.md. Positions are already
-//! UTF-16 code units at the core API, so this is a thin shim.
+//! TypeScript interface from docs/boundary-v0.md (v0/v0.1 plus the v0.2 M1
+//! additions). Positions are already UTF-16 code units at the core API, so
+//! this is a thin shim.
 //!
 //! Payload strategy: structured values (splice batches in, decoration/splice
 //! batches out) cross the boundary as **one JSON string** per call —
@@ -12,37 +13,278 @@
 //! single large blobs are fine") and it keeps this crate's dependency
 //! surface to `serde_json` only.
 //!
+//! Wire shapes (v0.2): `undo`/`redo`/`command`/`streamAppend` all return the
+//! `CoreChange` shape `{ revision, splices, selection? }`; M1 line styles
+//! serialize as `{ kind: "line", at, style, depth? }` and task checkboxes as
+//! `{ kind: "widget", from, to, widget: "task", checked }`.
+//!
 //! Timestamps: the core never reads clocks (std::time panics on
 //! wasm32-unknown-unknown); `applyEdit` injects `js_sys::Date::now()`.
 //!
 //! Errors: every core `Err` becomes a thrown JS exception whose message
 //! starts with the error name (e.g. "StaleRevision: ..."), per the contract's
-//! mirror-desync-emergency handling.
+//! mirror-desync-emergency handling. Every numeric argument crosses as `f64`
+//! (never a `u32` wasm-bindgen param, whose JS→wasm coercion silently wraps
+//! negatives and truncates fractions) and is validated (finite, integral,
+//! non-negative) before conversion; anything else throws "InvalidArgs: ..."
+//! — `as usize` would otherwise silently saturate negatives to 0 and NaN
+//! to 0. Document POSITIONS are additionally bounded to `u32::MAX` (wasm32's
+//! usize is 32 bits, so `as usize` would truncate 2^32+6 to 6 and edit the
+//! wrong place); an over-u32 position is necessarily beyond the document and
+//! fails with the core's own "OutOfBounds: ..." message, matching the mock,
+//! whose numeric layer has no u32 ceiling and reaches its document-bounds
+//! check instead. Positions INSIDE JSON payloads (splice `at`/`delete`,
+//! selection `anchor`/`head`) deserialize as f64 and get the same treatment
+//! via `convert_splices`/`convert_selections`: the mock's integer check
+//! ("InvalidPayload: malformed ...") first, then over-u32 and past-doc-end
+//! values flow to the ordinary OutOfBounds bounds check — never a serde
+//! range error, never a silent 32-bit truncation. Numeric values quoted in
+//! boundary error messages format as JS `${v}` prints them (`js_num`), so
+//! message parity with the mock holds at the extremes: >= 1e21 uses the
+//! `1e+21` exponential form, and 2^64 never misprints as the saturated
+//! u64::MAX that `check_arg`'s cast produces. The constructor installs
+//! `console_error_panic_hook` so any core panic surfaces its message on the
+//! JS console instead of an opaque `RuntimeError: unreachable`.
 //!
 //! No `rand`/`getrandom`: `replica_id` is a constructor parameter
 //! (default 1).
 
-use oxidown_core::{CoreError, Decoration, EditOrigin, Editor, HistoryResult, SelectionRange, Splice};
+use oxidown_core::{
+    Bias, Command, CoreChange, CoreError, Decoration, EditOrigin, Editor, SelectionRange, Splice,
+};
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
+// Payload numbers deserialize as f64, NOT u32: serde would reject an
+// over-u32 (or negative/fractional) position with InvalidPayload, but the
+// contract (docs/boundary-v0.md) pins payload positions to the SAME
+// validation the mock applies — integer check (InvalidPayload with the
+// mock's message) first, then values above u32::MAX or beyond the document
+// flow to the ordinary OutOfBounds bounds check, exactly like the
+// direct-argument `check_pos` path.
 #[derive(Deserialize)]
 struct SpliceIn {
-    at: u32,
-    delete: u32,
+    at: f64,
+    delete: f64,
     insert: String,
 }
 
 #[derive(Deserialize)]
 struct SelectionIn {
-    anchor: u32,
-    head: u32,
+    anchor: f64,
+    head: f64,
 }
 
 fn core_err(e: CoreError) -> JsError {
     // Display output starts with the error name, e.g. "StaleRevision: ...".
     JsError::new(&e.to_string())
+}
+
+/// Format an `f64` exactly as JS `${v}` would print it — every boundary
+/// error message that embeds a caller-supplied number goes through this, so
+/// message parity with the mock (whose template literals get JS formatting
+/// for free) holds at the extremes. Rust's `Display` produces the same
+/// shortest-round-trip digits as JS but NEVER switches notation, so the two
+/// only disagree where JS goes exponential:
+/// - magnitude >= 1e21: JS prints `1e+21`; Rust `Display` would print the
+///   21-zero digit string. Rust's `LowerExp` emits the same mantissa digits
+///   with a sign-less positive exponent (`1e21`), so inserting the `+`
+///   reproduces JS exactly.
+/// - 0 < magnitude < 1e-6: JS prints `1e-7`; `LowerExp` already matches
+///   (negative exponents carry their `-`). Only reachable from messages
+///   quoting a NON-integral refused value, but those quote it verbatim too.
+/// - non-finite: both spell `NaN` the same, but JS prints `Infinity`, not
+///   Rust's `inf`.
+fn js_num(v: f64) -> String {
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return (if v < 0.0 { "-Infinity" } else { "Infinity" }).to_string();
+    }
+    if v.abs() >= 1e21 {
+        // The exponent is always >= 21 here, so the bare `e` is always
+        // followed by the positive exponent that needs JS's explicit `+`.
+        return format!("{v:e}").replace('e', "e+");
+    }
+    if v == 0.0 {
+        // Covers negative zero: JS `${-0}` is "0", Rust Display is "-0".
+        return "0".to_string();
+    }
+    if v.abs() < 1e-6 {
+        return format!("{v:e}");
+    }
+    format!("{v}")
+}
+
+/// Validate an `f64` boundary argument (position/level/id): it must be
+/// finite, integral, and non-negative — `as` casts would otherwise silently
+/// saturate NaN/negatives to 0 and quietly truncate fractions. Returns the
+/// "InvalidArgs: ..." message on failure (a plain `String` so native unit
+/// tests can exercise it without constructing a `JsError` off-wasm).
+///
+/// The returned `u64` SATURATES at 2^64 (float `as` int is a saturating
+/// cast): safe for comparisons that only need "huge stays huge" (a saturated
+/// id/revision can never collide with a real one, which counts up from 0),
+/// but NEVER format it into an error message — quote the raw `f64` via
+/// `js_num` instead, or the message names `18446744073709551615` where the
+/// caller passed `18446744073709552000` (2^64) and the mock echoes the
+/// latter.
+fn check_arg(v: f64, what: &str) -> Result<u64, String> {
+    if !v.is_finite() || v.fract() != 0.0 || v < 0.0 {
+        return Err(format!(
+            "InvalidArgs: {what} must be a non-negative integer, got {}",
+            js_num(v)
+        ));
+    }
+    Ok(v as u64)
+}
+
+/// `check_arg`, boundary-flavored: failures become thrown JS exceptions.
+fn arg(v: f64, what: &str) -> Result<u64, JsError> {
+    check_arg(v, what).map_err(|msg| JsError::new(&msg))
+}
+
+/// Largest document position the boundary accepts: it must fit wasm32's
+/// 32-bit `usize`. Document lengths (UTF-16 code units of an in-memory
+/// string) always fit too, so anything above this is beyond the document.
+const MAX_POS: u64 = u32::MAX as u64;
+
+/// The core's OutOfBounds message (`CoreError::OutOfBounds` Display),
+/// reproduced verbatim for positions too large to fit the `usize` the
+/// `CoreError` variant carries on wasm32. `pos` stays `f64` and is formatted
+/// as JS `${pos}` (`js_num`) so the value prints exactly as the caller sent
+/// it — digits below 1e21, the mock's `1e+21` exponential form above.
+fn oob_msg(pos: f64, doc_len: usize) -> String {
+    format!(
+        "OutOfBounds: position {} beyond document length {doc_len} (UTF-16 code units)",
+        js_num(pos)
+    )
+}
+
+/// Position flavor of `check_arg`: additionally rejects integers above
+/// `u32::MAX`, which `as usize` on wasm32 would silently TRUNCATE (2^32+6
+/// becomes 6 — probe-confirmed to edit the wrong range before this guard).
+/// The rejection is the same OutOfBounds the core's own document-bounds
+/// check produces, because that is where the mock — whose numeric layer has
+/// no u32 ceiling — fails for the same value (mock-core.ts `checkDocPos`).
+fn check_pos(v: f64, what: &str, doc_len: usize) -> Result<usize, String> {
+    let n = check_arg(v, what)?;
+    if n > MAX_POS {
+        return Err(oob_msg(v, doc_len));
+    }
+    Ok(n as usize)
+}
+
+/// `check_pos` for a query range (`decorations` / `compositionBegin`),
+/// fronting the mock's FULL validation order (mock-core.ts `decorations` /
+/// `compositionBegin`): malformed `from` → malformed `to` → `InvalidRange`
+/// when `from > to` → OutOfBounds on `to` when it exceeds the document.
+/// The core re-checks range/bounds for values that reach it, but this layer
+/// cannot defer to those re-checks: `decorations` parses its selections
+/// payload BEFORE calling the core, and the mock validates selections LAST —
+/// deferring would let a malformed selections payload preempt an invalid
+/// range (probe-confirmed divergence, pinned by the S6 probes in
+/// wasm-core-boundary.test.ts: `decorations(rev, 9, 2, [{anchor:-1,head:0}])`
+/// must be InvalidRange, not InvalidPayload). Comparisons use the RAW f64s
+/// (exact for integral values; the checked u64s saturate at 2^64), and the
+/// bounds check subsumes the u32 ceiling `check_pos` guards — `doc_len`
+/// always fits u32, so every over-u32 endpoint is beyond the document.
+fn check_query_range(from: f64, to: f64, doc_len: usize) -> Result<(usize, usize), String> {
+    let f = check_arg(from, "from")?;
+    let t = check_arg(to, "to")?;
+    if from > to {
+        return Err(format!(
+            "InvalidRange: from {} > to {}",
+            js_num(from),
+            js_num(to)
+        ));
+    }
+    if to > doc_len as f64 {
+        return Err(oob_msg(to, doc_len));
+    }
+    // from <= to <= doc_len <= u32::MAX here, so both casts are exact on
+    // wasm32's 32-bit usize.
+    Ok((f as usize, t as usize))
+}
+
+/// A JSON-payload number (splice/selection field): the mock's integer check
+/// (`Number.isInteger(v) && v >= 0`), f64-flavored.
+fn payload_num_ok(v: f64) -> bool {
+    v.is_finite() && v.fract() == 0.0 && v >= 0.0
+}
+
+/// Validate and convert an `applyEdit` splice payload with the MOCK's exact
+/// semantics, message spellings, and error precedence (mock-core.ts
+/// `validateSplices`, minus the two checks that live elsewhere: the
+/// unpaired-surrogate insert check is the JS adapter's, and the
+/// surrogate-split boundary check is the core's own apply-time check). Per
+/// splice: malformed `at`/`delete` (InvalidPayload) → ordering
+/// (InvalidSplice) → document bounds (OutOfBounds — which also covers
+/// over-u32 values: `doc_len` always fits u32, so anything above the ceiling
+/// is beyond the document; without this, `as usize` on wasm32 would silently
+/// TRUNCATE, exactly the hazard `check_pos` guards for direct arguments).
+fn convert_splices(splices: Vec<SpliceIn>, doc_len: usize) -> Result<Vec<Splice>, String> {
+    let mut out = Vec::with_capacity(splices.len());
+    let mut prev_end = 0.0_f64;
+    for (i, s) in splices.into_iter().enumerate() {
+        if !payload_num_ok(s.at) || !payload_num_ok(s.delete) {
+            return Err(format!(
+                "InvalidPayload: malformed splices: splice #{i} has at={} delete={}",
+                js_num(s.at),
+                js_num(s.delete)
+            ));
+        }
+        let end = s.at + s.delete;
+        if i > 0 && s.at < prev_end {
+            return Err(format!(
+                "InvalidSplice: splice #{i}: splices must be ascending and non-overlapping \
+                 (at {} < previous end {})",
+                js_num(s.at),
+                js_num(prev_end)
+            ));
+        }
+        if end > doc_len as f64 {
+            return Err(oob_msg(end, doc_len));
+        }
+        prev_end = end;
+        out.push(Splice {
+            at: s.at as usize,
+            delete: s.delete as usize,
+            insert: s.insert,
+        });
+    }
+    Ok(out)
+}
+
+/// Validate and convert a `decorations` selections payload (mock-core.ts
+/// `decorations`): per selection — malformed anchor/head (InvalidPayload,
+/// the mock's message) → bounds on `max(anchor, head)` (OutOfBounds; covers
+/// over-u32 values like `convert_splices`).
+fn convert_selections(
+    sels: Vec<SelectionIn>,
+    doc_len: usize,
+) -> Result<Vec<SelectionRange>, String> {
+    let mut out = Vec::with_capacity(sels.len());
+    for s in sels {
+        if !payload_num_ok(s.anchor) || !payload_num_ok(s.head) {
+            return Err(format!(
+                "InvalidPayload: malformed selections: anchor={} head={}",
+                js_num(s.anchor),
+                js_num(s.head)
+            ));
+        }
+        let hi = s.anchor.max(s.head);
+        if hi > doc_len as f64 {
+            return Err(oob_msg(hi, doc_len));
+        }
+        out.push(SelectionRange {
+            anchor: s.anchor as usize,
+            head: s.head as usize,
+        });
+    }
+    Ok(out)
 }
 
 /// Parse a JsValue (array of objects) by stringifying once and deserializing.
@@ -60,20 +302,117 @@ fn to_js(value: &serde_json::Value) -> Result<JsValue, JsError> {
         .map_err(|_| JsError::new("InternalError: produced invalid JSON"))
 }
 
-fn history_to_js(result: Option<HistoryResult>) -> Result<JsValue, JsError> {
-    match result {
+fn splices_json(splices: &[Splice]) -> serde_json::Value {
+    serde_json::Value::Array(
+        splices
+            .iter()
+            .map(|s| {
+                json!({
+                    "at": s.at,
+                    "delete": s.delete,
+                    "insert": s.insert,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn core_change_json(change: &CoreChange) -> serde_json::Value {
+    let mut obj = json!({
+        "revision": change.revision,
+        "splices": splices_json(&change.splices),
+    });
+    if let Some(sel) = &change.selection {
+        obj["selection"] = json!({ "anchor": sel.anchor, "head": sel.head });
+    }
+    obj
+}
+
+fn change_to_js(change: Option<CoreChange>) -> Result<JsValue, JsError> {
+    match change {
         None => Ok(JsValue::NULL),
-        Some(r) => to_js(&json!({
-            "revision": r.revision,
-            "splices": r.splices.iter().map(|s| json!({
-                "at": s.at,
-                "delete": s.delete,
-                "insert": s.insert,
-            })).collect::<Vec<_>>(),
-        })),
+        Some(c) => to_js(&core_change_json(&c)),
     }
 }
 
+/// Serialize a decoration batch straight into one JSON string — the hot
+/// half of the `decorations()` boundary call. The old path built a
+/// `serde_json::Value` tree first (one `Map` plus fresh key/tag `String`
+/// allocations per decoration) and measurably cost MORE than computing the
+/// decorations themselves (research/08-perf-baseline.md §8); this writer
+/// allocates nothing but the output buffer.
+///
+/// Wire format: byte-identical to the previous `serde_json::Value`
+/// serialization — compact separators, keys in ALPHABETICAL order (what
+/// serde_json's default `BTreeMap` emitted), same optional-field omission
+/// rules. Every field value is an integer, a boolean, or a fixed vocabulary
+/// of static tags (`MarkStyle::as_str`/`BlockStyle::as_str`/`h{level}`), so
+/// no string escaping is ever needed. Pinned byte-for-byte against the
+/// `serde_json` path by the `wire_format` test module below.
+fn decorations_json_string(decos: &[Decoration]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(decos.len() * 56 + 2);
+    s.push('[');
+    for (i, d) in decos.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        match d {
+            Decoration::Mark { from, to, style } => {
+                let _ = write!(
+                    s,
+                    "{{\"from\":{from},\"kind\":\"mark\",\"style\":\"{}\",\"to\":{to}}}",
+                    style.as_str()
+                );
+            }
+            Decoration::Conceal { from, to } => {
+                let _ = write!(s, "{{\"from\":{from},\"kind\":\"conceal\",\"to\":{to}}}");
+            }
+            Decoration::Line { at, level } => {
+                let _ = write!(s, "{{\"at\":{at},\"kind\":\"line\",\"style\":\"h{level}\"}}");
+            }
+            Decoration::Block { at, style, revealed } => {
+                let _ = write!(s, "{{\"at\":{at}");
+                if let Some(depth) = style.depth() {
+                    let _ = write!(s, ",\"depth\":{depth}");
+                }
+                s.push_str(",\"kind\":\"line\"");
+                if *revealed {
+                    s.push_str(",\"revealed\":true");
+                }
+                let _ = write!(s, ",\"style\":\"{}\"}}", style.as_str());
+            }
+            Decoration::Widget { from, to, kind } => match kind {
+                oxidown_core::WidgetKind::Task { checked } => {
+                    let _ = write!(
+                        s,
+                        "{{\"checked\":{checked},\"from\":{from},\"kind\":\"widget\",\"to\":{to},\"widget\":\"task\"}}"
+                    );
+                }
+                oxidown_core::WidgetKind::Bullet => {
+                    let _ = write!(
+                        s,
+                        "{{\"from\":{from},\"kind\":\"widget\",\"to\":{to},\"widget\":\"bullet\"}}"
+                    );
+                }
+                oxidown_core::WidgetKind::Ordered { number, delim } => {
+                    let _ = write!(
+                        s,
+                        "{{\"delim\":\"{}\",\"from\":{from},\"kind\":\"widget\",\"number\":{number},\"to\":{to},\"widget\":\"ordered\"}}",
+                        *delim as char
+                    );
+                }
+            },
+        }
+    }
+    s.push(']');
+    s
+}
+
+/// The previous `serde_json::Value`-tree construction, kept ONLY as the
+/// oracle pinning `decorations_json_string`'s byte-exact wire format (see
+/// the `wire_format` test module).
+#[cfg(test)]
 fn decoration_json(d: &Decoration) -> serde_json::Value {
     match d {
         Decoration::Mark { from, to, style } => json!({
@@ -92,6 +431,43 @@ fn decoration_json(d: &Decoration) -> serde_json::Value {
             "at": at,
             "style": format!("h{level}"),
         }),
+        Decoration::Block { at, style, revealed } => {
+            let mut obj = json!({
+                "kind": "line",
+                "at": at,
+                "style": style.as_str(),
+            });
+            if let Some(depth) = style.depth() {
+                obj["depth"] = json!(depth);
+            }
+            if *revealed {
+                obj["revealed"] = json!(true);
+            }
+            obj
+        }
+        Decoration::Widget { from, to, kind } => match kind {
+            oxidown_core::WidgetKind::Task { checked } => json!({
+                "kind": "widget",
+                "from": from,
+                "to": to,
+                "widget": "task",
+                "checked": checked,
+            }),
+            oxidown_core::WidgetKind::Bullet => json!({
+                "kind": "widget",
+                "from": from,
+                "to": to,
+                "widget": "bullet",
+            }),
+            oxidown_core::WidgetKind::Ordered { number, delim } => json!({
+                "kind": "widget",
+                "from": from,
+                "to": to,
+                "widget": "ordered",
+                "number": number,
+                "delim": (*delim as char).to_string(),
+            }),
+        },
     }
 }
 
@@ -100,11 +476,28 @@ pub struct OxidownCore {
     inner: Editor,
 }
 
+// Boundary-flavored position validation (plain impl block: these are
+// internal helpers, not exports).
+impl OxidownCore {
+    /// `check_pos` against the live document length; failures thrown.
+    fn pos_arg(&self, v: f64, what: &str) -> Result<usize, JsError> {
+        check_pos(v, what, self.inner.doc_len_utf16()).map_err(|msg| JsError::new(&msg))
+    }
+
+    /// `check_query_range` against the live document length; failures thrown.
+    fn query_range(&self, from: f64, to: f64) -> Result<(usize, usize), JsError> {
+        check_query_range(from, to, self.inner.doc_len_utf16()).map_err(|msg| JsError::new(&msg))
+    }
+}
+
 #[wasm_bindgen]
 impl OxidownCore {
     /// `replica_id` defaults to 1 (no entropy source in the core by design).
     #[wasm_bindgen(constructor)]
     pub fn new(replica_id: Option<u16>) -> OxidownCore {
+        // Panics surface with a message on the JS console instead of an
+        // opaque `RuntimeError: unreachable` (idempotent; stderr on native).
+        console_error_panic_hook::set_once();
         OxidownCore {
             inner: Editor::new(replica_id.unwrap_or(1)),
         }
@@ -124,32 +517,51 @@ impl OxidownCore {
         splices: JsValue,
         origin: &str,
     ) -> Result<f64, JsError> {
+        // Validation precedence mirrors the mock (mock-core.ts `applyEdit`):
+        // malformed baseRevision → staleness → splice payload (the
+        // unpaired-surrogate insert check runs JS-side in the adapter,
+        // which replicates the two revision checks ahead of it) → origin →
+        // the core's own apply-time surrogate-split check. A doubly-invalid
+        // call (stale AND malformed payload) must be StaleRevision on both
+        // cores — opposite handling classes otherwise (desync-resync vs
+        // consumed no-op).
+        let requested = arg(base_revision, "baseRevision")?;
+        let current = self.inner.revision();
+        if requested != current {
+            // CoreError::StaleRevision's Display, reproduced with the RAW
+            // f64: `requested` saturates at 2^64 (see check_arg) — the
+            // variant's u64 would misname the revision the caller actually
+            // passed, while js_num prints it as the mock's `${revision}`
+            // does at every extreme. (The saturated value still compares
+            // correctly: real revisions count up from 0 and never reach it.)
+            return Err(JsError::new(&format!(
+                "StaleRevision: core is at revision {current}, caller passed {}",
+                js_num(base_revision)
+            )));
+        }
+        let base_revision = requested;
         let splices: Vec<SpliceIn> = from_js(&splices, "splices")?;
+        let core_splices = convert_splices(splices, self.inner.doc_len_utf16())
+            .map_err(|msg| JsError::new(&msg))?;
         let origin = EditOrigin::parse(origin)
             .ok_or_else(|| JsError::new(&format!("InvalidOrigin: {origin:?}")))?;
-        let core_splices: Vec<Splice> = splices
-            .into_iter()
-            .map(|s| Splice {
-                at: s.at as usize,
-                delete: s.delete as usize,
-                insert: s.insert,
-            })
-            .collect();
         let now_ms = js_sys::Date::now();
         self.inner
-            .apply_edit(base_revision as u64, &core_splices, origin, now_ms)
+            .apply_edit(base_revision, &core_splices, origin, now_ms)
             .map(|rev| rev as f64)
             .map_err(core_err)
     }
 
-    /// `{ revision, splices } | null` — splices in current-doc coordinates.
+    /// `CoreChange | null` — splices in current-doc coordinates plus
+    /// optional cursor placement (v0.2 shape; supersets the v0 shape).
     pub fn undo(&mut self) -> Result<JsValue, JsError> {
-        history_to_js(self.inner.undo())
+        change_to_js(self.inner.undo())
     }
 
-    /// `{ revision, splices } | null` — splices in current-doc coordinates.
+    /// `CoreChange | null` — splices in current-doc coordinates plus
+    /// optional cursor placement (v0.2 shape; supersets the v0 shape).
     pub fn redo(&mut self) -> Result<JsValue, JsError> {
-        history_to_js(self.inner.redo())
+        change_to_js(self.inner.redo())
     }
 
     /// `Decoration[]` for viewport `[from, to)` against `revision` (must be
@@ -157,37 +569,216 @@ impl OxidownCore {
     pub fn decorations(
         &self,
         revision: f64,
-        from: u32,
-        to: u32,
+        from: f64,
+        to: f64,
         selections: JsValue,
     ) -> Result<JsValue, JsError> {
+        // Validation order mirrors the mock (mock-core.ts `decorations`):
+        // malformed revision → staleness → malformed from/to → range →
+        // bounds → selections payload. EVERY check ahead of the selections
+        // payload is fronted here in full (not deferred to the core's own
+        // re-checks), because the payload is parsed before the core call —
+        // deferring range/bounds would let a malformed selections payload
+        // preempt an invalid range, diverging from the mock (pinned by the
+        // S6 probes in wasm-core-boundary.test.ts).
+        let requested = arg(revision, "revision")?;
+        let current = self.inner.revision();
+        if requested != current {
+            // Raw-f64 message for the same reason as apply_edit's staleness
+            // check: `requested` saturates at 2^64; js_num matches the
+            // mock's `${revision}` at every extreme.
+            return Err(JsError::new(&format!(
+                "StaleRevision: core is at revision {current}, caller passed {}",
+                js_num(revision)
+            )));
+        }
+        let revision = requested;
+        let (from, to) = self.query_range(from, to)?;
         let selections: Vec<SelectionIn> = from_js(&selections, "selections")?;
-        let sels: Vec<SelectionRange> = selections
-            .into_iter()
-            .map(|s| SelectionRange {
-                anchor: s.anchor as usize,
-                head: s.head as usize,
-            })
-            .collect();
+        let sels = convert_selections(selections, self.inner.doc_len_utf16())
+            .map_err(|msg| JsError::new(&msg))?;
         let decos = self
             .inner
-            .decorations(revision as u64, from as usize, to as usize, &sels)
+            .decorations(revision, from, to, &sels)
             .map_err(core_err)?;
-        let payload = serde_json::Value::Array(decos.iter().map(decoration_json).collect());
-        to_js(&payload)
+        js_sys::JSON::parse(&decorations_json_string(&decos))
+            .map_err(|_| JsError::new("InternalError: produced invalid JSON"))
     }
 
     #[wasm_bindgen(js_name = compositionBegin)]
-    pub fn composition_begin(&mut self, from: u32, to: u32) -> Result<(), JsError> {
-        self.inner
-            .composition_begin(from as usize, to as usize)
-            .map_err(core_err)
+    pub fn composition_begin(&mut self, from: f64, to: f64) -> Result<(), JsError> {
+        let (from, to) = self.query_range(from, to)?;
+        self.inner.composition_begin(from, to).map_err(core_err)
     }
 
     #[wasm_bindgen(js_name = compositionEnd)]
     pub fn composition_end(&mut self) {
         self.inner.composition_end();
     }
+
+    // ---- anchors (v0.2) --------------------------------------------------
+
+    /// `createAnchor(pos, bias)` — bias is `"before"` or `"after"`. Returns
+    /// the anchor id.
+    #[wasm_bindgen(js_name = createAnchor)]
+    pub fn create_anchor(&mut self, pos: f64, bias: &str) -> Result<f64, JsError> {
+        // Bias first, then the position — the mock's order (mock-core.ts
+        // `createAnchor`).
+        let bias = match bias {
+            "before" => Bias::Before,
+            "after" => Bias::After,
+            other => return Err(JsError::new(&format!("InvalidBias: {other:?}"))),
+        };
+        let pos = self.pos_arg(pos, "pos")?;
+        self.inner
+            .create_anchor(pos, bias)
+            .map(|id| id as f64)
+            .map_err(core_err)
+    }
+
+    /// Current position of the anchor, or `null` if unresolvable
+    /// (unknown/dropped id, or the document was replaced by `load`).
+    #[wasm_bindgen(js_name = resolveAnchor)]
+    pub fn resolve_anchor(&self, id: f64) -> Result<JsValue, JsError> {
+        Ok(match self.inner.resolve_anchor(arg(id, "id")?) {
+            Some(pos) => JsValue::from_f64(pos as f64),
+            None => JsValue::NULL,
+        })
+    }
+
+    #[wasm_bindgen(js_name = dropAnchor)]
+    pub fn drop_anchor(&mut self, id: f64) -> Result<(), JsError> {
+        self.inner.drop_anchor(arg(id, "id")?);
+        Ok(())
+    }
+
+    // ---- commands (v0.2) -------------------------------------------------
+
+    /// Flattened command entry point:
+    /// - `command("toggleStrong"|"toggleEm"|"toggleStrike"|"toggleCode", from, to)`
+    /// - `command("setHeading", pos, level)` (level 0–6; 0 = paragraph)
+    /// - `command("toggleTask", pos)`
+    /// - `command("indentList"|"outdentList", from, to)` (marker-width-aware
+    ///   Tab nesting, boundary v0.2)
+    /// - `command("enter", from, to)` (construct-aware Enter: list/quote
+    ///   continuation, single-press empty-item exit; boundary v0.3)
+    ///
+    /// Returns `CoreChange | null` (`null` when the command doesn't apply at
+    /// the target). Throws on unknown names, missing arguments, or invalid
+    /// positions.
+    pub fn command(&mut self, name: &str, a: f64, b: Option<f64>) -> Result<JsValue, JsError> {
+        let need_b = |what: &str| -> Result<f64, JsError> {
+            b.ok_or_else(|| JsError::new(&format!("InvalidArgs: {name} requires {what}")))
+        };
+        // Range-command argument order mirrors the mock (`rangeArgs` +
+        // `checkDocPos` in each command impl): malformed `from` → missing
+        // `to` → malformed `to` → over-u32 bounds on `from`, then `to`.
+        let range_args = |core: &Self| -> Result<(usize, usize), JsError> {
+            arg(a, "from")?;
+            let b_val = need_b("a `to` position")?;
+            arg(b_val, "to")?;
+            Ok((core.pos_arg(a, "from")?, core.pos_arg(b_val, "to")?))
+        };
+        let cmd = match name {
+            "toggleStrong" | "toggleEm" | "toggleStrike" | "toggleCode" => {
+                let (from, to) = range_args(self)?;
+                match name {
+                    "toggleStrong" => Command::ToggleStrong { from, to },
+                    "toggleEm" => Command::ToggleEm { from, to },
+                    "toggleStrike" => Command::ToggleStrike { from, to },
+                    _ => Command::ToggleCode { from, to },
+                }
+            }
+            "indentList" | "outdentList" => {
+                let (from, to) = range_args(self)?;
+                if name == "indentList" {
+                    Command::IndentList { from, to }
+                } else {
+                    Command::OutdentList { from, to }
+                }
+            }
+            "enter" => {
+                let (from, to) = range_args(self)?;
+                Command::Enter { from, to }
+            }
+            "setHeading" => {
+                // Mock order: malformed pos → missing/malformed/out-of-range
+                // level → pos document bounds (`setHeadingCmd` validates the
+                // level before `checkDocPos`).
+                arg(a, "pos")?;
+                let level_raw = need_b("a heading level")?;
+                let level = arg(level_raw, "level")?;
+                if level > 6 {
+                    // `level` saturates at 2^64 (still > 6, so the check
+                    // itself is unaffected); the message quotes the raw f64
+                    // like the mock's `${level}`.
+                    return Err(JsError::new(&format!(
+                        "InvalidArgs: setHeading level must be an integer 0..=6, got {}",
+                        js_num(level_raw)
+                    )));
+                }
+                Command::SetHeading {
+                    pos: self.pos_arg(a, "pos")?,
+                    level: level as u8,
+                }
+            }
+            "toggleTask" => Command::ToggleTask {
+                pos: self.pos_arg(a, "pos")?,
+            },
+            other => return Err(JsError::new(&format!("InvalidCommand: {other:?}"))),
+        };
+        change_to_js(self.inner.command(cmd).map_err(core_err)?)
+    }
+
+    // ---- streaming (v0.2) ------------------------------------------------
+
+    /// Open a stream at `pos`; the insertion point becomes an internal
+    /// after-bias anchor. Returns the stream id.
+    #[wasm_bindgen(js_name = streamOpen)]
+    pub fn stream_open(&mut self, pos: f64) -> Result<f64, JsError> {
+        let pos = self.pos_arg(pos, "pos")?;
+        self.inner
+            .stream_open(pos)
+            .map(|id| id as f64)
+            .map_err(core_err)
+    }
+
+    /// Append a chunk; returns `CoreChange` (splices for the view to apply
+    /// under its skip annotation). Throws `UnknownStream` on never-opened or
+    /// closed ids.
+    #[wasm_bindgen(js_name = streamAppend)]
+    pub fn stream_append(&mut self, id: f64, chunk: &str) -> Result<JsValue, JsError> {
+        let id_u = arg(id, "id")?;
+        // An id at/above 2^64 saturates in check_arg's u64 (see its doc):
+        // it can never have been issued (stream ids count up from 0), so it
+        // is necessarily unknown — front the core's own UnknownStream here
+        // with the RAW value, where the core's u64-carrying variant would
+        // misquote the saturated u64::MAX and the mock echoes the caller's
+        // number. (`u64::MAX as f64` rounds UP to exactly 2^64, the first
+        // value that saturates.)
+        if id >= u64::MAX as f64 {
+            return Err(JsError::new(&format!(
+                "UnknownStream: stream {} is unknown or already closed",
+                js_num(id)
+            )));
+        }
+        let change = self.inner.stream_append(id_u, chunk).map_err(core_err)?;
+        change_to_js(Some(change))
+    }
+
+    /// Close a stream. No-op on unknown/already-closed ids. Returns nothing:
+    /// the boundary contract's `streamClose(id): CoreChange | null` (the
+    /// surrogate-flush change, v0.3) is produced by the TS adapter
+    /// (wasm-core.ts), which is where trailing-high-surrogate buffering
+    /// lives — the core itself never buffers, so it never has a flush edit
+    /// to return.
+    #[wasm_bindgen(js_name = streamClose)]
+    pub fn stream_close(&mut self, id: f64) -> Result<(), JsError> {
+        self.inner.stream_close(arg(id, "id")?);
+        Ok(())
+    }
+
+    // ---- debug/verification ----------------------------------------------
 
     #[wasm_bindgen(js_name = getText)]
     pub fn get_text(&self) -> String {
@@ -202,5 +793,370 @@ impl OxidownCore {
 
     pub fn revision(&self) -> f64 {
         self.inner.revision() as f64
+    }
+}
+
+#[cfg(test)]
+mod wire_format {
+    //! Pins `decorations_json_string` byte-for-byte against the previous
+    //! `serde_json::Value` serialization (compact separators, alphabetical
+    //! key order from serde_json's default `BTreeMap`, identical
+    //! optional-field omission) — the boundary's JSON.parse contract must
+    //! not change shape. Runs natively (no wasm/js_sys involved).
+
+    use oxidown_core::{BlockStyle, Decoration, MarkStyle, WidgetKind};
+
+    use super::{decoration_json, decorations_json_string};
+
+    fn all_variants() -> Vec<Decoration> {
+        let mut v = vec![Decoration::Conceal { from: 0, to: 2 }];
+        for style in [
+            MarkStyle::Strong,
+            MarkStyle::Em,
+            MarkStyle::Code,
+            MarkStyle::Delim,
+            MarkStyle::Strike,
+            MarkStyle::Link,
+            MarkStyle::Url,
+            MarkStyle::ListMarker,
+        ] {
+            v.push(Decoration::Mark { from: 3, to: 12345, style });
+        }
+        for level in 1..=6 {
+            v.push(Decoration::Line { at: 7 * level as usize, level });
+        }
+        for style in [
+            BlockStyle::BlockQuote(1),
+            BlockStyle::BlockQuote(3),
+            BlockStyle::CodeBlock,
+            BlockStyle::CodeFence,
+            BlockStyle::ThematicBreak,
+            BlockStyle::ListItem(1),
+            BlockStyle::ListItem(4),
+        ] {
+            for revealed in [false, true] {
+                v.push(Decoration::Block { at: 42, style, revealed });
+            }
+        }
+        for checked in [false, true] {
+            v.push(Decoration::Widget { from: 9, to: 14, kind: WidgetKind::Task { checked } });
+        }
+        v.push(Decoration::Widget { from: 0, to: 2, kind: WidgetKind::Bullet });
+        for (number, delim) in [(1u64, b'.'), (12u64, b')')] {
+            v.push(Decoration::Widget { from: 0, to: 4, kind: WidgetKind::Ordered { number, delim } });
+        }
+        v
+    }
+
+    #[test]
+    fn writer_matches_value_path_byte_for_byte() {
+        let decos = all_variants();
+        let value_path =
+            serde_json::Value::Array(decos.iter().map(decoration_json).collect()).to_string();
+        assert_eq!(decorations_json_string(&decos), value_path);
+    }
+
+    #[test]
+    fn empty_batch_is_an_empty_array() {
+        assert_eq!(decorations_json_string(&[]), "[]");
+    }
+}
+
+#[cfg(test)]
+mod js_number_format {
+    //! `js_num` pins boundary error messages to JS `${v}` formatting at the
+    //! extremes — the mock gets this for free from template literals, so
+    //! message parity depends on it. The load-bearing cases: 2^64 (where
+    //! check_arg's u64 saturates — the message must still quote the caller's
+    //! number) and >= 1e21 (where JS switches to `1e+21` exponential form
+    //! but Rust's `Display` never does).
+
+    use super::js_num;
+
+    #[test]
+    fn ordinary_integers_print_digits_like_js() {
+        assert_eq!(js_num(0.0), "0");
+        assert_eq!(js_num(-0.0), "0"); // JS `${-0}` is "0"
+        assert_eq!(js_num(1.0), "1");
+        assert_eq!(js_num(4096.0), "4096");
+        assert_eq!(js_num(-3.0), "-3");
+        assert_eq!(js_num(1.5), "1.5");
+        // 2^53 and above: still digits in JS (exponential starts at 1e21),
+        // and Rust's shortest-round-trip digits match JS's exactly.
+        assert_eq!(js_num(9007199254740992.0), "9007199254740992");
+        assert_eq!(js_num(4294967302.0), "4294967302");
+    }
+
+    #[test]
+    fn two_to_the_64_prints_the_callers_number_not_the_saturated_u64() {
+        // JS `${2**64}` — NOT u64::MAX's 18446744073709551615, which is what
+        // a message formatting check_arg's saturated u64 would name.
+        assert_eq!(js_num(18446744073709551616.0), "18446744073709552000");
+    }
+
+    #[test]
+    fn at_1e21_and_above_js_switches_to_exponential() {
+        assert_eq!(js_num(1e21), "1e+21");
+        assert_eq!(js_num(1e22), "1e+22");
+        assert_eq!(js_num(1.5e21), "1.5e+21");
+        assert_eq!(js_num(-1e21), "-1e+21");
+        // Largest finite f64: JS prints 1.7976931348623157e+308.
+        assert_eq!(js_num(f64::MAX), "1.7976931348623157e+308");
+        // Just below the threshold: digits.
+        assert_eq!(js_num(999999999999999900000.0), "999999999999999900000");
+    }
+
+    #[test]
+    fn tiny_magnitudes_and_non_finites_match_js_spellings() {
+        assert_eq!(js_num(1e-7), "1e-7"); // JS goes exponential below 1e-6
+        assert_eq!(js_num(0.000001), "0.000001"); // 1e-6 itself: digits
+        assert_eq!(js_num(f64::NAN), "NaN");
+        assert_eq!(js_num(f64::INFINITY), "Infinity"); // Rust Display: "inf"
+        assert_eq!(js_num(f64::NEG_INFINITY), "-Infinity");
+    }
+}
+
+#[cfg(test)]
+mod arg_validation {
+    //! `check_arg` guards every f64 position/level/id crossing the boundary:
+    //! finite, integral, non-negative — or an "InvalidArgs: ..." message
+    //! (previously `as usize` silently saturated negatives/NaN to 0).
+
+    use super::check_arg;
+
+    #[test]
+    fn accepts_non_negative_integers() {
+        assert_eq!(check_arg(0.0, "pos"), Ok(0));
+        assert_eq!(check_arg(1.0, "pos"), Ok(1));
+        assert_eq!(check_arg(4096.0, "pos"), Ok(4096));
+        // Largest exactly-representable f64 integer round-trips.
+        assert_eq!(check_arg(9007199254740992.0, "pos"), Ok(1 << 53));
+        // Negative zero is still zero.
+        assert_eq!(check_arg(-0.0, "pos"), Ok(0));
+    }
+
+    #[test]
+    fn rejects_negatives() {
+        for v in [-1.0, -0.5, -4096.0, f64::MIN] {
+            let err = check_arg(v, "pos").unwrap_err();
+            assert!(err.starts_with("InvalidArgs: "), "got {err:?}");
+            assert!(err.contains("pos"), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_integral() {
+        for v in [0.5, 1.25, 4096.999] {
+            let err = check_arg(v, "level").unwrap_err();
+            assert!(err.starts_with("InvalidArgs: "), "got {err:?}");
+            assert!(err.contains("level"), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite() {
+        for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = check_arg(v, "id").unwrap_err();
+            assert!(err.starts_with("InvalidArgs: "), "got {err:?}");
+            assert!(err.contains("id"), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn message_names_the_argument_and_value() {
+        assert_eq!(
+            check_arg(-3.0, "baseRevision").unwrap_err(),
+            "InvalidArgs: baseRevision must be a non-negative integer, got -3"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pos_validation {
+    //! `check_pos`/`check_query_range` guard every document POSITION
+    //! crossing the boundary: on wasm32 `as usize` is a 32-bit cast, so an
+    //! integer above `u32::MAX` would silently truncate (2^32+6 → 6,
+    //! editing the wrong range). Over-u32 positions fail with the core's
+    //! own OutOfBounds message — byte-identical to what the mock
+    //! (mock-core.ts `checkDocPos`/`outOfBounds`) throws for the same value.
+
+    use super::{check_pos, check_query_range};
+
+    #[test]
+    fn accepts_the_full_u32_range() {
+        assert_eq!(check_pos(0.0, "pos", 11), Ok(0));
+        assert_eq!(check_pos(6.0, "pos", 11), Ok(6));
+        assert_eq!(
+            check_pos(4294967295.0, "pos", 11),
+            Ok(u32::MAX as usize),
+            "u32::MAX itself is representable and left to the core's bounds check"
+        );
+    }
+
+    #[test]
+    fn over_u32_positions_are_out_of_bounds_not_truncated() {
+        // The probe that motivated the guard: 2^32 + 6 used to wrap to 6.
+        assert_eq!(
+            check_pos(4294967302.0, "pos", 11).unwrap_err(),
+            "OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)"
+        );
+        // First rejected value: u32::MAX + 1 (would wrap to 0).
+        assert_eq!(
+            check_pos(4294967296.0, "from", 0).unwrap_err(),
+            "OutOfBounds: position 4294967296 beyond document length 0 (UTF-16 code units)"
+        );
+    }
+
+    #[test]
+    fn malformed_positions_are_still_invalid_args() {
+        assert_eq!(
+            check_pos(-1.0, "pos", 11).unwrap_err(),
+            "InvalidArgs: pos must be a non-negative integer, got -1"
+        );
+        assert_eq!(
+            check_pos(1.5, "from", 11).unwrap_err(),
+            "InvalidArgs: from must be a non-negative integer, got 1.5"
+        );
+        assert!(check_pos(f64::NAN, "pos", 11)
+            .unwrap_err()
+            .starts_with("InvalidArgs: "));
+    }
+
+    #[test]
+    fn query_range_error_precedence_matches_the_mock() {
+        // Malformed endpoints beat everything (`from` first).
+        assert_eq!(
+            check_query_range(-1.0, 4294967302.0, 11).unwrap_err(),
+            "InvalidArgs: from must be a non-negative integer, got -1"
+        );
+        assert_eq!(
+            check_query_range(0.0, 2.5, 11).unwrap_err(),
+            "InvalidArgs: to must be a non-negative integer, got 2.5"
+        );
+        // Reversed range with an over-u32 endpoint: InvalidRange, not
+        // OutOfBounds (the mock checks `from > to` before bounds).
+        assert_eq!(
+            check_query_range(4294967302.0, 5.0, 11).unwrap_err(),
+            "InvalidRange: from 4294967302 > to 5"
+        );
+        // Ordered but over-u32: OutOfBounds reported on `to`.
+        assert_eq!(
+            check_query_range(0.0, 4294967302.0, 11).unwrap_err(),
+            "OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)"
+        );
+        assert_eq!(
+            check_query_range(4294967296.0, 4294967302.0, 3).unwrap_err(),
+            "OutOfBounds: position 4294967302 beyond document length 3 (UTF-16 code units)"
+        );
+        // IN-u32-range violations are fronted too (S6): the core would catch
+        // them, but only AFTER `decorations` parses its selections payload —
+        // the mock checks range, then bounds, then selections.
+        assert_eq!(
+            check_query_range(9.0, 2.0, 11).unwrap_err(),
+            "InvalidRange: from 9 > to 2"
+        );
+        assert_eq!(
+            check_query_range(0.0, 99.0, 11).unwrap_err(),
+            "OutOfBounds: position 99 beyond document length 11 (UTF-16 code units)"
+        );
+        // Valid ranges pass through; `to == doc_len` is in bounds (the range
+        // is half-open).
+        assert_eq!(check_query_range(2.0, 9.0, 11), Ok((2, 9)));
+        assert_eq!(check_query_range(0.0, 11.0, 11), Ok((0, 11)));
+        assert_eq!(check_query_range(0.0, 0.0, 0), Ok((0, 0)));
+    }
+}
+
+#[cfg(test)]
+mod payload_validation {
+    //! `convert_splices`/`convert_selections` guard positions INSIDE JSON
+    //! payloads with the mock's exact messages and precedence (mock-core.ts
+    //! `validateSplices` / `decorations`): integer check (InvalidPayload) →
+    //! ordering (InvalidSplice, splices only) → document bounds
+    //! (OutOfBounds, which also covers over-u32 values — previously these
+    //! fields were u32-typed and serde failed them as InvalidPayload,
+    //! diverging from the mock's OutOfBounds).
+
+    use super::{convert_selections, convert_splices, SelectionIn, SpliceIn};
+
+    fn splice(at: f64, delete: f64) -> SpliceIn {
+        SpliceIn { at, delete, insert: String::new() }
+    }
+
+    #[test]
+    fn splices_convert_when_well_formed() {
+        let out = convert_splices(
+            vec![
+                SpliceIn { at: 1.0, delete: 2.0, insert: "x".into() },
+                SpliceIn { at: 5.0, delete: 0.0, insert: "y".into() },
+            ],
+            11,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].at, out[0].delete, out[0].insert.as_str()), (1, 2, "x"));
+        assert_eq!((out[1].at, out[1].delete, out[1].insert.as_str()), (5, 0, "y"));
+    }
+
+    #[test]
+    fn malformed_splice_numbers_are_invalid_payload_with_the_mock_message() {
+        assert_eq!(
+            convert_splices(vec![splice(-1.0, 0.0)], 11).unwrap_err(),
+            "InvalidPayload: malformed splices: splice #0 has at=-1 delete=0"
+        );
+        assert_eq!(
+            convert_splices(vec![splice(1.5, 0.0)], 11).unwrap_err(),
+            "InvalidPayload: malformed splices: splice #0 has at=1.5 delete=0"
+        );
+        assert_eq!(
+            convert_splices(vec![splice(0.0, -2.0)], 11).unwrap_err(),
+            "InvalidPayload: malformed splices: splice #0 has at=0 delete=-2"
+        );
+    }
+
+    #[test]
+    fn over_u32_and_past_doc_end_splices_are_out_of_bounds_not_invalid_payload() {
+        // 2^32 + 6: a well-formed integer that must reach the bounds check
+        // (the old u32-typed field made serde throw InvalidPayload here).
+        assert_eq!(
+            convert_splices(vec![splice(4294967302.0, 0.0)], 11).unwrap_err(),
+            "OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)"
+        );
+        // Ordinary in-u32 past-doc-end value: the same check.
+        assert_eq!(
+            convert_splices(vec![splice(2.0, 5.0)], 3).unwrap_err(),
+            "OutOfBounds: position 7 beyond document length 3 (UTF-16 code units)"
+        );
+    }
+
+    #[test]
+    fn splice_ordering_beats_bounds_like_the_mock() {
+        assert_eq!(
+            convert_splices(vec![splice(1.0, 2.0), splice(2.0, 4294967296.0)], 11).unwrap_err(),
+            "InvalidSplice: splice #1: splices must be ascending and non-overlapping (at 2 < previous end 3)"
+        );
+    }
+
+    #[test]
+    fn selections_validate_with_the_mock_message_and_bounds() {
+        assert_eq!(
+            convert_selections(vec![SelectionIn { anchor: -1.0, head: 0.0 }], 11).unwrap_err(),
+            "InvalidPayload: malformed selections: anchor=-1 head=0"
+        );
+        assert_eq!(
+            convert_selections(vec![SelectionIn { anchor: 0.0, head: 2.5 }], 11).unwrap_err(),
+            "InvalidPayload: malformed selections: anchor=0 head=2.5"
+        );
+        assert_eq!(
+            convert_selections(vec![SelectionIn { anchor: 4294967302.0, head: 0.0 }], 11)
+                .unwrap_err(),
+            "OutOfBounds: position 4294967302 beyond document length 11 (UTF-16 code units)"
+        );
+        assert_eq!(
+            convert_selections(vec![SelectionIn { anchor: 0.0, head: 99.0 }], 11).unwrap_err(),
+            "OutOfBounds: position 99 beyond document length 11 (UTF-16 code units)"
+        );
+        let ok = convert_selections(vec![SelectionIn { anchor: 2.0, head: 9.0 }], 11).unwrap();
+        assert_eq!((ok[0].anchor, ok[0].head), (2, 9));
     }
 }

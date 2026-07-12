@@ -40,6 +40,11 @@ body {
   cursor: pointer;
 }
 
+#chrome button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
 .banner {
   padding: 2px 8px;
   border-radius: 10px;
@@ -50,6 +55,17 @@ body {
 .banner.fallback {
   background: #fef3e0;
   color: #9a5b00;
+}
+
+#stream-status {
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+#stream-status:empty {
+  display: none;
 }
 
 #perf-hud {
