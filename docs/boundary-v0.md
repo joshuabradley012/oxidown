@@ -4,10 +4,10 @@ The minimum contract between `oxidown-core` and a platform view, for the M0 spik
 This document is authoritative: if the Rust core and the TypeScript view disagree, the one that
 matches this file wins; if this file is wrong, change it in the same PR as the code.
 
-Current contract version: **v0.5** — the base v0 sections below are followed by the v0.1
-clarifications, the v0.2 (M1) additions, and inline v0.3/v0.4/v0.5 amendments; the "v0.3
-changelog", "v0.4 changelog", and "v0.5 changelog" sections at the end enumerate exactly what
-each version comprises.
+Current contract version: **v0.6** — the base v0 sections below are followed by the v0.1
+clarifications, the v0.2 (M1) additions, and inline v0.3/v0.4/v0.5/v0.6 amendments; the "v0.3
+changelog" through "v0.6 changelog" sections at the end enumerate exactly what each version
+comprises.
 
 **Testing strategy.** The Rust/wasm core (`crates/oxidown-wasm`, wrapped by
 `packages/oxidown-view-cm6/src/wasm-core.ts`) is the ONLY implementation of this contract — there
@@ -398,6 +398,9 @@ command(name: "setHeading", pos: number, level: 0|1|2|3|4|5|6): CoreChange | nul
 command(name: "toggleTask", pos: number): CoreChange | null;  // flips an existing task, else PROMOTES the line — see "toggleTask" below
 command(name: "indentList"|"outdentList", from: number, to: number): CoreChange | null;
 command(name: "enter", from: number, to: number): CoreChange | null;  // v0.3 addition — see "enter" below
+// v0.6 additions — see "v0.6 commands" below:
+command(name: "toggleQuote"|"toggleLink"|"toggleBulletList"|"toggleOrderedList"|"toggleCodeBlock", from: number, to: number): CoreChange | null;
+command(name: "insertHr", pos: number): CoreChange | null;
 ```
 
 Commands are text transforms computed against the overlay (plan §5.8): they emit minimal
@@ -703,6 +706,117 @@ the source bytes — same node shape, LINE-level reveal, ordered items keep thei
 view-computed sequence (an empty `2. ` between `1. `/`3. ` still counts). Purely additive:
 empty items now decorate and behave like any other item.
 
+### v0.6 commands: toggleQuote / toggleLink / toggleBulletList / toggleOrderedList / insertHr / toggleCodeBlock
+
+Six new commands (M2 web-editor-beta toolbar batch), sharing every established command rule:
+one undo unit per press (never coalesces), origin `"command"`, UTF-16 range/position arguments
+with the CRLF-split guard, `command()`'s no-mutation-on-throw guarantee, and selection results
+that keep the cursor glued to its character (the character after the cursor is unchanged by a
+prefix insertion). The whole-document ITEMNESS INVARIANT (indentList/outdentList's acceptance
+bar: no command may cost an un-edited line its list itemness) holds for all of them, with one
+documented exemption called out under the list toggles.
+
+**`toggleQuote(from, to)`** — line-wise over every line intersecting the range, with STEPPED
+remove semantics (research/07 §2.2 — repeated presses unwind one nesting level per press, the
+gap Obsidian's on/off-only "Toggle Blockquote" never closed natively):
+
+- **Remove** when EVERY intersecting non-blank line already has quote depth >= 1: each line
+  loses its INNERMOST `> ` run element only. A lazy-continuation line counts as quoted for the
+  mode decision (it IS inside the quote) but carries no marker run of its own, so remove leaves
+  its bytes alone; a selection whose quoted lines are all marker-less returns the
+  indentList-style applies-but-no-op empty CoreChange (no undo unit, no revision bump).
+- **Add** otherwise: `"> "` is inserted at every intersecting line's start — blank lines
+  INCLUDED, so a quote wrapped around a multi-paragraph selection stays one contiguous quote.
+  Works on list items / tasks / headings unchanged (the prefix goes before existing content;
+  the parse nests the construct).
+- **Never `null`**: any position resolves to a line, so the command always applies (the
+  no-op case above is the one degenerate shape).
+- **Structural guards** (itemness invariant, same digit-rewrite contract as indentList's
+  interruption guards): quoting a selection interrupts the list anchoring a non-1 ordered item
+  directly below it (the marker would degrade to lazy-continuation text of the freshly quoted
+  paragraph), and de-quoting a non-1 ordered item can drop it where it cannot start a list —
+  in both cases the affected marker's digits rewrite to `1` in the same batch/undo unit.
+
+**`toggleLink(from, to)`** — single-line only (a range spanning a line terminator → `null`,
+the standard v1 scope). Code contexts refuse exactly like the inline toggles (`null`): a range
+touching a fenced-code line, or an endpoint strictly inside an inline code span.
+
+- **Unwrap** when the range's closed interval intersects an existing link node: an inline link
+  loses its `[` and `](url)` delimiter spans — the text survives, the URL is gone (re-toggling
+  wraps with an EMPTY url slot; the text round-trips byte-identically, the URL does not — the
+  documented asymmetry). An AUTOLINK (`<url>`) sheds just its `<`/`>` wrappers, keeping the
+  destination text. The returned selection covers the surviving text (matching the inline
+  toggles' OFF path).
+- **Wrap** otherwise: the range becomes `[<selected text>](` + `)` and the returned selection
+  is a cursor in the URL slot (between the parens). An EMPTY range inserts `[]()` with the
+  cursor in the TEXT slot (between the brackets).
+- View binding: Mod-k (the near-universal insert-link key), consuming the key even on `null`
+  so Ctrl/Cmd-K never leaks to the browser.
+
+**`toggleBulletList(from, to)` / `toggleOrderedList(from, to)`** — line-wise conversion with
+toggle semantics. Blank lines and fenced-code lines pass through untouched in every mode;
+`null` only when NO intersecting line is convertible (all blank/code).
+
+- **Flavor rule (pinned)**: task items are BULLET-flavor (`- [ ] x` is a bullet item;
+  `1. [ ] x` is ordered-flavor) — the checkbox is GFM content, not marker.
+- **Strip** when every convertible line is already an item of the TARGET flavor: leading
+  indent, marker token, task brackets, and all post-marker whitespace go (a genuinely plain
+  line at any depth — leaving 4+ leading spaces would re-type the line as indented code). This
+  is an explicit de-listing gesture: the stripped lines are EXEMPT from the itemness invariant
+  exactly like `enter`'s marker-clear; every line the command does not touch keeps its
+  itemness (below-line guard).
+- **Convert** otherwise: plain lines get a marker prefixed at content start (right after any
+  quote prefix); other-flavor items get their marker glyphs REPLACED in place (indent and
+  quote prefix kept). Task decisions (pinned): converting to ORDERED strips the task brackets
+  (`- [ ] x` → `1. x`); converting an ordered task to BULLET keeps them (`1. [ ] x` →
+  `- [ ] x` — still a task, now bullet-flavor); already-target lines are untouched, brackets,
+  raw digits and all (never-rewrite-unedited-bytes beats cosmetic uniformity).
+- **Ordered numbering**: markers the command WRITES get sequential raw digits restarting at 1
+  per contiguous same-column run (blank/code lines, quote-depth changes, and shallower columns
+  end a run). Untouched ordered lines feed the counter (raw value + 1) and their `.`/`)`
+  delimiter is adopted; the run seeds from the item line directly above the selection at the
+  same column — written markers therefore always either start a run at `1` (which may
+  interrupt anything) or JOIN an adjacent same-column same-delimiter run, so the conversion
+  itself can never de-list its own output. Bullet conversion adopts the run's bullet glyph the
+  same way (`*` siblings get `*`, not a list-splitting `-`). Display numbering recomputes
+  regardless (v0.3 ordered widget); this is about the source reading sensibly.
+- **Below-line guard** (same contract as indentList's `below_line_rewrite`): the first
+  unaffected item line below the affected block — skipping adopted descendants in convert
+  mode — rewrites its digits to `1` when it is a non-1 ordered marker that no longer joins a
+  same-column same-delimiter run. The scan stops at a blank/non-item line or quote-depth
+  change, and never runs when the selection's own trailing line is blank/code.
+- **Accepted v1 imprecision** (mirror of indentList's `10.` → `1.` note): converting a bullet
+  to ordered grows the marker token width by one, so a descendant sitting exactly at the old
+  content column may reparse as a SIBLING rather than a child — still a list item (the
+  invariant holds); only its nesting depth degrades.
+
+**`insertHr(pos)`** — inserts a thematic break on its own line AFTER the line containing
+`pos`. The CommonMark trap this construction guards (one this repo has been bitten by): `---`
+directly under paragraph text is a SETEXT-H2 UNDERLINE, not an hr. The splice therefore
+guarantees a blank line ABOVE (one extra `"\n"` when the current line is non-blank) and BELOW
+(one trailing `"\n"` when a following non-blank line exists — the original terminator supplies
+the second newline), so the result always reparses as `ThematicBreak` (pinned by a
+reparse-assertion test on exactly the paragraph-adjacent shape, paragraphs above and below
+intact). The break is inserted at TOP level: on a quoted line it lands after (outside) the
+quote, splitting it — v1 behavior. `null` only on fenced-code lines (literal dashes). The
+cursor does not move (the insertion lands at/after `pos`).
+
+**`toggleCodeBlock(from, to)`** —
+
+- **Unwrap** when the range intersects an existing FENCED block (block-level touch semantics,
+  matching fence reveal: fence lines or body, anywhere counts): both fence LINES are removed —
+  each with one adjoining line terminator, so no stray blank lines are left — and the body
+  survives verbatim. An unterminated block loses just its opening fence line.
+- **Wrap** otherwise: the intersecting lines are wrapped in backtick fences on their own lines
+  above/below. The fence is one backtick longer than the longest leading backtick run (after
+  up to 3 leading spaces) among the wrapped lines, minimum three, so a wrapped line can never
+  close the new fence early. The selection shifts by the opening fence's length — same
+  characters, now INSIDE the block.
+- **Quote punt (v1, documented)**: `null` whenever the target sits at quote depth > 0 —
+  fences-in-quotes need per-line `> ` prefix surgery on every body line, deferred. INDENTED
+  (non-fenced) code blocks are invisible to this command (they emit no overlay nodes); their
+  lines wrap like plain text.
+
 ## Streaming (plan §5.9)
 
 ```ts
@@ -973,3 +1087,35 @@ in-place convention: each item lives inline above, tagged "(v0.5 amendment)". Th
   like level 0 does, making the toolbar's H1–H6 buttons idempotent presses. A different level
   still replaces the prefix as before; level 0 is unchanged. See "`setHeading` (v0.4
   clarifications, v0.5 amendment)" under Commands.
+
+---
+
+# v0.6 changelog
+
+**The current version of this contract is v0.6** (M2 web-editor-beta toolbar batch). Additive
+only — six new commands, no changes to any existing rule. Everything lives in the "v0.6
+commands" section under Commands; the headline decisions:
+
+- **`toggleQuote`** — stepped blockquote toggle (research/07 §2.2): add one `> ` level to every
+  intersecting line (blank lines included, keeping the quote contiguous), or remove ONE level
+  per press when every intersecting non-blank line is already quoted. Never `null`; structural
+  digit-rewrite guards preserve the itemness invariant in both directions.
+- **`toggleLink`** — wrap (`[text](` + `)`, cursor in the URL slot; empty range `[]()`, cursor
+  in the text slot) / unwrap (text survives; the URL is dropped — the documented round-trip
+  asymmetry; autolinks shed their `<`/`>`). Single-line only; code contexts refuse. View binds
+  Mod-k, always consuming the key.
+- **`toggleBulletList` / `toggleOrderedList`** — line-wise conversion with toggle semantics: an
+  all-target-flavor selection STRIPS back to plain lines (itemness-invariant exemption, like
+  `enter`'s marker-clear), anything else CONVERTS in place. Pinned decisions: task items are
+  bullet-flavor; converting to ordered strips task brackets; converting to bullet keeps them;
+  already-target lines (raw digits included) are never rewritten; written ordered markers get
+  sequential digits restarting at 1 per contiguous same-column run with delimiter/glyph
+  adoption; the below-line interruption guard carries over from indentList/outdentList.
+- **`insertHr`** — a thematic break after the line containing `pos`, with blank lines
+  guaranteed above and below so the dashes can never parse as a setext-H2 underline (the
+  paragraph-adjacent shape is pinned by a reparse-assertion test).
+- **`toggleCodeBlock`** — wrap the intersecting lines in backtick fences (length computed so
+  body lines can never close the fence early; selection lands inside the block) / remove both
+  fence lines of an intersected block. Quote context is a documented v1 `null` punt.
+- All six: one undo unit, origin `"command"`, UTF-16 arguments with the CRLF guard, and the
+  whole-document itemness invariant (with the strip exemption above).

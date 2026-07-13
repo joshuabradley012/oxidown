@@ -1963,6 +1963,12 @@ describe("core CRLF split guard (S2)", () => {
       () => core.command("indentList", 4, 4),
       () => core.command("outdentList", 4, 4),
       () => core.command("enter", 4, 4),
+      () => core.command("toggleQuote", 4, 8),
+      () => core.command("toggleLink", 0, 4),
+      () => core.command("toggleBulletList", 4, 4),
+      () => core.command("toggleOrderedList", 4, 4),
+      () => core.command("insertHr", 4),
+      () => core.command("toggleCodeBlock", 4, 4),
     ]) {
       expect(run).toThrow(msg);
     }
@@ -2075,5 +2081,107 @@ describe("core heading trailing whitespace + closing run (S5)", () => {
       { kind: "conceal", from: 0, to: 2 },
       { kind: "conceal", from: 5, to: 7 },
     ]);
+  });
+});
+
+describe("v0.6 commands — the toolbar batch, end-to-end through the wasm command path", () => {
+  // One end-to-end per toolbar button (docs/boundary-v0.md "v0.6 additions"):
+  // each drives core.command(...) exactly like the demo's runToggle/
+  // runInsertHr wiring and applies the returned splices to a mirror.
+
+  it("toggleQuote adds one level (blank lines included), a second press on the quoted text removes it", () => {
+    const { core } = makeCore("alpha\n\nbeta");
+    let mirror = "alpha\n\nbeta";
+    const c1 = core.command("toggleQuote", 0, 11)!;
+    mirror = applySplices(mirror, c1.splices);
+    expect(mirror).toBe("> alpha\n> \n> beta");
+    expect(core.getText()).toBe(mirror);
+    const c2 = core.command("toggleQuote", 0, mirror.length)!;
+    mirror = applySplices(mirror, c2.splices);
+    expect(mirror).toBe("alpha\n\nbeta");
+    expect(core.getText()).toBe(mirror);
+  });
+
+  it("toggleQuote remove is stepped: one nesting level per press", () => {
+    const { core } = makeCore("> > deep");
+    core.command("toggleQuote", 4, 4);
+    expect(core.getText()).toBe("> deep");
+    core.command("toggleQuote", 3, 3);
+    expect(core.getText()).toBe("deep");
+  });
+
+  it("toggleLink wraps with the cursor in the URL slot; empty range gives the text slot", () => {
+    const { core } = makeCore("hello world");
+    const c = core.command("toggleLink", 6, 11)!;
+    expect(core.getText()).toBe("hello [world]()");
+    expect(c.selection).toEqual({ anchor: 14, head: 14 });
+
+    const { core: c2core } = makeCore("ab");
+    const c2 = c2core.command("toggleLink", 1, 1)!;
+    expect(c2core.getText()).toBe("a[]()b");
+    expect(c2.selection).toEqual({ anchor: 2, head: 2 });
+  });
+
+  it("toggleLink unwraps an intersected link, keeping the text; multi-line and code contexts are null", () => {
+    const { core } = makeCore("see [docs](https://x.y) now");
+    const c = core.command("toggleLink", 6, 6)!;
+    expect(core.getText()).toBe("see docs now");
+    expect(c.selection).toEqual({ anchor: 4, head: 8 });
+
+    const { core: multi } = makeCore("ab\ncd");
+    expect(multi.command("toggleLink", 0, 4)).toBeNull();
+    const { core: code } = makeCore("`code`");
+    expect(code.command("toggleLink", 2, 4)).toBeNull();
+  });
+
+  it("toggleBulletList converts plain lines and a second press strips back", () => {
+    const { core } = makeCore("alpha\nbeta");
+    core.command("toggleBulletList", 0, 10);
+    expect(core.getText()).toBe("- alpha\n- beta");
+    core.command("toggleBulletList", 0, core.docLength());
+    expect(core.getText()).toBe("alpha\nbeta");
+  });
+
+  it("toggleOrderedList writes sequential digits and re-flavors bullets in place", () => {
+    const { core } = makeCore("alpha\n- beta\ngamma");
+    core.command("toggleOrderedList", 0, 18);
+    expect(core.getText()).toBe("1. alpha\n2. beta\n3. gamma");
+  });
+
+  it("insertHr guarantees the blank lines that defuse the setext trap", () => {
+    const { core } = makeCore("para1\npara2");
+    const c = core.command("insertHr", 2)!;
+    expect(core.getText()).toBe("para1\n\n---\n\npara2");
+    // The dashes decorate as an hr LINE (a setext underline would instead
+    // re-style para1 as a heading).
+    const d = core.decorations(core.revision(), 0, core.docLength(), []);
+    expect(lines(d).some((l) => l.kind === "line" && l.style === "hr")).toBe(true);
+    expect(lines(d).some((l) => l.kind === "line" && l.style === "h2")).toBe(false);
+    // Cursor glued: the insertion is at/after pos.
+    expect(c.selection).toEqual({ anchor: 2, head: 2 });
+  });
+
+  it("toggleCodeBlock wraps the selection lines (selection inside the block) and unwraps back", () => {
+    const { core } = makeCore("alpha\nbeta");
+    const c = core.command("toggleCodeBlock", 0, 10)!;
+    expect(core.getText()).toBe("```\nalpha\nbeta\n```");
+    expect(c.selection).toEqual({ anchor: 4, head: 14 });
+    core.command("toggleCodeBlock", 6, 6);
+    expect(core.getText()).toBe("alpha\nbeta");
+  });
+
+  it("toggleCodeBlock is null in quote context (documented v1 punt)", () => {
+    const { core } = makeCore("> quoted");
+    expect(core.command("toggleCodeBlock", 3, 3)).toBeNull();
+  });
+
+  it("each v0.6 command is one undo unit", () => {
+    const { core } = makeCore("alpha\nbeta");
+    core.command("toggleOrderedList", 0, 10);
+    expect(core.getText()).toBe("1. alpha\n2. beta");
+    const u = core.undo()!;
+    expect(u.splices.length).toBeGreaterThan(0);
+    expect(core.getText()).toBe("alpha\nbeta");
+    expect(core.undo()).toBeNull();
   });
 });

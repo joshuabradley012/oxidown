@@ -662,6 +662,12 @@ impl OxidownCore {
     ///   Tab nesting, boundary v0.2)
     /// - `command("enter", from, to)` (construct-aware Enter: list/quote
     ///   continuation, single-press empty-item exit; boundary v0.3)
+    /// - `command("toggleQuote"|"toggleBulletList"|"toggleOrderedList"|
+    ///   "toggleCodeBlock"|"toggleLink", from, to)` (boundary v0.6: stepped
+    ///   quote toggle, line-wise list conversion, fenced-code wrap/unwrap,
+    ///   link wrap/unwrap)
+    /// - `command("insertHr", pos)` (boundary v0.6: setext-safe thematic
+    ///   break after the line containing pos)
     ///
     /// Returns `CoreChange | null` (`null` when the command doesn't apply at
     /// the target). Throws on unknown names, missing arguments, or invalid
@@ -701,6 +707,23 @@ impl OxidownCore {
                 let (from, to) = range_args(self)?;
                 Command::Enter { from, to }
             }
+            // v0.6 range commands (docs/boundary-v0.md "v0.6 additions").
+            "toggleQuote" | "toggleLink" | "toggleBulletList" | "toggleOrderedList"
+            | "toggleCodeBlock" => {
+                let (from, to) = range_args(self)?;
+                match name {
+                    "toggleQuote" => Command::ToggleQuote { from, to },
+                    "toggleLink" => Command::ToggleLink { from, to },
+                    "toggleBulletList" => Command::ToggleBulletList { from, to },
+                    "toggleOrderedList" => Command::ToggleOrderedList { from, to },
+                    _ => Command::ToggleCodeBlock { from, to },
+                }
+            }
+            // v0.6 position command: insert a thematic break after the line
+            // containing `pos` (setext-underline-safe splice).
+            "insertHr" => Command::InsertHr {
+                pos: self.pos_arg(a, "pos")?,
+            },
             "setHeading" => {
                 // Mock order: malformed pos → missing/malformed/out-of-range
                 // level → pos document bounds (`setHeadingCmd` validates the

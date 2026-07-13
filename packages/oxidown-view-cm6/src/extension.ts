@@ -1186,6 +1186,13 @@ function commandKeymap(core: OxidownCore): Extension {
     { key: "Mod-i", run: runToggle("toggleEm"), preventDefault: true },
     { key: "Mod-Shift-x", run: runToggle("toggleStrike"), preventDefault: true },
     { key: "Mod-e", run: runToggle("toggleCode"), preventDefault: true },
+    // Mod-k -> toggleLink (v0.6): the near-universal insert-link binding
+    // (Google Docs, Slack, GitHub, Obsidian). runToggle returns true even
+    // on a legitimate `null` (multi-line selection, code context), so the
+    // key is ALWAYS consumed — and `preventDefault: true` eats the
+    // browser's own Ctrl/Cmd-K default (Chrome/Firefox focus the search/
+    // address bar) regardless, same rationale as Mod-L above.
+    { key: "Mod-k", run: runToggle("toggleLink"), preventDefault: true },
     // Enter continues/exits list markers and quote prefixes through the core
     // (null → falls through to the default newline). No preventDefault: when
     // the binding declines (plain paragraph, composing), the event must stay
@@ -1232,6 +1239,9 @@ function commandKeymap(core: OxidownCore): Extension {
  * The core-driven command keymap:
  * - Mod-b / Mod-i / Mod-Shift-x / Mod-e toggle strong/em/strike/code over
  *   the current selection;
+ * - Mod-k wraps the selection as a link / unwraps an intersected link via
+ *   toggleLink (v0.6), always consuming the key (a `null` — multi-line
+ *   selection, code context — must not leak Ctrl/Cmd-K to the browser);
  * - Enter continues/exits list markers and quote prefixes (falling through
  *   to the default newline when neither applies);
  * - Tab / Shift-Tab and Mod-] / Mod-[ run marker-width-aware

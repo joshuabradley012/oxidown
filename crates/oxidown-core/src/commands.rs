@@ -324,6 +324,145 @@
 //!    never arises here: every applicable case (2 through 6) produces a real
 //!    splice batch. `enter` returns either `None` (rule 1) or `Some` with a
 //!    non-empty batch — never `Some` with an empty one.
+//!
+//! ## toggleQuote (boundary v0.6)
+//!
+//! Line-wise over every line intersecting `[from, to]`, with STEPPED remove
+//! semantics (research/07 §2.2 — repeated presses unwind one nesting level
+//! per press, the gap Obsidian's on/off-only "Toggle Blockquote" never
+//! closed natively):
+//!
+//! * **REMOVE** when EVERY intersecting non-blank line already has quote
+//!   depth >= 1 (a lazy-continuation line inside a quote counts — it IS
+//!   quoted, it just carries no marker run of its own): delete each line's
+//!   INNERMOST `"> "` run element (the `BlockQuoteLine` node's last
+//!   delimiter span — the same run `enter`'s quote-exit rule strips).
+//!   Lines with no marker run of their own — lazy continuations, blank
+//!   separator lines — are left untouched; a selection whose quoted lines
+//!   are ALL marker-less returns the applies-but-no-op empty batch
+//!   (`indentList`'s shape: no undo unit, no revision bump).
+//! * **ADD** otherwise: insert `"> "` at every intersecting line's START —
+//!   blank lines INCLUDED, so a quote wrapped around a multi-paragraph
+//!   selection stays one contiguous quote. Works on list items / tasks /
+//!   headings unchanged: the prefix goes before the existing content and
+//!   the parse nests the construct inside the quote.
+//! * Never `None`: any position resolves to a line, so the command always
+//!   applies (the no-op case above is `Some` with an empty batch).
+//!
+//! ## toggleLink (boundary v0.6)
+//!
+//! Single-line only: a range spanning a line terminator is `None` (v1
+//! scope, like every other line-oriented command). Code contexts refuse
+//! exactly like the inline toggles (`Ok(None)`-shaped `None` here): a range
+//! touching a fenced-code line, or an endpoint strictly inside an inline
+//! code span, would make the link delimiters literal bytes.
+//!
+//! * **UNWRAP** when the range's closed interval intersects an existing
+//!   link node's extent: an inline link loses its `[` and `](url)`
+//!   delimiter spans (the text survives; the URL is gone — re-toggling
+//!   wraps with an EMPTY url slot, the documented asymmetry); an AUTOLINK
+//!   (`<url>`) loses just the `<`/`>` wrappers, keeping the destination
+//!   text. Selection covers the surviving text (matching the inline
+//!   toggles' OFF path).
+//! * **WRAP** otherwise: the range becomes `[<selected text>](` + `)` and
+//!   the returned selection is a cursor in the URL slot (between the
+//!   parens). An EMPTY range inserts `[]()` with the cursor in the TEXT
+//!   slot (between the brackets) instead.
+//!
+//! ## toggleBulletList / toggleOrderedList (boundary v0.6)
+//!
+//! Line-wise conversion with toggle semantics over every line intersecting
+//! `[from, to]`. Blank lines and fenced-code lines (fence or body) pass
+//! through untouched in every mode; "convertible" below means the other,
+//! non-blank non-code intersecting lines. `None` only when NO intersecting
+//! line is convertible.
+//!
+//! * **Flavor**: task items are BULLET-flavor (`- [ ] x` is a bullet item;
+//!   `1. [ ] x` is ordered-flavor — the checkbox is content, not marker).
+//! * **STRIP** when every convertible line is already an item of the TARGET
+//!   flavor: each line loses its leading indent, marker token, task
+//!   brackets, and all post-marker whitespace (back to a genuinely plain
+//!   line — leaving 4+ leading spaces behind would re-type the line as
+//!   indented code). This is an explicit de-listing gesture: the stripped
+//!   lines are exempt from the whole-document itemness invariant exactly
+//!   like `enter`'s marker-clear; every line the command does NOT strip
+//!   keeps its itemness (below-line guard, below).
+//! * **CONVERT** otherwise: plain lines get a marker inserted at content
+//!   start (right after any quote prefix); other-flavor items get their
+//!   marker glyphs REPLACED in place (indent and quote prefix kept).
+//!   Task handling (pinned decisions): converting a task item to ORDERED
+//!   strips the brackets (`- [ ] x` → `1. x`); converting an ORDERED task
+//!   to bullet keeps them (`1. [ ] x` → `- [ ] x` — it stays a task, now
+//!   bullet-flavored); a bullet task under a BULLET target is already
+//!   target flavor and is untouched — as is any already-target line (the
+//!   never-rewrite-unedited-bytes principle wins over cosmetic uniformity,
+//!   so an already-ordered line's raw digits are never renumbered by a
+//!   convert pass).
+//! * **Ordered numbering**: markers this command WRITES get sequential raw
+//!   digits restarting at 1 per contiguous same-column run (a blank/code
+//!   line, a quote-depth change, or a shallower column ends a run; deeper
+//!   columns start a nested run). Untouched ordered lines feed the run's
+//!   counter (their raw value + 1) and their delimiter flavor is adopted,
+//!   so written markers JOIN the surrounding list rather than splitting it
+//!   (`.` vs `)` starts a new list per CommonMark); the run seeds from the
+//!   item line directly above the selection when it sits at the same
+//!   column, so converting mid-list reads sequentially. Display numbering
+//!   recomputes regardless (v0.3 ordered widget) — this is about the
+//!   source reading sensibly and about interruption-safety: a written
+//!   first-in-run marker is always `1` (which may interrupt anything) and
+//!   a written non-1 marker always joins an adjacent same-column
+//!   same-delimiter run. Bullet conversion adopts the run's bullet glyph
+//!   the same way (`*` siblings get `*`, not a list-splitting `-`).
+//! * **Below-line guard** (the same contract as `indentList`/
+//!   `outdentList`'s `below_line_rewrite`): stripping or re-flavoring the
+//!   selection can re-anchor the first unaffected ordered sibling BELOW it
+//!   (a non-1 ordered marker cannot START a list in paragraph-interruption
+//!   position). After the batch, the first unaffected item line below the
+//!   affected block — skipping, in convert mode, adopted descendants
+//!   (column strictly greater than the last converted line's) — is
+//!   checked: a non-1 ordered marker that no longer joins a same-column
+//!   same-delimiter ordered run gets its digits rewritten to `1` in the
+//!   same batch/undo unit. The scan stops at a blank/non-item line or
+//!   quote-depth change like every other scan here, and never runs when
+//!   the selection's own trailing line is blank/code (the blank line
+//!   already separates any following list).
+//!
+//! ## insertHr (boundary v0.6)
+//!
+//! Inserts a thematic break on its own line AFTER the line containing
+//! `pos`. The CommonMark trap this construction exists to avoid: `---`
+//! directly under paragraph text is a SETEXT H2 UNDERLINE, not an hr — so
+//! the splice guarantees a blank line above (one extra `"\n"` when the
+//! current line is non-blank) and below (one trailing `"\n"` before the
+//! original terminator when a following non-blank line exists), and the
+//! result always reparses as `ThematicBreak` (pinned by test against
+//! exactly the paragraph-adjacent shape). The hr is inserted at TOP level:
+//! on a quoted line the break lands after (outside) the quote, splitting
+//! it — v1 behavior, documented. `None` only on fenced-code lines (a `---`
+//! inside a fence is literal bytes). The cursor stays glued to its
+//! character (the insertion lands at/after `pos`).
+//!
+//! ## toggleCodeBlock (boundary v0.6)
+//!
+//! * **UNWRAP** when `[from, to]` intersects an existing FENCED block (the
+//!   fence nodes' block-level reveal extent — a touch anywhere in the
+//!   block, fence lines or body, counts): both fence LINES are removed
+//!   (each with one adjoining line terminator so no stray blank lines are
+//!   left behind), and the body survives verbatim. An unterminated block
+//!   (no closing fence) loses just its opening fence line.
+//! * **WRAP** otherwise: the intersecting lines are wrapped in backtick
+//!   fences on their own lines above/below. The fence is one backtick
+//!   longer than the longest leading backtick run (after up to 3 leading
+//!   spaces) among the wrapped lines, minimum three, so a wrapped line can
+//!   never close the new fence early. The selection shifts by the opening
+//!   fence's length — it stays on the same characters, now INSIDE the
+//!   block.
+//! * **Quote punt (v1, documented)**: `None` whenever the target (the
+//!   intersecting lines, or the intersected block's first line) sits at
+//!   quote depth > 0 — fences-in-quotes need per-line `> ` prefix surgery
+//!   on every body line, deferred. Indented (non-fenced) code blocks are
+//!   invisible to this command (they emit no overlay nodes): their lines
+//!   wrap like plain text.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -355,6 +494,24 @@ pub enum Command {
     /// construct applies at the target (the view falls back to a plain
     /// newline) — see the module doc comment's "## enter" section.
     Enter { from: usize, to: usize },
+    /// Stepped blockquote toggle (boundary v0.6): add one `> ` level to
+    /// every intersecting line, or remove one level when every intersecting
+    /// non-blank line is already quoted — see "## toggleQuote" above.
+    ToggleQuote { from: usize, to: usize },
+    /// Link wrap/unwrap (boundary v0.6): single-line only — see
+    /// "## toggleLink" above.
+    ToggleLink { from: usize, to: usize },
+    /// Line-wise list conversion with toggle semantics (boundary v0.6) —
+    /// see "## toggleBulletList / toggleOrderedList" above.
+    ToggleBulletList { from: usize, to: usize },
+    ToggleOrderedList { from: usize, to: usize },
+    /// Insert a thematic break after the line containing `pos`, blank-line
+    /// guarded against the setext-underline trap (boundary v0.6) — see
+    /// "## insertHr" above.
+    InsertHr { pos: usize },
+    /// Fenced-code wrap/unwrap (boundary v0.6) — see "## toggleCodeBlock"
+    /// above.
+    ToggleCodeBlock { from: usize, to: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1077,8 +1234,16 @@ fn intersecting_lines<'s, 'a>(
             if src.get(next) == Some(b'\n') {
                 next += 1;
             }
-            // `next <= p` is the defensive doc-end stop (no terminator left).
-            (next > p).then_some(next)
+            // `next == line.end` means the line has NO terminator — it is
+            // the document's last line and the iteration must stop after
+            // yielding it once. (The previous guard, `next > p`, only fired
+            // when `p` already sat AT the unterminated line's end; for
+            // `p < line.end < to_b == doc end` it advanced `pos` to
+            // `line.end` and the next round yielded the SAME line again —
+            // a duplicate that plan_list_nesting's BTreeMap dedup masked
+            // but the v0.6 line-wise planners, which collect into a Vec,
+            // must never see.)
+            (next > line.end).then_some(next)
         };
         if empty || to_b > line.start {
             Some(line)
@@ -1800,4 +1965,773 @@ pub fn enter(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Opti
     }
 
     None // rule 1: neither a list marker nor a quote prefix applies here
+}
+
+// ---------------------------------------------------------------------
+// toggleQuote (boundary v0.6: stepped blockquote toggle). See the module
+// doc comment's "## toggleQuote" section for the full spec — this is a
+// direct transcription of it.
+// ---------------------------------------------------------------------
+
+/// Stepped blockquote toggle: remove one `> ` level per press when every
+/// intersecting non-blank line is already quoted, else add one level to
+/// every intersecting line (blank ones included). Always `Some` — see the
+/// module doc comment (the applies-but-no-op empty batch covers the
+/// all-marker-less remove case).
+pub fn toggle_quote(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Option<CommandPlan> {
+    let lines: Vec<Range<usize>> = intersecting_lines(src, from_b, to_b).collect();
+    // REMOVE iff every non-blank intersecting line sits at quote depth >= 1.
+    // Lazy-continuation lines count (their BlockQuoteLine node carries the
+    // depth even with no marker run of their own); an all-blank selection
+    // has no quoted line to unwind, so it falls to ADD (the blank lines get
+    // markers, keeping a to-be-typed quote contiguous).
+    let mut saw_non_blank = false;
+    let mut all_quoted = true;
+    for line in &lines {
+        if is_blank(src, line.clone()) {
+            continue;
+        }
+        saw_non_blank = true;
+        if quote_context(nodes, line.start).0 == 0 {
+            all_quoted = false;
+            break;
+        }
+    }
+    let mut batch: Vec<ByteSplice> = Vec::with_capacity(lines.len());
+    if saw_non_blank && all_quoted {
+        for line in &lines {
+            // The line's INNERMOST `> ` run element — one nesting level per
+            // press (research/07 §2.2). Marker-less lines (lazy
+            // continuations, blank separators) are untouched.
+            let Some(d) = blockquote_line_node(nodes, line.start).and_then(|n| n.delims.last())
+            else {
+                continue;
+            };
+            batch.push(del(d));
+            // Structural guard (itemness invariant, same contract as
+            // indentList's interruption rewrite): a de-quoted non-1 ordered
+            // item lands after whatever the line above leaves — if that
+            // isn't a same-column same-delimiter ordered item at the SAME
+            // post-edit quote depth, the marker would be starting a new
+            // list in paragraph-interruption position and silently de-list
+            // (lazy continuation into the block above). Rewrite its digits
+            // to 1 (a `1.` may interrupt anything) in the same batch.
+            if let Some((item_start, _)) = line_marker(nodes, src, line) {
+                if let Some((digit_len, is_one, delim)) = ordered_marker(src, item_start) {
+                    if !is_one && !dequoted_line_joins(nodes, src, &lines, line, item_start, delim) {
+                        batch.push(ByteSplice {
+                            at: item_start,
+                            delete: digit_len,
+                            insert: "1".into(),
+                        });
+                    }
+                }
+            }
+        }
+        if batch.is_empty() {
+            // Every quoted line was marker-less: applies, nothing to do
+            // (indentList's no-op shape — no undo unit, no revision bump).
+            return Some(CommandPlan { batch, selection: None });
+        }
+    } else {
+        for line in &lines {
+            batch.push(ins(line.start, "> ".to_string()));
+        }
+        // Below-line structural guard (itemness invariant): quoting the
+        // selection interrupts whatever list anchored the first item line
+        // directly below it — a non-1 ordered marker there can no longer
+        // START a list (the freshly-quoted last line's open paragraph makes
+        // it lazy-continuation territory) and would silently de-list.
+        // Rewrite its digits to 1 in the same batch. No hazard when the
+        // last selected line is blank (the quoted blank line closes the
+        // paragraph) or carries a line-terminated construct (heading, hr,
+        // fence — nothing lazily continues those).
+        let last = lines.last().expect("intersecting_lines is never empty");
+        if !is_blank(src, last.clone()) && !line_terminated_construct(nodes, last) {
+            if let Some(next) = next_line(src, last.end) {
+                if let Some((item_start, _)) = line_marker(nodes, src, &next) {
+                    if let Some((digit_len, is_one, _)) = ordered_marker(src, item_start) {
+                        if !is_one {
+                            batch.push(ByteSplice {
+                                at: item_start,
+                                delete: digit_len,
+                                insert: "1".into(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Bias::After keeps the cursor glued to its character: an insertion
+    // landing exactly at the cursor (the `"> "` at a line start the cursor
+    // sits on) shifts it right with its content.
+    let anchor = mapping::map_pos(from_b, &batch, Bias::After);
+    let head = mapping::map_pos(to_b, &batch, Bias::After);
+    Some(CommandPlan {
+        batch,
+        selection: Some((anchor, head)),
+    })
+}
+
+/// Whether the physical line carries a construct nothing can lazily
+/// continue (heading, thematic break, fence/code line) — used by
+/// `toggle_quote`'s ADD-mode below-line guard.
+fn line_terminated_construct(nodes: &[Node], line: &Range<usize>) -> bool {
+    let lo = nodes.partition_point(|n| n.extent.start < line.start);
+    let hi = nodes.partition_point(|n| n.extent.start < line.end);
+    nodes[lo..hi].iter().any(|n| {
+        matches!(
+            n.kind,
+            NodeKind::Heading(_)
+                | NodeKind::ThematicBreak
+                | NodeKind::CodeFenceLine
+                | NodeKind::CodeBlockLine
+        )
+    })
+}
+
+/// REMOVE-mode join check for `toggle_quote`: after this press, does the
+/// de-quoted ordered item at `item_start` (delimiter `delim`) still JOIN an
+/// ordered run — i.e. is the line directly above it an ordered item with
+/// the same delimiter at the same marker column whose POST-edit quote depth
+/// equals this line's own post-edit depth? (Both lines' columns are
+/// unchanged by the press: removing a `> ` run element shifts `quote_end`
+/// and `item_start` together.) `selection_lines` identifies which lines the
+/// press de-quotes (every intersecting line loses exactly one level in
+/// remove mode when it carries a marker run).
+fn dequoted_line_joins(
+    nodes: &[Node],
+    src: &SrcBytes,
+    selection_lines: &[Range<usize>],
+    line: &Range<usize>,
+    item_start: usize,
+    delim: u8,
+) -> bool {
+    let Some(above) = prev_line(src, line.start) else {
+        return false;
+    };
+    let dequoted = |l: &Range<usize>| {
+        selection_lines.iter().any(|s| s.start == l.start)
+            && blockquote_line_node(nodes, l.start).is_some_and(|n| !n.delims.is_empty())
+    };
+    let post_depth = |l: &Range<usize>| {
+        let d = quote_context(nodes, l.start).0;
+        if dequoted(l) { d.saturating_sub(1) } else { d }
+    };
+    let Some((above_start, _)) = line_marker(nodes, src, &above) else {
+        return false;
+    };
+    let Some((_, _, above_delim)) = ordered_marker(src, above_start) else {
+        return false;
+    };
+    let (_, quote_end) = quote_context(nodes, line.start);
+    let (_, above_quote_end) = quote_context(nodes, above.start);
+    above_delim == delim
+        && (above_start - above_quote_end) == (item_start - quote_end)
+        && post_depth(&above) == post_depth(line)
+}
+
+// ---------------------------------------------------------------------
+// toggleLink (boundary v0.6: link wrap/unwrap). See the module doc
+// comment's "## toggleLink" section for the full spec.
+// ---------------------------------------------------------------------
+
+/// Wrap the range as an inline link (cursor in the URL slot; empty range →
+/// `[]()` with the cursor in the text slot) or unwrap an intersected link
+/// node. `None` for multi-line ranges and code contexts — see the module
+/// doc comment.
+pub fn toggle_link(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Option<CommandPlan> {
+    let line = line_containing(src, from_b);
+    if to_b > line.end {
+        return None; // single-line only (v1)
+    }
+    // Code contexts refuse exactly like the inline toggles: delimiters
+    // written onto a fenced-code line, or into a code span's literal
+    // content, would be literal bytes (and a re-toggle would stack them).
+    if nodes.iter().any(|n| {
+        matches!(n.kind, NodeKind::CodeFenceLine | NodeKind::CodeBlockLine)
+            && n.extent.start <= to_b
+            && from_b <= n.extent.end
+    }) {
+        return None;
+    }
+    let inside_code = |p: usize| {
+        nodes
+            .iter()
+            .any(|n| matches!(n.kind, NodeKind::Code) && n.extent.start < p && p < n.extent.end)
+    };
+    if inside_code(from_b) || inside_code(to_b) {
+        return None;
+    }
+
+    // UNWRAP: the first link node whose closed extent intersects the range.
+    if let Some(node) = nodes.iter().find(|n| {
+        matches!(n.kind, NodeKind::Link { .. }) && n.extent.start <= to_b && from_b <= n.extent.end
+    }) {
+        let (batch, selection) = if matches!(node.kind, NodeKind::Link { autolink: true }) {
+            // `<url>`: strip the wrappers, keep the destination text.
+            let s = node.extent.start;
+            let e = node.extent.end;
+            (
+                vec![
+                    ByteSplice { at: s, delete: 1, insert: String::new() },
+                    ByteSplice { at: e - 1, delete: 1, insert: String::new() },
+                ],
+                (s, e - 2),
+            )
+        } else {
+            // Inline `[text](url)`: both delimiter spans go; the selection
+            // covers the surviving text (matching the inline toggles' OFF
+            // path). delims[0] is the 1-byte `[`, delims[1] is `](url)`.
+            let open = node.delims[0].clone();
+            let close = node.delims[1].clone();
+            let open_len = open.end - open.start;
+            let sel = (open.start, close.start - open_len);
+            (vec![del(&open), del(&close)], sel)
+        };
+        return Some(CommandPlan {
+            batch,
+            selection: Some(selection),
+        });
+    }
+
+    // WRAP.
+    if from_b == to_b {
+        // Empty range: `[]()`, cursor in the TEXT slot (between brackets).
+        let batch = vec![ins(from_b, "[]()".to_string())];
+        let cur = from_b + 1;
+        return Some(CommandPlan {
+            batch,
+            selection: Some((cur, cur)),
+        });
+    }
+    // `[` + selected text + `]()`, cursor in the URL slot (between parens):
+    // post-apply, the text sits at [from+1, to+1), `](` ends at to+3.
+    let batch = vec![ins(from_b, "[".to_string()), ins(to_b, "]()".to_string())];
+    let cur = to_b + 3;
+    Some(CommandPlan {
+        batch,
+        selection: Some((cur, cur)),
+    })
+}
+
+// ---------------------------------------------------------------------
+// toggleBulletList / toggleOrderedList (boundary v0.6: line-wise list
+// conversion with toggle semantics). See the module doc comment's
+// "## toggleBulletList / toggleOrderedList" section for the full spec.
+// ---------------------------------------------------------------------
+
+/// One intersecting line's classification for the list toggles.
+#[derive(Clone, Copy)]
+enum ListToggleClass {
+    /// Whole line is spaces/tabs (or empty): passes through untouched.
+    Blank,
+    /// Carries a fenced-code node (fence or body line): passes through
+    /// untouched — markers written there would be literal bytes.
+    Code,
+    /// Carries its own list marker.
+    Item {
+        /// Marker glyph start (past quote prefix + leading indent).
+        item_start: usize,
+        /// Just past the marker glyphs (bullet char / digits + delimiter).
+        glyph_end: usize,
+        /// `(literal value, delimiter byte)` for an ordered marker; `None`
+        /// for a bullet marker.
+        ordered: Option<(u64, u8)>,
+        /// Whether this item carries a task checkbox.
+        task: bool,
+    },
+    /// Anything else (paragraph text, headings, hr, quote content, …).
+    Plain,
+}
+
+fn classify_list_line(nodes: &[Node], src: &SrcBytes, line: &Range<usize>) -> ListToggleClass {
+    if is_blank(src, line.clone()) {
+        return ListToggleClass::Blank;
+    }
+    // Binary-search jump like `quote_context` (extent-start-sorted overlay).
+    let lo = nodes.partition_point(|n| n.extent.start < line.start);
+    let hi = nodes.partition_point(|n| n.extent.start < line.end);
+    if nodes[lo..hi]
+        .iter()
+        .any(|n| matches!(n.kind, NodeKind::CodeFenceLine | NodeKind::CodeBlockLine))
+    {
+        return ListToggleClass::Code;
+    }
+    if let Some((item_start, _)) = line_marker(nodes, src, line) {
+        let Some(m) = parser::scan_marker(|i| src.get(i), item_start) else {
+            return ListToggleClass::Plain; // defensive: marker node without a scannable glyph
+        };
+        let task = nodes[lo..hi]
+            .iter()
+            .any(|n| matches!(n.kind, NodeKind::ListMarker { task: true, .. }));
+        return ListToggleClass::Item {
+            item_start,
+            glyph_end: m.glyph_end,
+            ordered: m.number.zip(m.delim),
+            task,
+        };
+    }
+    ListToggleClass::Plain
+}
+
+/// The task checkbox node (`[ ]`/`[x]`) on this physical line, if any.
+fn task_widget_on_line<'a>(nodes: &'a [Node], line: &Range<usize>) -> Option<&'a Node> {
+    let lo = nodes.partition_point(|n| n.extent.start < line.start);
+    let hi = nodes.partition_point(|n| n.extent.start < line.end);
+    nodes[lo..hi]
+        .iter()
+        .find(|n| matches!(n.kind, NodeKind::TaskWidget { .. }))
+}
+
+/// A contiguous same-column numbering run for the ordered-convert pass —
+/// see the module doc comment's "Ordered numbering" bullet. `delim`/`glyph`
+/// are adopted from untouched neighbors so written markers join their runs.
+struct RunCounter {
+    col: usize,
+    next: u64,
+    delim: u8,
+    glyph: u8,
+}
+
+pub fn toggle_bullet_list(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Option<CommandPlan> {
+    plan_list_toggle(nodes, src, from_b, to_b, false)
+}
+
+pub fn toggle_ordered_list(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Option<CommandPlan> {
+    plan_list_toggle(nodes, src, from_b, to_b, true)
+}
+
+/// Shared planner for `toggleBulletList`/`toggleOrderedList` — a direct
+/// transcription of the module doc comment's spec section.
+fn plan_list_toggle(
+    nodes: &[Node],
+    src: &SrcBytes,
+    from_b: usize,
+    to_b: usize,
+    ordered_target: bool,
+) -> Option<CommandPlan> {
+    let lines: Vec<Range<usize>> = intersecting_lines(src, from_b, to_b).collect();
+    let classes: Vec<ListToggleClass> = lines
+        .iter()
+        .map(|l| classify_list_line(nodes, src, l))
+        .collect();
+
+    // Applies iff at least one intersecting line is convertible (non-blank,
+    // non-code); STRIP iff every convertible line is already an item of the
+    // target flavor (task items are bullet-flavor — the checkbox is
+    // content, so `ordered.is_some()` alone decides the flavor).
+    let mut any_convertible = false;
+    let mut all_target = true;
+    for class in &classes {
+        match class {
+            ListToggleClass::Blank | ListToggleClass::Code => {}
+            ListToggleClass::Item { ordered, .. } => {
+                any_convertible = true;
+                if ordered.is_some() != ordered_target {
+                    all_target = false;
+                }
+            }
+            ListToggleClass::Plain => {
+                any_convertible = true;
+                all_target = false;
+            }
+        }
+    }
+    if !any_convertible {
+        return None;
+    }
+    let strip = all_target;
+
+    let mut batch: Vec<ByteSplice> = Vec::new();
+    // Post-edit knowledge for the below-line guard: every processed item
+    // line's `(column, post-edit ordered delimiter — None for bullets)`, in
+    // document order, plus whether the LAST intersecting line leaves the
+    // adjacency hazard open (a trailing blank/code line already separates).
+    let mut processed: Vec<(usize, Option<u8>)> = Vec::new();
+    let mut last_line_open_hazard = false;
+    // Post-edit content survives on the last stripped line? (A stripped
+    // EMPTY item leaves a blank line, which separates any list below.)
+    let mut last_strip_non_blank = false;
+
+    if strip {
+        for (line, class) in lines.iter().zip(&classes) {
+            let ListToggleClass::Item { item_start, glyph_end, task, .. } = class else {
+                last_line_open_hazard = false;
+                continue;
+            };
+            let (_, quote_end) = quote_context(nodes, line.start);
+            // Content start: past the glyphs — and the task brackets — then
+            // past ALL post-marker whitespace (the marker span owns it per
+            // the contract; leaving 4+ spaces would re-type the line as
+            // indented code).
+            let mut content = if *task {
+                task_widget_on_line(nodes, line)
+                    .map_or(*glyph_end, |w| w.extent.end)
+            } else {
+                *glyph_end
+            };
+            while content < line.end && matches!(src.get(content), Some(b' ' | b'\t')) {
+                content += 1;
+            }
+            debug_assert!(*item_start >= quote_end);
+            batch.push(ByteSplice {
+                at: quote_end,
+                delete: content - quote_end,
+                insert: String::new(),
+            });
+            last_line_open_hazard = true;
+            last_strip_non_blank = content < line.end;
+        }
+    } else {
+        // CONVERT. Numbering runs: a stack of per-column counters; blank/
+        // code lines and quote-depth changes break every run.
+        let mut counters: Vec<RunCounter> = Vec::new();
+        let mut prev_depth: Option<u8> = None;
+        // Seed from the item line directly above the selection (same quote
+        // depth) so a conversion mid-list continues its run — numbering
+        // reads sequentially and written markers join the open list.
+        if let Some(first) = lines.first() {
+            if let Some(above) = prev_line(src, first.start) {
+                let ctx = list_line_ctx(nodes, src, above.clone());
+                let first_depth = quote_context(nodes, first.start).0;
+                if ctx.quote_depth == first_depth {
+                    if let Some((item_start, _)) = ctx.marker {
+                        let col = item_start - ctx.quote_end;
+                        let counter = match ordered_marker_value(src, item_start) {
+                            Some((_, value, delim)) => RunCounter {
+                                col,
+                                next: value.saturating_add(1).min(999_999_999),
+                                delim,
+                                glyph: b'-',
+                            },
+                            None => RunCounter {
+                                col,
+                                next: 1,
+                                delim: b'.',
+                                glyph: src.byte(item_start),
+                            },
+                        };
+                        counters.push(counter);
+                        prev_depth = Some(first_depth);
+                    }
+                }
+            }
+        }
+        for (line, class) in lines.iter().zip(&classes) {
+            let (depth, quote_end) = quote_context(nodes, line.start);
+            match class {
+                ListToggleClass::Blank | ListToggleClass::Code => {
+                    counters.clear(); // a run never crosses a blank/code line
+                    prev_depth = None;
+                    last_line_open_hazard = false;
+                    continue;
+                }
+                ListToggleClass::Plain | ListToggleClass::Item { .. } => {
+                    if prev_depth.is_some_and(|d| d != depth) {
+                        counters.clear(); // nor a quote-depth change
+                    }
+                    prev_depth = Some(depth);
+                }
+            }
+            let col = match class {
+                ListToggleClass::Item { item_start, .. } => *item_start - quote_end,
+                _ => 0,
+            };
+            // Locate/open this column's run counter.
+            while counters.last().is_some_and(|c| c.col > col) {
+                counters.pop(); // dedent ends the deeper runs
+            }
+            if counters.last().is_none_or(|c| c.col != col) {
+                counters.push(RunCounter { col, next: 1, delim: b'.', glyph: b'-' });
+            }
+            let counter = counters.last_mut().expect("just ensured");
+
+            match *class {
+                ListToggleClass::Item { ordered: Some((value, delim)), .. } if ordered_target => {
+                    // Already ordered: untouched; the run adopts its value
+                    // and delimiter. (Task brackets on an untouched line
+                    // stay untouched — never-rewrite principle.)
+                    counter.next = value.saturating_add(1).min(999_999_999);
+                    counter.delim = delim;
+                    processed.push((col, Some(delim)));
+                }
+                ListToggleClass::Item { item_start, ordered: None, .. } if !ordered_target => {
+                    // Already a bullet (task or not): untouched; the run
+                    // adopts its glyph.
+                    counter.glyph = src.byte(item_start);
+                    processed.push((col, None));
+                }
+                ListToggleClass::Item { item_start, glyph_end, task, .. } => {
+                    // Other-flavor item: replace the marker glyphs in place.
+                    let insert = if ordered_target {
+                        let text = format!("{}{}", counter.next, counter.delim as char);
+                        counter.next = counter.next.saturating_add(1).min(999_999_999);
+                        text
+                    } else {
+                        (counter.glyph as char).to_string()
+                    };
+                    processed.push((col, ordered_target.then_some(counter.delim)));
+                    batch.push(ByteSplice {
+                        at: item_start,
+                        delete: glyph_end - item_start,
+                        insert,
+                    });
+                    if task && ordered_target {
+                        // Converting to ordered strips the brackets (pinned
+                        // decision): `[ ]`/`[x]` plus ALL its trailing
+                        // whitespace — the marker's own trailing space
+                        // before the brackets keeps content separated.
+                        if let Some(w) = task_widget_on_line(nodes, line) {
+                            let mut end = w.extent.end;
+                            while end < line.end && matches!(src.get(end), Some(b' ' | b'\t')) {
+                                end += 1;
+                            }
+                            batch.push(ByteSplice {
+                                at: w.extent.start,
+                                delete: end - w.extent.start,
+                                insert: String::new(),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    // Plain line: prefix a fresh marker at content start
+                    // (right after any quote prefix).
+                    let insert = if ordered_target {
+                        let text = format!("{}{} ", counter.next, counter.delim as char);
+                        counter.next = counter.next.saturating_add(1).min(999_999_999);
+                        text
+                    } else {
+                        format!("{} ", counter.glyph as char)
+                    };
+                    processed.push((col, ordered_target.then_some(counter.delim)));
+                    batch.push(ins(quote_end, insert));
+                }
+            }
+            last_line_open_hazard = true;
+        }
+    }
+
+    if batch.is_empty() {
+        // All-untouched convert (every convertible line already target
+        // flavor would be STRIP; this arises only defensively) — applies,
+        // nothing to do.
+        return Some(CommandPlan { batch, selection: None });
+    }
+
+    // Below-line guard (module doc comment): only when the selection's own
+    // trailing line leaves the adjacency hazard open.
+    if last_line_open_hazard && (!strip || last_strip_non_blank) {
+        let last_line = lines.last().expect("non-empty by construction");
+        let scan_depth = quote_context(nodes, last_line.start).0;
+        // Convert mode skips adopted descendants of the last processed item
+        // (they nest under it and keep their itemness with it); strip mode
+        // checks the immediate first item line below (nothing above anchors
+        // anything anymore).
+        let base_col = if strip {
+            None
+        } else {
+            processed.last().map(|(c, _)| *c)
+        };
+        let mut cursor_end = last_line.end;
+        while let Some(range) = next_line(src, cursor_end) {
+            let ctx = list_line_ctx(nodes, src, range.clone());
+            if ctx.quote_depth != scan_depth {
+                break;
+            }
+            let Some((item_start, _)) = ctx.marker else {
+                break; // blank or non-item line separates: no hazard
+            };
+            let col = item_start - ctx.quote_end;
+            if base_col.is_some_and(|b| col > b) {
+                cursor_end = range.end; // adopted descendant
+                continue;
+            }
+            if let Some((digit_len, is_one, delim)) = ordered_marker(src, item_start) {
+                // Joins iff the landing processed line sits at the same
+                // column with the same post-edit ordered delimiter (the
+                // same landing-scan rule as `interruption_rewrite`, run
+                // against post-edit flavors).
+                let joins = processed
+                    .iter()
+                    .rev()
+                    .find(|(c, _)| *c <= col)
+                    .is_some_and(|(c, d)| *c == col && *d == Some(delim));
+                if !is_one && !joins {
+                    batch.push(ByteSplice {
+                        at: item_start,
+                        delete: digit_len,
+                        insert: "1".into(),
+                    });
+                }
+            }
+            break;
+        }
+    }
+
+    let anchor = mapping::map_pos(from_b, &batch, Bias::After);
+    let head = mapping::map_pos(to_b, &batch, Bias::After);
+    Some(CommandPlan {
+        batch,
+        selection: Some((anchor, head)),
+    })
+}
+
+// ---------------------------------------------------------------------
+// insertHr (boundary v0.6: setext-safe thematic break insertion). See the
+// module doc comment's "## insertHr" section for the full spec.
+// ---------------------------------------------------------------------
+
+/// Insert `---` on its own line after the line containing `pos`, with the
+/// blank-line guarantees that make it parse as a `ThematicBreak` rather
+/// than a setext-H2 underline. `None` only on fenced-code lines.
+pub fn insert_hr(nodes: &[Node], src: &SrcBytes, pos_b: usize) -> Option<CommandPlan> {
+    let line = line_containing(src, pos_b);
+    // Never write into a fence: the dashes would be literal bytes (same
+    // defensive gate as setHeading's).
+    if nodes.iter().any(|n| {
+        matches!(n.kind, NodeKind::CodeFenceLine | NodeKind::CodeBlockLine)
+            && n.extent.start <= line.end
+            && line.start <= n.extent.end
+    }) {
+        return None;
+    }
+    let mut insert = String::from("\n");
+    if !is_blank(src, line.clone()) {
+        // THE setext trap: `---` directly under paragraph text is an H2
+        // underline. A blank line above forces the ThematicBreak parse.
+        insert.push('\n');
+    }
+    insert.push_str("---");
+    // Blank line below, so following text doesn't sit against the break:
+    // the original terminator supplies one of the two newlines.
+    if next_line(src, line.end).is_some_and(|next| !is_blank(src, next)) {
+        insert.push('\n');
+    }
+    let batch = vec![ins(line.end, insert)];
+    // The insertion lands at/after `pos` (end of its line), so Before-bias
+    // keeps the cursor exactly where it was, glued to its character.
+    let cursor = mapping::map_pos(pos_b, &batch, Bias::Before);
+    Some(CommandPlan {
+        batch,
+        selection: Some((cursor, cursor)),
+    })
+}
+
+// ---------------------------------------------------------------------
+// toggleCodeBlock (boundary v0.6: fenced-code wrap/unwrap). See the module
+// doc comment's "## toggleCodeBlock" section for the full spec.
+// ---------------------------------------------------------------------
+
+/// Wrap the intersecting lines in backtick fences, or remove both fence
+/// lines of an intersected fenced block (keeping the body). `None` in
+/// quote context (v1 punt, documented).
+pub fn toggle_code_block(nodes: &[Node], src: &SrcBytes, from_b: usize, to_b: usize) -> Option<CommandPlan> {
+    // UNWRAP: the range touches an existing fenced block — the fence
+    // nodes' block-level reveal extent covers the body lines too, so a
+    // touch anywhere in the block counts.
+    let block = nodes.iter().find_map(|n| {
+        if !matches!(n.kind, NodeKind::CodeFenceLine) {
+            return None;
+        }
+        let ext = n.reveal_extent.clone()?;
+        (ext.start <= to_b && from_b <= ext.end).then_some(ext)
+    });
+    if let Some(block) = block {
+        if quote_context(nodes, line_containing(src, block.start).start).0 > 0 {
+            return None; // fences-in-quotes: v1 punt
+        }
+        let fences: Vec<Range<usize>> = nodes
+            .iter()
+            .filter(|n| {
+                matches!(n.kind, NodeKind::CodeFenceLine)
+                    && block.start <= n.extent.start
+                    && n.extent.end <= block.end
+            })
+            .map(|n| n.extent.clone())
+            .collect();
+        let open = fences.first()?.clone();
+        // Opening fence goes with its OWN terminator; the closing fence
+        // goes with the terminator BEFORE it (its own terminator survives
+        // as the body's trailing newline) — no stray blank lines either
+        // way. `\n`, `\r\n`, and lone `\r` all handled.
+        let mut open_del_end = open.end;
+        if src.get(open_del_end) == Some(b'\r') {
+            open_del_end += 1;
+        }
+        if src.get(open_del_end) == Some(b'\n') {
+            open_del_end += 1;
+        }
+        let mut batch = vec![ByteSplice {
+            at: open.start,
+            delete: open_del_end - open.start,
+            insert: String::new(),
+        }];
+        if fences.len() >= 2 {
+            let close = fences.last().expect("len checked").clone();
+            let mut s = close.start;
+            if s > 0 && src.get(s - 1) == Some(b'\n') {
+                s -= 1;
+                if s > 0 && src.get(s - 1) == Some(b'\r') {
+                    s -= 1;
+                }
+            } else if s > 0 && src.get(s - 1) == Some(b'\r') {
+                s -= 1;
+            }
+            // An EMPTY block's "terminator before the closing fence" is the
+            // opening fence's own — already deleted above; clamp.
+            let s = s.max(open_del_end);
+            batch.push(ByteSplice {
+                at: s,
+                delete: close.end - s,
+                insert: String::new(),
+            });
+        }
+        let anchor = mapping::map_pos(from_b, &batch, Bias::After);
+        let head = mapping::map_pos(to_b, &batch, Bias::After);
+        return Some(CommandPlan {
+            batch,
+            selection: Some((anchor, head)),
+        });
+    }
+
+    // WRAP.
+    let lines: Vec<Range<usize>> = intersecting_lines(src, from_b, to_b).collect();
+    if lines.iter().any(|l| quote_context(nodes, l.start).0 > 0) {
+        return None; // fences-in-quotes: v1 punt
+    }
+    let first = lines.first()?.clone();
+    let last = lines.last()?.clone();
+    // Fence length: one backtick longer than the longest LEADING run
+    // (after up to 3 leading spaces — a closing fence tolerates that
+    // indent) on any wrapped line, minimum three — a wrapped line can then
+    // never close the new fence early.
+    let mut longest = 0usize;
+    for l in &lines {
+        let mut i = l.start;
+        let mut spaces = 0;
+        while spaces < 3 && src.get(i) == Some(b' ') {
+            i += 1;
+            spaces += 1;
+        }
+        let mut run = 0usize;
+        while i < l.end && src.get(i) == Some(b'`') {
+            run += 1;
+            i += 1;
+        }
+        longest = longest.max(run);
+    }
+    let ticks = "`".repeat((longest + 1).max(3));
+    let open = format!("{ticks}\n");
+    let open_len = open.len();
+    let batch = vec![ins(first.start, open), ins(last.end, format!("\n{ticks}"))];
+    // Selection: computed directly (both endpoints lie within the wrapped
+    // lines, so they shift by exactly the opening fence) — it stays on the
+    // same characters, now inside the block.
+    Some(CommandPlan {
+        batch,
+        selection: Some((from_b + open_len, to_b + open_len)),
+    })
 }

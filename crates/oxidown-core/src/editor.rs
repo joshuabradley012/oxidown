@@ -447,6 +447,38 @@ impl Editor {
                 let (from_b, to_b) = (a.min(b), a.max(b));
                 commands::enter(&self.overlay, &src, from_b, to_b)
             }
+            Command::ToggleQuote { from, to } => {
+                let a = self.command_pos(from)?;
+                let b = self.command_pos(to)?;
+                let (from_b, to_b) = (a.min(b), a.max(b));
+                commands::toggle_quote(&self.overlay, &src, from_b, to_b)
+            }
+            Command::ToggleLink { from, to } => {
+                let a = self.command_pos(from)?;
+                let b = self.command_pos(to)?;
+                let (from_b, to_b) = (a.min(b), a.max(b));
+                commands::toggle_link(&self.overlay, &src, from_b, to_b)
+            }
+            Command::ToggleBulletList { from, to } | Command::ToggleOrderedList { from, to } => {
+                let a = self.command_pos(from)?;
+                let b = self.command_pos(to)?;
+                let (from_b, to_b) = (a.min(b), a.max(b));
+                if matches!(cmd, Command::ToggleBulletList { .. }) {
+                    commands::toggle_bullet_list(&self.overlay, &src, from_b, to_b)
+                } else {
+                    commands::toggle_ordered_list(&self.overlay, &src, from_b, to_b)
+                }
+            }
+            Command::InsertHr { pos } => {
+                let pos_b = self.command_pos_floor(pos)?;
+                commands::insert_hr(&self.overlay, &src, pos_b)
+            }
+            Command::ToggleCodeBlock { from, to } => {
+                let a = self.command_pos(from)?;
+                let b = self.command_pos(to)?;
+                let (from_b, to_b) = (a.min(b), a.max(b));
+                commands::toggle_code_block(&self.overlay, &src, from_b, to_b)
+            }
         };
         // A plan with an empty batch means the command APPLIES but no
         // movement is possible (boundary v0.2: indentList/outdentList at the

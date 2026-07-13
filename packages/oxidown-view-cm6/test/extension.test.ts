@@ -1962,3 +1962,67 @@ describe("S12: drawSelection opt-out + core-change history tagging", () => {
     view.destroy();
   });
 });
+
+describe("Mod-K keymap (toggleLink wrap/unwrap + browser shortcut consumption, v0.6)", () => {
+  const modKKey = () =>
+    new KeyboardEvent("keydown", {
+      key: "k",
+      code: "KeyK",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+  it("wraps the selection as a link with the cursor in the URL slot (wasm)", async () => {
+    const core = makeWasmCore();
+    const doc = "hello world";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: 6, head: 11 } });
+
+    view.contentDOM.dispatchEvent(modKKey());
+    await flush();
+
+    expect(view.state.doc.toString()).toBe("hello [world]()");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    // Cursor in the URL slot: between the parens.
+    expect(view.state.selection.main.from).toBe(14);
+    expect(view.state.selection.main.empty).toBe(true);
+    view.destroy();
+  });
+
+  it("unwraps an existing link from a cursor inside it (wasm)", async () => {
+    const core = makeWasmCore();
+    const doc = "see [docs](https://x.y) now";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: doc.indexOf("docs") + 2 } });
+
+    view.contentDOM.dispatchEvent(modKKey());
+    await flush();
+
+    expect(view.state.doc.toString()).toBe("see docs now");
+    expect(core.getText()).toBe(view.state.doc.toString());
+    // Selection covers the surviving text (the inline toggles' OFF shape).
+    expect(view.state.selection.main.from).toBe(4);
+    expect(view.state.selection.main.to).toBe(8);
+    view.destroy();
+  });
+
+  it("a null (multi-line selection) still consumes the key — Ctrl/Cmd-K never reaches the browser (wasm)", async () => {
+    const core = makeWasmCore();
+    const doc = "ab\ncd";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: 0, head: 4 } });
+
+    const event = modKKey();
+    const notCanceled = view.contentDOM.dispatchEvent(event);
+    await flush();
+
+    // dispatchEvent returns false once a handler preventDefault()ed —
+    // the binding consumes the key whether or not toggleLink applies.
+    expect(notCanceled).toBe(false);
+    expect(event.defaultPrevented).toBe(true);
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(core.getText()).toBe(doc);
+    view.destroy();
+  });
+});

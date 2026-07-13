@@ -182,6 +182,13 @@ function runSetHeading(level: 0 | 1 | 2 | 3 | 4 | 5 | 6) {
   if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
 }
 
+function runInsertHr() {
+  if (view.state.readOnly) return;
+  const pos = view.state.selection.main.head;
+  const outcome = runCoreCommand("insertHr", () => core.command("insertHr", pos));
+  if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
+}
+
 toolbar.addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest("button");
   if (!button) return;
@@ -193,6 +200,8 @@ toolbar.addEventListener("click", (event) => {
     runToggleTaskBtn();
   } else if (button.dataset.indent) {
     runIndent(button.dataset.indent as "indentList" | "outdentList");
+  } else if ("hr" in button.dataset) {
+    runInsertHr();
   }
   // Whatever ran above, keep typing focus in the editor.
   view.focus();
