@@ -1,6 +1,18 @@
 import type { ChangeSet } from "@codemirror/state";
 import type { Splice } from "./protocol.js";
 
+/** Apply ascending, non-overlapping, original-coordinate splices to a string. */
+export function applySplices(doc: string, splices: Splice[]): string {
+  const parts: string[] = [];
+  let pos = 0;
+  for (const s of splices) {
+    parts.push(doc.slice(pos, s.at), s.insert);
+    pos = s.at + s.delete;
+  }
+  parts.push(doc.slice(pos));
+  return parts.join("");
+}
+
 /**
  * Convert a CM6 ChangeSet into the boundary protocol's `Splice[]`:
  * ascending, non-overlapping, in original-document coordinates —

@@ -4,9 +4,27 @@ The minimum contract between `oxidown-core` and a platform view, for the M0 spik
 This document is authoritative: if the Rust core and the TypeScript view disagree, the one that
 matches this file wins; if this file is wrong, change it in the same PR as the code.
 
-Current contract version: **v0.4** — the base v0 sections below are followed by the v0.1
-clarifications, the v0.2 (M1) additions, and inline v0.3/v0.4 amendments; the "v0.3 changelog"
-and "v0.4 changelog" sections at the end enumerate exactly what each version comprises.
+Current contract version: **v0.6** — the base v0 sections below are followed by the v0.1
+clarifications, the v0.2 (M1) additions, and inline v0.3/v0.4/v0.5/v0.6 amendments; the "v0.3
+changelog" through "v0.6 changelog" sections at the end enumerate exactly what each version
+comprises.
+
+**Testing strategy.** The Rust/wasm core (`crates/oxidown-wasm`, wrapped by
+`packages/oxidown-view-cm6/src/wasm-core.ts`) is the ONLY implementation of this contract — there
+is no longer a second, hand-maintained TypeScript reference core. Every test that asserts
+CONTRACT BEHAVIOR (decorations, reveal, commands, numbering, undo/redo/coalescing, streaming,
+anchors, composition) runs directly against the real wasm core, loaded Node-side in vitest via
+`initSync` over the built `.wasm` bytes (`packages/oxidown-view-cm6/test/wasm-loader.ts`); those
+tests fail loudly if `crates/oxidown-wasm/pkg` hasn't been built, rather than skip. A separate,
+deliberately dumb `StubCore` (`packages/oxidown-view-cm6/test/stub-core.ts` — a plain text buffer
+with no markdown knowledge, whole-text-snapshot undo, and scriptable per-method hooks) exists only
+for the CM6 view's WIRING tests — change forwarding, skip annotations, desync recovery, keymap
+fallback, and the like — where a fast, fully-scriptable double is more useful than a real parser.
+Earlier drafts of this document and its test suite used a third option, a hand-written `MockCore`
+that reimplemented this whole contract in TypeScript; it was retired (pre-1.0) once the wasm core
+was fast and stable enough for every test to depend on it directly — a from-scratch parity
+implementation was pure double-implementation tax, and its behavior drifted from the authoritative
+core more than once (e.g. `***x***` nesting, below).
 
 Web-boundary flavor: **all positions in this protocol are UTF-16 code units** (CodeMirror's unit).
 The conversion to core-internal UTF-8 byte offsets happens inside `oxidown-core` itself — every
@@ -196,8 +214,7 @@ fast-path below.
    calls on the same instance (stale revision numbers are never re-issued).
 3. **`***x***`:** per CommonMark, emphasis is the outer node (`<em><strong>x</strong></em>`).
    Views must not depend on which node owns which delimiter characters beyond what the emitted
-   spans say. (The MockCore currently emits strong-outer — a known, documented deviation; the
-   wasm core is authoritative.)
+   spans say.
 4. **Undo-coalescing adjacency** *(amended in v0.3 — the original wording, "touches the
    previous edit's end position", was narrower than the pinned rule)*: a consecutive
    `user`/`ime` edit coalesces when it is a single splice falling entirely within (or touching
@@ -378,9 +395,12 @@ implement the stay-at-`p` behavior.
 ```ts
 command(name: "toggleStrong"|"toggleEm"|"toggleStrike"|"toggleCode", from: number, to: number): CoreChange | null;
 command(name: "setHeading", pos: number, level: 0|1|2|3|4|5|6): CoreChange | null;   // 0 = paragraph
-command(name: "toggleTask", pos: number): CoreChange | null;  // pos anywhere in the list item
+command(name: "toggleTask", pos: number): CoreChange | null;  // flips an existing task, else PROMOTES the line — see "toggleTask" below
 command(name: "indentList"|"outdentList", from: number, to: number): CoreChange | null;
 command(name: "enter", from: number, to: number): CoreChange | null;  // v0.3 addition — see "enter" below
+// v0.6 additions — see "v0.6 commands" below:
+command(name: "toggleQuote"|"toggleLink"|"toggleBulletList"|"toggleOrderedList"|"toggleCodeBlock", from: number, to: number): CoreChange | null;
+command(name: "insertHr", pos: number): CoreChange | null;
 ```
 
 Commands are text transforms computed against the overlay (plan §5.8): they emit minimal
@@ -421,7 +441,7 @@ trimming rather than refusal:
 - Cursor-only toggles (`from == to`) and `toggleCode` are unchanged — code spans have no
   flanking rules; the code planner's existing padding treatment stands.
 
-### `setHeading` (v0.4 clarifications)
+### `setHeading` (v0.4 clarifications, v0.5 amendment)
 
 - The list-item gate applies at any quote depth: `setHeading` inside a blockquote strips the
   `>` prefix before classifying the target line, so a quoted list item (`> - item`) refuses
@@ -429,6 +449,59 @@ trimming rather than refusal:
   the gate and the marker was swallowed as literal heading text.
 - Level 0 (heading → paragraph) removes EVERY delimiter span, an ATX closing hash run included:
   `# foo #` → `foo`, not `foo #`. Releveling (1–6) keeps the closing run, as before.
+- **Idempotent press toggles back to a paragraph (v0.5 amendment).** `setHeading(pos, N)` where
+  the line is ALREADY exactly level `N` (1–6) behaves exactly like level 0: it removes the
+  heading, ALL delimiter spans included. This closes a toolbar-parity gap — clicking H2 on a
+  line that is already an H2 used to be a silent no-op (`null`); it now returns the line to a
+  paragraph, matching the idempotent-toggle behavior every other formatting button already has.
+  "Already level `N`" compares the parsed heading node's OWN level, not a byte-identical prefix
+  match, so an irregularly-spaced `"##  x"` (an extra inner space beyond the one required after
+  the hashes) still counts as "already level 2" and clears fully — only the delimiter span
+  itself is removed; any extra whitespace beyond it is content and is untouched, same as it
+  always was for level 0. A DIFFERENT level still replaces the opening delimiter as before
+  (never treated as a toggle); level 0 is unchanged (always clears, regardless of the line's
+  current level).
+
+### `toggleTask` (v0.5 amendment — Obsidian parity)
+
+`pos` anywhere in an EXISTING task item still flips exactly the `[ ]`/`[x]` checkbox byte
+(unchanged: `[X]` also toggles off to `[ ]`, and this path never moves the cursor). What changed
+is what happens when `pos` does NOT resolve inside an existing task item: v0.2–v0.4 refused
+(`null`) there; v0.5 PROMOTES the line containing `pos` into a task instead, matching Obsidian's
+"Toggle checkbox status" command, which converts a plain bullet into a checkbox rather than
+no-op'ing (research/07 §1.6):
+
+- **Non-task list item** (bullet or ordered, any nesting depth, any quote depth): the `"[ ] "`
+  run is inserted right after the marker token — after the marker's required single space when
+  the item has content (the ordinary case), or with its OWN leading space when the marker has
+  none (a bare empty item, e.g. `"-"`) so the result is still valid GFM task syntax
+  (`"- [ ] "`) rather than the unrecognized `"-[ ] "`. This is resolved per LINE — the line
+  carrying its own marker — not the whole possibly-multi-line item; a cursor on a plain list
+  item's CONTINUATION line does not promote (the same line-oriented v1 scope every other
+  line-based command in this contract has; the flip path above already covers "anywhere in the
+  item" for the EXISTING-task case, which remains the contract's pinned guarantee for that case).
+- **Plain paragraph or blockquote-content line** (seen through any quote prefix, exactly like
+  `setHeading`'s own gate; not blank): `"- [ ] "` is inserted at the content start, i.e. right
+  after the quote prefix — empty at top level, preserved verbatim when quoted
+  (`"> text"` → `"> - [ ] text"`).
+- **Blank line** (including an empty quote line, e.g. `">"`): also promotes, `"- [ ] "` inserted
+  after any quote prefix. This is MORE permissive than `setHeading`'s own blank-line refusal —
+  deliberately: Obsidian promotes a blank line too, and a toolbar button that sometimes silently
+  does nothing on an empty line is a worse experience than a predictable empty task item.
+- **Still `null`** on headings, fenced/indented code lines, thematic breaks, and every other
+  block kind a checkbox makes no sense on (tables, HTML blocks, footnote definitions, or a
+  continuation line inside some OTHER list item) — the same conservative set `setHeading`
+  refuses, since a checkbox on a heading or inside a fence is exactly as nonsensical as a hash
+  run would be there.
+
+Selection after a promotion maps the original `pos` forward through the inserted text
+(after-biased): the insertion always lands at/before `pos`, so the character immediately after
+the cursor is unchanged — the cursor stays with its content, shifted right by the inserted
+marker/checkbox bytes, rather than landing mid-syntax between the new marker and the new
+checkbox. One undo unit, same as every other command. The whole-document itemness invariant
+(indentList/outdentList's own acceptance bar) holds here too, in its ADDITIVE direction:
+a promotion may give a line itemness it didn't have, but never costs any OTHER line the
+itemness it already had.
 
 ### `indentList` / `outdentList`
 
@@ -508,9 +581,8 @@ the open outer ordered list, now sit against the new top-level bullet list, wher
 marker cannot start a list → it de-lists without ever being edited.
 
 To prevent both, after computing the batch (indent AND outdent alike), TWO lines are checked
-with one deterministic structural rule (identical in the Rust core and the mock — a shared rule,
-not post-hoc parser validation, so both cores agree even where their parsers differ in
-leniency):
+with one deterministic structural rule (a single rule the command applies directly, not post-hoc
+parser validation):
 
 1. the FIRST affected line (the moved item itself), at its new column;
 2. the first UNAFFECTED list-item line BELOW the affected set, at its own (unchanged) column —
@@ -634,6 +706,117 @@ the source bytes — same node shape, LINE-level reveal, ordered items keep thei
 view-computed sequence (an empty `2. ` between `1. `/`3. ` still counts). Purely additive:
 empty items now decorate and behave like any other item.
 
+### v0.6 commands: toggleQuote / toggleLink / toggleBulletList / toggleOrderedList / insertHr / toggleCodeBlock
+
+Six new commands (M2 web-editor-beta toolbar batch), sharing every established command rule:
+one undo unit per press (never coalesces), origin `"command"`, UTF-16 range/position arguments
+with the CRLF-split guard, `command()`'s no-mutation-on-throw guarantee, and selection results
+that keep the cursor glued to its character (the character after the cursor is unchanged by a
+prefix insertion). The whole-document ITEMNESS INVARIANT (indentList/outdentList's acceptance
+bar: no command may cost an un-edited line its list itemness) holds for all of them, with one
+documented exemption called out under the list toggles.
+
+**`toggleQuote(from, to)`** — line-wise over every line intersecting the range, with STEPPED
+remove semantics (research/07 §2.2 — repeated presses unwind one nesting level per press, the
+gap Obsidian's on/off-only "Toggle Blockquote" never closed natively):
+
+- **Remove** when EVERY intersecting non-blank line already has quote depth >= 1: each line
+  loses its INNERMOST `> ` run element only. A lazy-continuation line counts as quoted for the
+  mode decision (it IS inside the quote) but carries no marker run of its own, so remove leaves
+  its bytes alone; a selection whose quoted lines are all marker-less returns the
+  indentList-style applies-but-no-op empty CoreChange (no undo unit, no revision bump).
+- **Add** otherwise: `"> "` is inserted at every intersecting line's start — blank lines
+  INCLUDED, so a quote wrapped around a multi-paragraph selection stays one contiguous quote.
+  Works on list items / tasks / headings unchanged (the prefix goes before existing content;
+  the parse nests the construct).
+- **Never `null`**: any position resolves to a line, so the command always applies (the
+  no-op case above is the one degenerate shape).
+- **Structural guards** (itemness invariant, same digit-rewrite contract as indentList's
+  interruption guards): quoting a selection interrupts the list anchoring a non-1 ordered item
+  directly below it (the marker would degrade to lazy-continuation text of the freshly quoted
+  paragraph), and de-quoting a non-1 ordered item can drop it where it cannot start a list —
+  in both cases the affected marker's digits rewrite to `1` in the same batch/undo unit.
+
+**`toggleLink(from, to)`** — single-line only (a range spanning a line terminator → `null`,
+the standard v1 scope). Code contexts refuse exactly like the inline toggles (`null`): a range
+touching a fenced-code line, or an endpoint strictly inside an inline code span.
+
+- **Unwrap** when the range's closed interval intersects an existing link node: an inline link
+  loses its `[` and `](url)` delimiter spans — the text survives, the URL is gone (re-toggling
+  wraps with an EMPTY url slot; the text round-trips byte-identically, the URL does not — the
+  documented asymmetry). An AUTOLINK (`<url>`) sheds just its `<`/`>` wrappers, keeping the
+  destination text. The returned selection covers the surviving text (matching the inline
+  toggles' OFF path).
+- **Wrap** otherwise: the range becomes `[<selected text>](` + `)` and the returned selection
+  is a cursor in the URL slot (between the parens). An EMPTY range inserts `[]()` with the
+  cursor in the TEXT slot (between the brackets).
+- View binding: Mod-k (the near-universal insert-link key), consuming the key even on `null`
+  so Ctrl/Cmd-K never leaks to the browser.
+
+**`toggleBulletList(from, to)` / `toggleOrderedList(from, to)`** — line-wise conversion with
+toggle semantics. Blank lines and fenced-code lines pass through untouched in every mode;
+`null` only when NO intersecting line is convertible (all blank/code).
+
+- **Flavor rule (pinned)**: task items are BULLET-flavor (`- [ ] x` is a bullet item;
+  `1. [ ] x` is ordered-flavor) — the checkbox is GFM content, not marker.
+- **Strip** when every convertible line is already an item of the TARGET flavor: leading
+  indent, marker token, task brackets, and all post-marker whitespace go (a genuinely plain
+  line at any depth — leaving 4+ leading spaces would re-type the line as indented code). This
+  is an explicit de-listing gesture: the stripped lines are EXEMPT from the itemness invariant
+  exactly like `enter`'s marker-clear; every line the command does not touch keeps its
+  itemness (below-line guard).
+- **Convert** otherwise: plain lines get a marker prefixed at content start (right after any
+  quote prefix); other-flavor items get their marker glyphs REPLACED in place (indent and
+  quote prefix kept). Task decisions (pinned): converting to ORDERED strips the task brackets
+  (`- [ ] x` → `1. x`); converting an ordered task to BULLET keeps them (`1. [ ] x` →
+  `- [ ] x` — still a task, now bullet-flavor); already-target lines are untouched, brackets,
+  raw digits and all (never-rewrite-unedited-bytes beats cosmetic uniformity).
+- **Ordered numbering**: markers the command WRITES get sequential raw digits restarting at 1
+  per contiguous same-column run (blank/code lines, quote-depth changes, and shallower columns
+  end a run). Untouched ordered lines feed the counter (raw value + 1) and their `.`/`)`
+  delimiter is adopted; the run seeds from the item line directly above the selection at the
+  same column — written markers therefore always either start a run at `1` (which may
+  interrupt anything) or JOIN an adjacent same-column same-delimiter run, so the conversion
+  itself can never de-list its own output. Bullet conversion adopts the run's bullet glyph the
+  same way (`*` siblings get `*`, not a list-splitting `-`). Display numbering recomputes
+  regardless (v0.3 ordered widget); this is about the source reading sensibly.
+- **Below-line guard** (same contract as indentList's `below_line_rewrite`): the first
+  unaffected item line below the affected block — skipping adopted descendants in convert
+  mode — rewrites its digits to `1` when it is a non-1 ordered marker that no longer joins a
+  same-column same-delimiter run. The scan stops at a blank/non-item line or quote-depth
+  change, and never runs when the selection's own trailing line is blank/code.
+- **Accepted v1 imprecision** (mirror of indentList's `10.` → `1.` note): converting a bullet
+  to ordered grows the marker token width by one, so a descendant sitting exactly at the old
+  content column may reparse as a SIBLING rather than a child — still a list item (the
+  invariant holds); only its nesting depth degrades.
+
+**`insertHr(pos)`** — inserts a thematic break on its own line AFTER the line containing
+`pos`. The CommonMark trap this construction guards (one this repo has been bitten by): `---`
+directly under paragraph text is a SETEXT-H2 UNDERLINE, not an hr. The splice therefore
+guarantees a blank line ABOVE (one extra `"\n"` when the current line is non-blank) and BELOW
+(one trailing `"\n"` when a following non-blank line exists — the original terminator supplies
+the second newline), so the result always reparses as `ThematicBreak` (pinned by a
+reparse-assertion test on exactly the paragraph-adjacent shape, paragraphs above and below
+intact). The break is inserted at TOP level: on a quoted line it lands after (outside) the
+quote, splitting it — v1 behavior. `null` only on fenced-code lines (literal dashes). The
+cursor does not move (the insertion lands at/after `pos`).
+
+**`toggleCodeBlock(from, to)`** —
+
+- **Unwrap** when the range intersects an existing FENCED block (block-level touch semantics,
+  matching fence reveal: fence lines or body, anywhere counts): both fence LINES are removed —
+  each with one adjoining line terminator, so no stray blank lines are left — and the body
+  survives verbatim. An unterminated block loses just its opening fence line.
+- **Wrap** otherwise: the intersecting lines are wrapped in backtick fences on their own lines
+  above/below. The fence is one backtick longer than the longest leading backtick run (after
+  up to 3 leading spaces) among the wrapped lines, minimum three, so a wrapped line can never
+  close the new fence early. The selection shifts by the opening fence's length — same
+  characters, now INSIDE the block.
+- **Quote punt (v1, documented)**: `null` whenever the target sits at quote depth > 0 —
+  fences-in-quotes need per-line `> ` prefix surgery on every body line, deferred. INDENTED
+  (non-fenced) code blocks are invisible to this command (they emit no overlay nodes); their
+  lines wrap like plain text.
+
 ## Streaming (plan §5.9)
 
 ```ts
@@ -666,7 +849,7 @@ Rules:
   mutated the core but the change was silently dropped, desyncing the view's mirror. Returns
   `null` in the common nothing-pending case. The flush edit belongs to the STREAM'S single undo
   unit (it is the stream's last append), not a unit of its own. The surrogate buffering — and
-  therefore the flush — lives at the adapter/mock layer: the raw wasm binding never buffers
+  therefore the flush — lives at the TS adapter layer: the raw wasm binding never buffers
   (surrogate policy is enforced JS-side before text crosses the boundary), so its own
   `streamClose` has nothing to return; the TS adapter produces the returned change.
 
@@ -718,42 +901,38 @@ Position arguments are additionally bounded to `u32::MAX` at the wasm boundary (
 `usize` is 32 bits; a larger value would otherwise silently truncate — `2^32 + 6` becoming
 `6` — and edit the wrong range). Since any integer above `u32::MAX` is necessarily beyond the
 document, such a position throws the ordinary `OutOfBounds: position X beyond document length
-Y (UTF-16 code units)` — the same error the mock, whose numbers have no 32-bit cliff, reaches
-via its document-bounds check. Positions are NEVER silently truncated, wrapped, or clamped.
-This applies equally to positions INSIDE structured JSON payloads (splice `at`/`delete`,
-selection `anchor`/`head`): malformed values (negative, non-integral) throw `InvalidPayload`
-with the `malformed splices` / `malformed selections` message, while well-formed integers
-above `u32::MAX` or beyond the document throw the ordinary `OutOfBounds` — identical names
-and messages on both cores.
+Y (UTF-16 code units)` directly off the core's own document-bounds check. Positions are NEVER
+silently truncated, wrapped, or clamped. This applies equally to positions INSIDE structured
+JSON payloads (splice `at`/`delete`, selection `anchor`/`head`): malformed values (negative,
+non-integral) throw `InvalidPayload` with the `malformed splices` / `malformed selections`
+message, while well-formed integers above `u32::MAX` or beyond the document throw the ordinary
+`OutOfBounds`.
 
 Validation-refusal error names (v0.3):
 
-- `InvalidArgs` — thrown by the wasm adapter/mock argument layer, before dispatch, when a raw
+- `InvalidArgs` — thrown by the wasm adapter's argument layer, before dispatch, when a raw
   argument is malformed (non-integer or negative numbers, a missing command argument, a
   `setHeading` level outside 0–6 at the boundary).
 - `InvalidArgument` — thrown by the core when a value is semantically outside its documented
   domain (e.g. a heading level above 6 at the core API; an inline-toggle range spanning more
   than one leaf block; a command position splitting a CRLF pair — v0.4).
-- `InvalidPayload` — thrown by the adapter/mock payload layer when a STRUCTURED payload is
+- `InvalidPayload` — thrown by the adapter's payload layer when a STRUCTURED payload is
   malformed before it can cross the boundary: mis-shaped or non-serializable `splices` /
-  `selections` (e.g. a negative or non-integer field — wasm:
-  ``InvalidPayload: malformed splices: invalid value: integer `-1`, expected u32``; the mock
-  mirrors the name and `malformed splices` / `malformed selections` prefixes), and text
+  `selections` (e.g. a negative or non-integer field —
+  ``InvalidPayload: malformed splices: invalid value: integer `-1`, expected u32``), and text
   payloads carrying unpaired surrogates (see "Unpaired surrogates in payloads" below).
 - `InvalidOrigin` — thrown by `applyEdit` when the `origin` string is not a documented
   `EditOrigin` value.
 - `InvalidBias` — thrown by `createAnchor` when the bias is not `"before"` / `"after"`.
 - `InvalidCommand` — thrown by `command` when the command name is unknown.
 
-`applyEdit` validates in a pinned order (identical on mock and wasm): malformed
+`applyEdit` validates in a pinned order: malformed
 `baseRevision` (`InvalidArgs`) → staleness (`StaleRevision`) → splice payload (surrogate
 inserts, malformed numbers, ordering, bounds) → origin (`InvalidOrigin`) → apply-time
 surrogate-split check (`SurrogateSplit`). A call that is simultaneously stale AND
 payload-malformed therefore throws `StaleRevision`.
 
-`decorations` likewise validates in a pinned order (v0.4 — identical on mock and wasm, closing
-a divergence where the wasm layer checked the selections payload first and the two cores threw
-DIFFERENT names, in different handling classes, for the same doubly-invalid call): malformed
+`decorations` likewise validates in a pinned order (v0.4 clarification): malformed
 `revision` (`InvalidArgs`) → staleness (`StaleRevision`) → malformed `from`/`to`
 (`InvalidArgs`) → viewport range (`InvalidRange`: `from > to`) → viewport bounds
 (`OutOfBounds`) → per-selection malformed fields (`InvalidPayload`) → per-selection bounds
@@ -788,9 +967,9 @@ Complementing v0.1 clarification 7 (which governs splice *positions*), the docum
 itself never contains an unpaired surrogate code unit:
 
 - `load` and `applyEdit` throw `InvalidPayload: ...` when a text payload carries a lone
-  surrogate (enforced at the adapter/mock layer, before the text crosses the boundary —
+  surrogate (enforced at the TS adapter layer, before the text crosses the boundary —
   wasm-bindgen's string conversion would otherwise silently corrupt it to U+FFFD).
-- `streamAppend` buffers a TRAILING lone high surrogate per stream (adapter/mock behavior: a
+- `streamAppend` buffers a TRAILING lone high surrogate per stream (adapter behavior: a
   producer chunking at fixed UTF-16 lengths can split a surrogate pair across chunks); the
   withheld code unit is prepended to the next chunk. A lone surrogate anywhere else in a
   chunk throws `InvalidPayload: ...` (and clears the stream's pending buffer).
@@ -888,3 +1067,55 @@ The full list:
 - **Perf-gate enforcement note** — CI gates the loose perf ceilings (`perf_smoke`,
   `stream_perf`); the 1ms contract budget stays a local trip-wire (`perf_baseline`,
   informational in CI). See "Performance budget".
+
+---
+
+# v0.5 changelog
+
+**The current version of this contract is v0.5** (M2 web-editor-beta dogfooding fixes). Same
+in-place convention: each item lives inline above, tagged "(v0.5 amendment)". The full list:
+
+- **`toggleTask` promotes instead of refusing** — `pos` outside any existing task item used to
+  return `null` unconditionally (a documented v1 limitation); it now promotes the line containing
+  `pos` into a task item — a non-task list item gets `"[ ] "` inserted after its marker, a plain
+  paragraph/blockquote-content line or a blank line gets a fresh `"- [ ] "` marker — matching
+  Obsidian's "Toggle checkbox status" behavior (research/07 §1.6). Still `null` on headings,
+  code/fence lines, thematic breaks, and other block kinds a checkbox makes no sense on. See
+  "`toggleTask` (v0.5 amendment — Obsidian parity)" under Commands.
+- **`setHeading` same-level press toggles back to a paragraph** — `setHeading(pos, N)` where the
+  line is already exactly level `N` used to no-op (`null`); it now removes the heading exactly
+  like level 0 does, making the toolbar's H1–H6 buttons idempotent presses. A different level
+  still replaces the prefix as before; level 0 is unchanged. See "`setHeading` (v0.4
+  clarifications, v0.5 amendment)" under Commands.
+
+---
+
+# v0.6 changelog
+
+**The current version of this contract is v0.6** (M2 web-editor-beta toolbar batch). Additive
+only — six new commands, no changes to any existing rule. Everything lives in the "v0.6
+commands" section under Commands; the headline decisions:
+
+- **`toggleQuote`** — stepped blockquote toggle (research/07 §2.2): add one `> ` level to every
+  intersecting line (blank lines included, keeping the quote contiguous), or remove ONE level
+  per press when every intersecting non-blank line is already quoted. Never `null`; structural
+  digit-rewrite guards preserve the itemness invariant in both directions.
+- **`toggleLink`** — wrap (`[text](` + `)`, cursor in the URL slot; empty range `[]()`, cursor
+  in the text slot) / unwrap (text survives; the URL is dropped — the documented round-trip
+  asymmetry; autolinks shed their `<`/`>`). Single-line only; code contexts refuse. View binds
+  Mod-k, always consuming the key.
+- **`toggleBulletList` / `toggleOrderedList`** — line-wise conversion with toggle semantics: an
+  all-target-flavor selection STRIPS back to plain lines (itemness-invariant exemption, like
+  `enter`'s marker-clear), anything else CONVERTS in place. Pinned decisions: task items are
+  bullet-flavor; converting to ordered strips task brackets; converting to bullet keeps them;
+  already-target lines (raw digits included) are never rewritten; written ordered markers get
+  sequential digits restarting at 1 per contiguous same-column run with delimiter/glyph
+  adoption; the below-line interruption guard carries over from indentList/outdentList.
+- **`insertHr`** — a thematic break after the line containing `pos`, with blank lines
+  guaranteed above and below so the dashes can never parse as a setext-H2 underline (the
+  paragraph-adjacent shape is pinned by a reparse-assertion test).
+- **`toggleCodeBlock`** — wrap the intersecting lines in backtick fences (length computed so
+  body lines can never close the fence early; selection lands inside the block) / remove both
+  fence lines of an intersected block. Quote context is a documented v1 `null` punt.
+- All six: one undo unit, origin `"command"`, UTF-16 arguments with the CRLF guard, and the
+  whole-document itemness invariant (with the strip exemption above).

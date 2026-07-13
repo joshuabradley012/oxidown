@@ -118,8 +118,12 @@ jobs:
   web:
     name: pnpm build + test
     runs-on: ubuntu-latest
-    # Needs the built wasm pkg so the JS suite's wasm conformance tests run
-    # against the real artifact instead of silently skipping.
+    # Needs the built wasm pkg (shared from the wasm job via
+    # upload/download-artifact rather than compiling Rust twice): the wasm
+    # core is the boundary contract's ONLY implementation, so the whole JS
+    # behavior suite (core-contract/conformance + the wasm-backed extension
+    # tests) runs against the real artifact and FAILS LOUDLY — never skips —
+    # when the pkg is missing (packages/oxidown-view-cm6/test/wasm-loader.ts).
     needs: wasm
     steps:
       - name: Checkout

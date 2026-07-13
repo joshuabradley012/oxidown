@@ -173,9 +173,13 @@ function isValidationRefusal(err: unknown): boolean {
 
 /**
  * Shared wrapper for every `core.command(...)` call site (Mod-b/i/Shift-x/e
- * toggles, Tab/Shift-Tab indent/outdent, Enter, and the checkbox widget's
- * click handler) — replaces four separately hand-rolled try/command/catch
- * blocks (a confirmed duplication).
+ * toggles, Tab/Shift-Tab indent/outdent, Enter, Mod-L/checkbox-widget
+ * toggleTask) — replaces four separately hand-rolled try/command/catch
+ * blocks (a confirmed duplication). Exported so a host can drive the exact
+ * same command → CoreChange → applyCoreChange path from something that
+ * isn't a keybinding at all — e.g. a toolbar button (see the web demo) —
+ * without re-implementing the validation-refusal/error-swallowing policy
+ * below.
  *
  * On a thrown exception this logs and SWALLOWS it rather than treating it as
  * a mirror-desync emergency: `command()` is transactional — planning
@@ -196,7 +200,7 @@ function isValidationRefusal(err: unknown): boolean {
  * distinctly from a legitimate `null`: never fall back to a default command
  * just because the core errored.
  */
-function runCoreCommand(
+export function runCoreCommand(
   name: string,
   invoke: () => CoreChange | null,
 ): { ok: true; change: CoreChange | null } | { ok: false } {
@@ -1160,12 +1164,13 @@ function commandKeymap(core: OxidownCore): Extension {
     applyCoreChange(view, outcome.change, "oxidown.command");
     return true;
   };
-  // Mod-Shift-Enter: keyboard path for the task-checkbox toggle (a11y — the
-  // widget's click handler must not be the only way to toggle). Same
-  // core.command("toggleTask") path as the checkbox click, targeted at the
-  // cursor's line (toggleTask resolves leniently from anywhere in the item).
-  // `null` (not a task line) falls through so a host binding may claim the
-  // key. Not bound by defaultKeymap (which uses Mod-Enter for
+  // Mod-Shift-Enter / Mod-L: two keyboard paths to the SAME task-checkbox
+  // toggle (a11y — the widget's click handler must not be the only way to
+  // toggle). Both go through core.command("toggleTask") targeted at the
+  // cursor's line (toggleTask resolves leniently from anywhere in the item,
+  // like the checkbox click). `null` (not a task line) falls through — see
+  // each binding below for what "falls through" means for that specific key.
+  // Mod-Shift-Enter is not bound by defaultKeymap (which uses Mod-Enter for
   // insertBlankLine) nor elsewhere in this file.
   const runToggleTask = (view: EditorView): boolean => {
     if (view.state.readOnly) return false;
@@ -1181,6 +1186,13 @@ function commandKeymap(core: OxidownCore): Extension {
     { key: "Mod-i", run: runToggle("toggleEm"), preventDefault: true },
     { key: "Mod-Shift-x", run: runToggle("toggleStrike"), preventDefault: true },
     { key: "Mod-e", run: runToggle("toggleCode"), preventDefault: true },
+    // Mod-k -> toggleLink (v0.6): the near-universal insert-link binding
+    // (Google Docs, Slack, GitHub, Obsidian). runToggle returns true even
+    // on a legitimate `null` (multi-line selection, code context), so the
+    // key is ALWAYS consumed — and `preventDefault: true` eats the
+    // browser's own Ctrl/Cmd-K default (Chrome/Firefox focus the search/
+    // address bar) regardless, same rationale as Mod-L above.
+    { key: "Mod-k", run: runToggle("toggleLink"), preventDefault: true },
     // Enter continues/exits list markers and quote prefixes through the core
     // (null → falls through to the default newline). No preventDefault: when
     // the binding declines (plain paragraph, composing), the event must stay
@@ -1205,6 +1217,21 @@ function commandKeymap(core: OxidownCore): Extension {
     { key: "Mod-[", run: runIndent("outdentList", indentLess), preventDefault: true },
     // Keyboard path for the task checkbox (see runToggleTask above).
     { key: "Mod-Shift-Enter", run: runToggleTask, preventDefault: true },
+    // Obsidian-parity shortcut for the same toggle (research/07 §1.6:
+    // Obsidian's default "Toggle checkbox status" hotkey since 1.0, moved off
+    // Mod-Enter to free that combo for link-opening). `preventDefault: true`
+    // is set on the BINDING itself (not returned by runToggleTask), so CM6
+    // eats the browser's default for this key regardless of whether
+    // toggleTask actually applies (runToggleTask still returns `false` on a
+    // legitimate `null`, per the same "doesn't apply here" convention every
+    // other command site uses — that only affects whether a LATER keymap
+    // layer gets a chance at the key, never the browser). This is
+    // deliberate: browsers reserve Cmd/Ctrl-L unconditionally for focusing
+    // the location/address bar, so if we only prevented default when the
+    // command actually produced a change, pressing Mod-L on a plain
+    // paragraph (or any non-task line) would leak the keystroke straight to
+    // the browser chrome instead of being silently consumed by the editor.
+    { key: "Mod-l", run: runToggleTask, preventDefault: true },
   ]);
 }
 
@@ -1212,13 +1239,32 @@ function commandKeymap(core: OxidownCore): Extension {
  * The core-driven command keymap:
  * - Mod-b / Mod-i / Mod-Shift-x / Mod-e toggle strong/em/strike/code over
  *   the current selection;
+ * - Mod-k wraps the selection as a link / unwraps an intersected link via
+ *   toggleLink (v0.6), always consuming the key (a `null` — multi-line
+ *   selection, code context — must not leak Ctrl/Cmd-K to the browser);
  * - Enter continues/exits list markers and quote prefixes (falling through
  *   to the default newline when neither applies);
  * - Tab / Shift-Tab and Mod-] / Mod-[ run marker-width-aware
  *   indentList/outdentList (falling back to CM6's indentMore/indentLess
  *   outside list context);
- * - Mod-Shift-Enter toggles the task checkbox on the cursor's line (the
- *   keyboard-accessible counterpart of the widget click).
+ * - Mod-Shift-Enter / Mod-L both toggle the task checkbox on the cursor's
+ *   line (Mod-Shift-Enter is the keyboard-accessible counterpart of the
+ *   widget click; Mod-L matches Obsidian's default "Toggle checkbox status"
+ *   hotkey — research/07 §1.6 — and unconditionally eats the browser's own
+ *   Cmd/Ctrl-L location-bar shortcut, applicable or not).
+ *
+ * **toggleTask on a non-task target (v0.5, Obsidian parity):** Obsidian's
+ * "Toggle checkbox status" run on a plain bullet CONVERTS it into a task
+ * item (research/07 §1.6) rather than no-op'ing, and `toggle_task`
+ * (crates/oxidown-core/src/commands.rs) now matches — see the module doc
+ * comment's "## toggleTask" section there, and docs/boundary-v0.md's
+ * `toggleTask` (v0.5 amendment) entry, for the exact promotion rules (a
+ * non-task list item, a plain paragraph/blockquote line, or a blank line
+ * all promote; headings/fences/hr stay `null`). Both bindings above need NO
+ * changes for this — they already forward whatever `core.command("toggleTask",
+ * pos)` returns, so a promotion CoreChange applies through the exact same
+ * `applyCoreChange` path a flip does.
+ *
  * Exported standalone so it can be composed elsewhere; included in
  * `oxidown()` by default.
  */
@@ -1239,7 +1285,8 @@ export function oxidownCommands(core: OxidownCore): Extension {
  *   Tab / Shift-Tab / Mod-] / Mod-[ to marker-width-aware list nesting,
  *   Enter to construct-aware list/quote continuation (single-press exit on
  *   empty items; plain paragraphs fall through to the default newline), and
- *   Mod-Shift-Enter to the task-checkbox toggle on the cursor's line.
+ *   Mod-Shift-Enter / Mod-L to the task-checkbox toggle on the cursor's line
+ *   (see oxidownCommands's doc comment for the non-task-item behavior).
  *
  * IMPORTANT: do NOT include CM6's own history extension
  * (`@codemirror/commands` `history()` / `historyKeymap`) alongside this one —

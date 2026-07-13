@@ -9,14 +9,12 @@
  * `WasmCoreInstance` that records what actually crosses the "boundary".
  *
  * The one exception to "without the wasm binary": the S6 probes at the
- * bottom pin the wasm layer's `decorations()` validation PRECEDENCE against
- * the mock's canonical order, which only means anything against the real
- * crate — they load `crates/oxidown-wasm/pkg` exactly like the conformance
- * suite (skip locally when unbuilt, mandatory in CI).
+ * bottom pin `decorations()`'s validation PRECEDENCE (the contract's pinned
+ * order — docs/boundary-v0.md "Error handling") against the real crate,
+ * loaded via test/wasm-loader.ts, which fails LOUDLY (naming
+ * `pnpm build:wasm`) when the pkg is missing; never a skip.
  */
 import { describe, expect, it } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import {
   StreamSurrogateBuffer,
   adaptWasmCore,
@@ -24,7 +22,7 @@ import {
   hasUnpairedSurrogate,
   splitTrailingHighSurrogate,
 } from "../src/wasm-core";
-import { MockCore } from "../src/mock-core";
+import { loadWasmCoreFactory } from "./wasm-loader";
 import type { CoreChange, OxidownCore } from "../src/protocol";
 
 const HIGH = "\uD83D"; // first half of 😀 (U+1F600 = D83D DE00)
@@ -322,70 +320,16 @@ describe("adaptWasmCore boundary guards (fake wasm instance)", () => {
 
 // ---------------------------------------------------------------------------
 // S6 probes: decorations() validation precedence against the REAL wasm crate.
-// The mock's order (mock-core.ts `decorations`) is canonical: malformed
-// revision → staleness → malformed from/to → range (from > to) → bounds on
-// `to` → selections payload (malformed, then per-selection bounds). The wasm
-// layer parses its selections JSON before calling into the core, so unless it
-// ALSO fronts the range/bounds checks (lib.rs `check_query_range`), a bad
-// selections payload would preempt an invalid range there — these probes run
-// the same call against both cores and pin the mock's answer. Loading mirrors
-// conformance.test.ts: initSync over the raw pkg bytes, local skip when the
-// pkg is unbuilt, mandatory under CI (which builds the pkg first — a silent
-// skip would let CI go green without the real binary).
+// The contract pins the order (docs/boundary-v0.md "Error handling", v0.4):
+// malformed revision → staleness → malformed from/to → range (from > to) →
+// bounds on `to` → selections payload (malformed, then per-selection bounds).
+// The wasm layer parses its selections JSON before calling into the core, so
+// unless it ALSO fronts the range/bounds checks (lib.rs `check_query_range`),
+// a bad selections payload would preempt an invalid range — these probes pin
+// the contract's answer against the real binary.
 // ---------------------------------------------------------------------------
 
-const REQUIRE_WASM = Boolean(process.env.CI);
-
-async function loadWasmFactory(): Promise<(() => OxidownCore) | null> {
-  const jsPath = fileURLToPath(
-    new URL("../../../crates/oxidown-wasm/pkg/oxidown_wasm.js", import.meta.url),
-  );
-  const wasmPath = fileURLToPath(
-    new URL("../../../crates/oxidown-wasm/pkg/oxidown_wasm_bg.wasm", import.meta.url),
-  );
-  if (!existsSync(jsPath) || !existsSync(wasmPath)) {
-    if (REQUIRE_WASM) {
-      throw new Error(
-        "[wasm-core-boundary] CI requires the wasm side: crates/oxidown-wasm/pkg is missing " +
-          "(build it with wasm-pack before running this suite)",
-      );
-    }
-    return null;
-  }
-  try {
-    const mod = (await import(/* @vite-ignore */ jsPath)) as {
-      initSync: (arg: { module: BufferSource }) => unknown;
-      OxidownCore: new () => Parameters<typeof adaptWasmCore>[0];
-    };
-    mod.initSync({ module: readFileSync(wasmPath) });
-    return () => adaptWasmCore(new mod.OxidownCore());
-  } catch (err) {
-    if (REQUIRE_WASM) {
-      throw new Error(
-        `[wasm-core-boundary] CI requires the wasm side: crates/oxidown-wasm/pkg is present but failed to load: ${String(err)}`,
-      );
-    }
-    console.log(
-      "[wasm-core-boundary] crates/oxidown-wasm/pkg present but failed to load — wasm probes skipped:",
-      err,
-    );
-    return null;
-  }
-}
-
-const wasmFactory = await loadWasmFactory();
-
-const probeCores: Array<[string, () => OxidownCore]> = [["MockCore", () => new MockCore()]];
-if (wasmFactory) {
-  probeCores.push(["WasmCore", wasmFactory]);
-} else {
-  console.log(
-    "[wasm-core-boundary] S6 wasm probes skipped (build crates/oxidown-wasm with wasm-pack to enable them)",
-  );
-  describe.skip("decorations validation precedence, S6 probes: WasmCore (pkg not built)", () => {
-    it("skipped — wasm pkg absent", () => {});
-  });
-}
+const makeWasmCore = await loadWasmCoreFactory();
 
 /** Run `fn`, expecting a throw; return the error message. */
 function thrownMessage(fn: () => unknown): string {
@@ -397,33 +341,31 @@ function thrownMessage(fn: () => unknown): string {
   throw new Error("expected the call to throw, but it returned");
 }
 
-for (const [coreName, makeCore] of probeCores) {
-  describe(`decorations validation precedence, S6 probes: ${coreName}`, () => {
-    const boot = (): { core: OxidownCore; rev: number } => {
-      const core = makeCore();
-      const rev = core.load("hello world"); // 11 UTF-16 code units
-      return { core, rev };
-    };
+describe("decorations validation precedence, S6 probes (wasm)", () => {
+  const boot = (): { core: OxidownCore; rev: number } => {
+    const core = makeWasmCore();
+    const rev = core.load("hello world"); // 11 UTF-16 code units
+    return { core, rev };
+  };
 
-    it("range check (from 9 > to 2) beats a MALFORMED selections payload", () => {
-      const { core, rev } = boot();
-      expect(thrownMessage(() => core.decorations(rev, 9, 2, [{ anchor: -1, head: 0 }]))).toBe(
-        "InvalidRange: from 9 > to 2",
-      );
-    });
-
-    it("bounds check on `to` beats a MALFORMED selections payload", () => {
-      const { core, rev } = boot();
-      expect(thrownMessage(() => core.decorations(rev, 0, 99, [{ anchor: -1, head: 0 }]))).toBe(
-        "OutOfBounds: position 99 beyond document length 11 (UTF-16 code units)",
-      );
-    });
-
-    it("range check beats an OUT-OF-BOUNDS selection", () => {
-      const { core, rev } = boot();
-      expect(thrownMessage(() => core.decorations(rev, 9, 2, [{ anchor: 99, head: 0 }]))).toBe(
-        "InvalidRange: from 9 > to 2",
-      );
-    });
+  it("range check (from 9 > to 2) beats a MALFORMED selections payload", () => {
+    const { core, rev } = boot();
+    expect(thrownMessage(() => core.decorations(rev, 9, 2, [{ anchor: -1, head: 0 }]))).toBe(
+      "InvalidRange: from 9 > to 2",
+    );
   });
-}
+
+  it("bounds check on `to` beats a MALFORMED selections payload", () => {
+    const { core, rev } = boot();
+    expect(thrownMessage(() => core.decorations(rev, 0, 99, [{ anchor: -1, head: 0 }]))).toBe(
+      "OutOfBounds: position 99 beyond document length 11 (UTF-16 code units)",
+    );
+  });
+
+  it("range check beats an OUT-OF-BOUNDS selection", () => {
+    const { core, rev } = boot();
+    expect(thrownMessage(() => core.decorations(rev, 9, 2, [{ anchor: 99, head: 0 }]))).toBe(
+      "InvalidRange: from 9 > to 2",
+    );
+  });
+});

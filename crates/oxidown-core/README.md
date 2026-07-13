@@ -240,14 +240,26 @@ enter the op log with origin `command`, never coalesce, and return
   go after that line's `> ` markers — and the SAME block gate applies to
   what sits after them: a quote-nested list item or thematic break refuses
   exactly like its top-level counterpart (`"> - item"` → `None`).
-  `setHeading(pos, level)` at the current level, and `level 0` on a
-  non-heading, are no-ops → `None` (no burned revision). `level 0` on a
-  heading deletes ALL delimiter spans — an ATX closing hash run included
-  (`"# foo #"` → `"foo"`). Level > 6 errors.
-- **toggleTask** accepts `pos` anywhere in the item (the parser records each
-  task item's full extent, multi-line items included) and flips exactly the
-  one checkbox byte (`[X]` also unchecks). Returns `selection: None` — a
-  1-for-1 byte swap never moves the cursor.
+  `level 0` on a non-heading is a no-op → `None` (no burned revision).
+  **A press at the line's CURRENT level toggles back to a paragraph**
+  (v0.5: was a no-op through v0.4) — same as `level 0`, deleting ALL
+  delimiter spans, an ATX closing hash run included (`"# foo #"` →
+  `"foo"`). Compared via the parsed heading node's own level, not a
+  byte-identical prefix match. A DIFFERENT level replaces the opening
+  delimiter as before. Level > 6 errors.
+- **toggleTask** accepts `pos` anywhere in an EXISTING task item (the parser
+  records each task item's full extent, multi-line items included) and
+  flips exactly the one checkbox byte (`[X]` also unchecks); returns
+  `selection: None` — a 1-for-1 byte swap never moves the cursor. **When
+  `pos` doesn't resolve inside an existing task item, it PROMOTES the line
+  instead of refusing** (v0.5, Obsidian parity — was `None` through v0.4):
+  a non-task list item (any depth, any quote depth) gets `"[ ] "` inserted
+  after its marker token; a plain paragraph/blockquote-content line or a
+  blank line (quote prefix preserved) gets a fresh `"- [ ] "` marker.
+  Still `None` on headings, code/fence lines, thematic breaks, and other
+  block kinds a checkbox makes no sense on — the same gate `setHeading`
+  uses. Promotion selection is after-biased (cursor stays with its
+  character, shifted past the inserted bytes).
 - Toggle from/to are strict positions (surrogate split errors — they lead to
   mutations); reversed ranges normalize; setHeading/toggleTask positions are
   query-like and floor-snap.

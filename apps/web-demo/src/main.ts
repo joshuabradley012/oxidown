@@ -1,13 +1,14 @@
 import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
-import { defaultKeymap } from "@codemirror/commands";
+import { defaultKeymap, indentLess, indentMore } from "@codemirror/commands";
 // NOTE: no history()/historyKeymap here — the Oxidown core is the historian.
 import {
   applyCoreChange,
-  MockCore,
   loadWasmCore,
   oxidown,
+  runCoreCommand,
   type OxidownCore,
+  type RangeCommandName,
 } from "@oxidown/view-cm6";
 import { SAMPLE_DOC, STREAM_TEXT, largeDocFiller } from "./sample-doc";
 import "./style.css";
@@ -58,14 +59,17 @@ function withTiming(core: OxidownCore, onSample: (s: PerfSample) => void): Oxido
     streamClose: (id) => core.streamClose(id),
 
     // Optional teardown: forwarded only when the wrapped core has one (the
-    // wasm adapter frees its wasm-bindgen instance; MockCore omits it), so
-    // this proxy's surface matches the wrapped core's exactly.
+    // wasm adapter frees its wasm-bindgen instance), so this proxy's surface
+    // matches the wrapped core's exactly.
     ...(core.destroy ? { destroy: () => core.destroy?.() } : {}),
   };
 }
 
 // ---------------------------------------------------------------------------
-// Core selection: ?core=wasm tries the wasm build, falls back to MockCore
+// Core loading: the wasm core is the ONLY core (the TypeScript MockCore is
+// retired). A stale `?core=wasm` in a bookmarked URL is harmless — the param
+// is simply never read. If the wasm pkg is missing or fails to instantiate,
+// the demo shows a clear error instead of silently degrading.
 // ---------------------------------------------------------------------------
 
 const banner = document.getElementById("core-banner")!;
@@ -76,22 +80,21 @@ const streamBtn = document.getElementById("stream-btn") as HTMLButtonElement;
 const stopStreamBtn = document.getElementById("stop-stream-btn") as HTMLButtonElement;
 const streamStatus = document.getElementById("stream-status")!;
 
-const wantWasm = new URLSearchParams(location.search).get("core") === "wasm";
-let rawCore: OxidownCore | null = null;
-if (wantWasm) {
-  rawCore = await loadWasmCore();
+const rawCore: OxidownCore | null = await loadWasmCore();
+if (!rawCore) {
+  banner.textContent = "core: FAILED to load wasm";
+  banner.classList.add("fallback");
+  const editorEl = document.getElementById("editor")!;
+  const error = document.createElement("div");
+  error.className = "load-error";
+  error.innerHTML =
+    "<strong>The Oxidown wasm core failed to load.</strong>" +
+    "<p>Build it with <code>pnpm build:wasm</code> (repo root) and reload. " +
+    "Details are in the browser console.</p>";
+  editorEl.appendChild(error);
+  throw new Error("[oxidown demo] wasm core failed to load — no editor created");
 }
-if (rawCore) {
-  banner.textContent = "core: wasm";
-} else {
-  rawCore = new MockCore();
-  if (wantWasm) {
-    banner.textContent = "core: mock (wasm unavailable — fell back)";
-    banner.classList.add("fallback");
-  } else {
-    banner.textContent = "core: mock (add ?core=wasm to try the wasm build)";
-  }
-}
+banner.textContent = "core: wasm";
 
 const fmt = (ms: number | null) => (ms === null ? "—" : `${ms.toFixed(2)}ms`);
 const core = withTiming(rawCore, (s) => {
@@ -123,6 +126,86 @@ if (import.meta.env.DEV) {
   (window as unknown as { __oxidownView?: EditorView }).__oxidownView = view;
   (window as unknown as { __oxidownCore?: OxidownCore }).__oxidownCore = core;
 }
+
+// ---------------------------------------------------------------------------
+// Toolbar: a compact discoverability layer over the SAME core commands the
+// keybindings already use. Every button goes through core.command +
+// applyCoreChange — runCoreCommand (exported by the package) wraps the
+// try/validation-refusal/apply policy shared with every keymap command site,
+// so this file never touches the document directly. Keyboard shortcuts stay
+// the source of truth; this is just a mouse-discoverable path to the exact
+// same behavior. Streaming never disables editing (see the streaming section
+// below), so the toolbar stays enabled while a stream is running too.
+// ---------------------------------------------------------------------------
+
+const toolbar = document.getElementById("toolbar")!;
+
+// Buttons must not steal focus from the editor: preventing the default
+// mousedown (before the click fires) is the standard pattern for widgets
+// that shouldn't move focus off the editor (see the task-checkbox widget's
+// own mousedown handler in extension.ts) — the click handler below still
+// runs normally.
+toolbar.addEventListener("mousedown", (event) => event.preventDefault());
+
+function runToggle(name: RangeCommandName) {
+  if (view.state.readOnly) return;
+  const { from, to } = view.state.selection.main;
+  const outcome = runCoreCommand(name, () => core.command(name, from, to));
+  if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
+}
+
+function runIndent(name: "indentList" | "outdentList") {
+  if (view.state.readOnly) return;
+  const { from, to } = view.state.selection.main;
+  const outcome = runCoreCommand(name, () => core.command(name, from, to));
+  if (!outcome.ok) return; // thrown: handled-and-ignored, like every other command site
+  if (outcome.change === null) {
+    // Same fallback semantics as the Tab/Shift-Tab keybinding: outside list
+    // context, fall back to CM6's own indentMore/indentLess.
+    (name === "indentList" ? indentMore : indentLess)(view);
+    return;
+  }
+  applyCoreChange(view, outcome.change, "oxidown.command");
+}
+
+function runToggleTaskBtn() {
+  if (view.state.readOnly) return;
+  const pos = view.state.selection.main.head;
+  const outcome = runCoreCommand("toggleTask", () => core.command("toggleTask", pos));
+  if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
+}
+
+function runSetHeading(level: 0 | 1 | 2 | 3 | 4 | 5 | 6) {
+  if (view.state.readOnly) return;
+  const pos = view.state.selection.main.head;
+  const outcome = runCoreCommand("setHeading", () => core.command("setHeading", pos, level));
+  if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
+}
+
+function runInsertHr() {
+  if (view.state.readOnly) return;
+  const pos = view.state.selection.main.head;
+  const outcome = runCoreCommand("insertHr", () => core.command("insertHr", pos));
+  if (outcome.ok && outcome.change) applyCoreChange(view, outcome.change, "oxidown.command");
+}
+
+toolbar.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest("button");
+  if (!button) return;
+  if (button.dataset.toggle) {
+    runToggle(button.dataset.toggle as RangeCommandName);
+  } else if (button.dataset.heading !== undefined) {
+    runSetHeading(Number(button.dataset.heading) as 0 | 1 | 2 | 3 | 4 | 5 | 6);
+  } else if ("task" in button.dataset) {
+    runToggleTaskBtn();
+  } else if (button.dataset.indent) {
+    runIndent(button.dataset.indent as "indentList" | "outdentList");
+  } else if ("hr" in button.dataset) {
+    runInsertHr();
+  }
+  // Whatever ran above, keep typing focus in the editor.
+  view.focus();
+});
 
 // Source-mode toggle: swap out live-preview decorations; document syncing and
 // core-driven undo/redo keep working (the plugin re-attaches without reloading
@@ -158,7 +241,6 @@ loadLargeBtn.addEventListener("click", () => {
 // stream keeps appending exactly where it left off — every CoreChange the
 // core returns is applied via applyCoreChange with no explicit selection,
 // so CM6 maps your existing cursor through the change instead of moving it.
-// This works identically against MockCore and (once built) the wasm core.
 // ---------------------------------------------------------------------------
 
 function randInt(min: number, max: number): number {

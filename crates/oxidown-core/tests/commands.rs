@@ -90,19 +90,39 @@ fn assert_enter_itemness(before: &str, after: &str, splices: &[Splice], from: us
 /// Run a command and verify the returned splices transform the mirror into
 /// the core's text (the "splices are what the VIEW needs" requirement).
 ///
-/// For indentList/outdentList this additionally asserts the WHOLE-DOCUMENT
-/// itemness invariant — the acceptance bar for the paragraph-interruption
-/// guards: every line that parsed as a list item BEFORE the command still
-/// parses as a list item AFTER it (marker digits may differ; itemness may
-/// not). Neither command adds or removes lines, so line indices correspond.
+/// For indentList/outdentList/toggleTask this additionally asserts the
+/// WHOLE-DOCUMENT itemness invariant — for indent/outdent it's the
+/// acceptance bar for the paragraph-interruption guards (every line that
+/// parsed as a list item BEFORE the command still parses as one AFTER it;
+/// marker digits may differ, itemness may not); for toggleTask (v0.5
+/// promotion) it's the corresponding "promotions only ADD itemness" bar —
+/// no line that was already an item loses it. None of the three commands
+/// add or remove PHYSICAL LINES, so line indices correspond before/after.
 fn run(ed: &mut Editor, cmd: Command) -> Option<CoreChange> {
     let before_text = ed.get_text();
     let mut mirror = before_text.clone();
-    let is_nest = matches!(
+    let checks_itemness = matches!(
         cmd,
-        Command::IndentList { .. } | Command::OutdentList { .. }
+        Command::IndentList { .. }
+            | Command::OutdentList { .. }
+            | Command::ToggleTask { .. }
+            | Command::ToggleQuote { .. }
+            | Command::ToggleBulletList { .. }
+            | Command::ToggleOrderedList { .. }
     );
-    let items_before = is_nest.then(|| item_line_indices(&mirror));
+    // The list toggles' STRIP mode de-lists the selected lines by explicit
+    // gesture (boundary v0.6, same rationale as enter's marker-clear), so
+    // intersecting lines are exempt from the invariant; every line the
+    // command does NOT touch must keep its itemness (the below-line guard's
+    // acceptance bar). toggleQuote has no exemption: quoting/de-quoting
+    // must never cost any line its itemness.
+    let exempt: Vec<usize> = match cmd {
+        Command::ToggleBulletList { from, to } | Command::ToggleOrderedList { from, to } => {
+            intersecting_line_index_set(&before_text, from.min(to), from.max(to))
+        }
+        _ => Vec::new(),
+    };
+    let items_before = checks_itemness.then(|| item_line_indices(&mirror));
     let change = ed.command(cmd).unwrap()?;
     apply_to_mirror(&mut mirror, &change.splices);
     assert_eq!(
@@ -114,6 +134,9 @@ fn run(ed: &mut Editor, cmd: Command) -> Option<CoreChange> {
     if let Some(before) = items_before {
         let after = item_line_indices(&ed.get_text());
         for line in before {
+            if exempt.contains(&line) {
+                continue;
+            }
             assert!(
                 after.contains(&line),
                 "whole-doc invariant violated by {cmd:?}: line {line} was a list item \
@@ -126,6 +149,44 @@ fn run(ed: &mut Editor, cmd: Command) -> Option<CoreChange> {
         assert_enter_itemness(&before_text, &ed.get_text(), &change.splices, from.min(to));
     }
     Some(change)
+}
+
+/// 0-based indices of the physical lines intersecting `[from, to]`
+/// (byte == UTF-16 offsets for the ASCII fixtures), CM6 semantics like the
+/// core's own `intersecting_lines`: a cursor yields its containing line; a
+/// non-empty range excludes a trailing line touched only at its very start.
+fn intersecting_line_index_set(text: &str, from: usize, to: usize) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut line_no = 0usize;
+    loop {
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != b'\n' && bytes[end] != b'\r' {
+            end += 1;
+        }
+        let hit = if from == to {
+            from >= start && from <= end
+        } else {
+            from <= end && to > start
+        };
+        if hit {
+            out.push(line_no);
+        }
+        let mut next = end;
+        if next < bytes.len() && bytes[next] == b'\r' {
+            next += 1;
+        }
+        if next < bytes.len() && bytes[next] == b'\n' {
+            next += 1;
+        }
+        if next == end {
+            break; // no terminator: the document's last line
+        }
+        start = next;
+        line_no += 1;
+    }
+    out
 }
 
 // ------------------------------------------------------------ toggles --
@@ -668,6 +729,12 @@ fn command_positions_splitting_a_crlf_pair_are_refused() {
         Command::IndentList { from: 3, to: 3 },
         Command::OutdentList { from: 3, to: 3 },
         Command::Enter { from: 3, to: 3 },
+        Command::ToggleQuote { from: 3, to: 6 },
+        Command::ToggleLink { from: 0, to: 3 },
+        Command::ToggleBulletList { from: 3, to: 3 },
+        Command::ToggleOrderedList { from: 3, to: 3 },
+        Command::InsertHr { pos: 3 },
+        Command::ToggleCodeBlock { from: 3, to: 3 },
     ] {
         let err = ed.command(cmd).unwrap_err();
         assert_eq!(err.name(), "InvalidArgument", "{cmd:?}");
@@ -714,12 +781,45 @@ fn set_heading_zero_removes_prefix() {
 }
 
 #[test]
-fn set_heading_same_level_is_noop_null() {
+fn set_heading_same_level_toggles_back_to_paragraph() {
+    // Bug 2 (v0.5 amendment): pressing the SAME heading level again removes
+    // the heading instead of no-op'ing, exactly like level 0 — an idempotent
+    // toolbar press, matching Obsidian's toggle behavior.
+    for level in 1u8..=6 {
+        let prefix = "#".repeat(level as usize);
+        let doc = format!("{prefix} title\n");
+        let mut ed = Editor::new(1);
+        ed.load(&doc);
+        let pos = prefix.len() + 1; // inside "title"
+        run(&mut ed, Command::SetHeading { pos, level }).unwrap();
+        assert_eq!(ed.get_text(), "title\n", "level {level}");
+    }
+}
+
+#[test]
+fn set_heading_same_level_toggle_is_irregular_whitespace_tolerant() {
+    // The same-level comparison reads the parsed `Heading` node's own level,
+    // not a byte-identical prefix match — an irregular "##  x" (extra inner
+    // space, only the FIRST of which is the delimiter's required space)
+    // still counts as "already level 2" and toggles back (the delimiter
+    // span itself — "## " — is removed; the extra space is content, same as
+    // the pre-existing level-0 removal path, and stays).
+    let mut ed = Editor::new(1);
+    ed.load("##  x\n");
+    run(&mut ed, Command::SetHeading { pos: 4, level: 2 }).unwrap();
+    assert_eq!(ed.get_text(), " x\n");
+}
+
+#[test]
+fn set_heading_different_level_still_replaces_not_toggles() {
+    // Control: a DIFFERENT level always replaces the prefix (never treated
+    // as a toggle-back), same as before this change.
     let mut ed = Editor::new(1);
     ed.load("## title\n");
     let rev = ed.revision();
-    assert!(ed.command(Command::SetHeading { pos: 4, level: 2 }).unwrap().is_none());
-    assert_eq!(ed.revision(), rev, "no-op must not burn a revision");
+    run(&mut ed, Command::SetHeading { pos: 4, level: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "### title\n");
+    assert_ne!(ed.revision(), rev);
 }
 
 #[test]
@@ -915,12 +1015,113 @@ fn toggle_task_capital_x_unchecks() {
     assert_eq!(ed.get_text(), "- [ ] done\n");
 }
 
+// ------------------------------------------------- toggleTask promotion --
+// Bug 1 (v0.5 amendment): toggleTask on a non-task target now PROMOTES
+// instead of refusing (Obsidian parity, research/07 §1.6). `run()` also
+// asserts the whole-doc itemness invariant for every case here — a
+// promotion may ADD itemness to the target line, but must never cost any
+// OTHER line its own.
+
 #[test]
-fn toggle_task_outside_any_task_is_null() {
+fn toggle_task_promotes_a_plain_bullet_and_ordered_item() {
     let mut ed = Editor::new(1);
-    ed.load("- plain item\n\nparagraph\n");
-    assert!(ed.command(Command::ToggleTask { pos: 3 }).unwrap().is_none());
-    assert!(ed.command(Command::ToggleTask { pos: 16 }).unwrap().is_none());
+    ed.load("- plain item\n");
+    run(&mut ed, Command::ToggleTask { pos: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] plain item\n");
+
+    let mut ed = Editor::new(1);
+    ed.load("1. plain item\n");
+    run(&mut ed, Command::ToggleTask { pos: 4 }).unwrap();
+    assert_eq!(ed.get_text(), "1. [ ] plain item\n");
+}
+
+#[test]
+fn toggle_task_promotes_a_nested_bullet_without_disturbing_the_parent() {
+    let mut ed = Editor::new(1);
+    ed.load("- parent\n  - child\n");
+    run(&mut ed, Command::ToggleTask { pos: 14 }).unwrap();
+    assert_eq!(ed.get_text(), "- parent\n  - [ ] child\n");
+}
+
+#[test]
+fn toggle_task_promotes_a_quoted_bullet() {
+    let mut ed = Editor::new(1);
+    ed.load("> - item\n");
+    run(&mut ed, Command::ToggleTask { pos: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "> - [ ] item\n");
+}
+
+#[test]
+fn toggle_task_promotes_a_plain_paragraph() {
+    let mut ed = Editor::new(1);
+    ed.load("paragraph\n");
+    run(&mut ed, Command::ToggleTask { pos: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] paragraph\n");
+}
+
+#[test]
+fn toggle_task_promotes_a_quoted_paragraph_preserving_the_prefix() {
+    let mut ed = Editor::new(1);
+    ed.load("> quoted text\n");
+    run(&mut ed, Command::ToggleTask { pos: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "> - [ ] quoted text\n");
+}
+
+#[test]
+fn toggle_task_promotes_a_blank_line() {
+    // Obsidian promotes a blank line rather than no-op'ing — more permissive
+    // than setHeading's own blank-line refusal (deliberate, v0.5).
+    let mut ed = Editor::new(1);
+    ed.load("a\n\nb\n");
+    run(&mut ed, Command::ToggleTask { pos: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "a\n- [ ] \nb\n");
+}
+
+#[test]
+fn toggle_task_promotes_an_empty_document() {
+    let mut ed = Editor::new(1);
+    ed.load("");
+    run(&mut ed, Command::ToggleTask { pos: 0 }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] ");
+}
+
+#[test]
+fn toggle_task_still_null_on_heading_fence_and_hr() {
+    for (doc, pos) in [("# heading\n", 3usize), ("```\ncode\n```\n", 5), ("---\n", 1)] {
+        let mut ed = Editor::new(1);
+        ed.load(doc);
+        let rev = ed.revision();
+        assert!(
+            ed.command(Command::ToggleTask { pos }).unwrap().is_none(),
+            "{doc:?}"
+        );
+        assert_eq!(ed.get_text(), doc, "no mutation for {doc:?}");
+        assert_eq!(ed.revision(), rev, "no revision bump for {doc:?}");
+    }
+}
+
+#[test]
+fn toggle_task_promotion_is_a_single_undo_unit() {
+    let mut ed = Editor::new(1);
+    ed.load("- plain item\n");
+    run(&mut ed, Command::ToggleTask { pos: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] plain item\n");
+    ed.undo().unwrap();
+    assert_eq!(ed.get_text(), "- plain item\n", "undo restores the plain bullet in one step");
+}
+
+#[test]
+fn toggle_task_promotion_maps_selection_to_stay_with_its_character() {
+    // Bias::After: the insertion always lands at/before `pos`, so the
+    // character immediately after the (collapsed) cursor is unchanged —
+    // typing right where the user clicked still lands in "item", not
+    // stranded between the new marker and the new checkbox.
+    let mut ed = Editor::new(1);
+    ed.load("- item\n");
+    let change = ed.command(Command::ToggleTask { pos: 2 }).unwrap().unwrap();
+    assert_eq!(ed.get_text(), "- [ ] item\n");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (6, 6), "cursor lands right before \"item\"");
 }
 
 #[test]
@@ -2045,4 +2246,666 @@ fn user_sequence_outdent_twice_then_indent_twice_on_the_nested_task() {
         ed.get_text(),
         "1. ordered one\n2. ordered two\n   1. nested ordered item\n   - a bullet nested under an ordered item\n     - [x] a task nested under an ordered item\n1. ordered three\n"
     );
+}
+
+// -------------------------------------------------- toggleQuote (v0.6) --
+
+#[test]
+fn toggle_quote_adds_one_level_to_a_plain_paragraph() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha");
+    let change = run(&mut ed, Command::ToggleQuote { from: 2, to: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "> alpha");
+    // Cursor glued to its character: shifted right by the inserted marker.
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (4, 4));
+}
+
+#[test]
+fn toggle_quote_add_covers_blank_lines_to_keep_the_quote_contiguous() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha\n\nbeta");
+    run(&mut ed, Command::ToggleQuote { from: 0, to: 11 }).unwrap();
+    assert_eq!(ed.get_text(), "> alpha\n> \n> beta");
+    // One contiguous quote: every line is a depth-1 BlockQuoteLine.
+    let quoted = ed
+        .overlay_nodes()
+        .iter()
+        .filter(|n| matches!(n.kind, oxidown_core::parser::NodeKind::BlockQuoteLine(1)))
+        .count();
+    assert_eq!(quoted, 3);
+}
+
+#[test]
+fn toggle_quote_removes_one_level_when_every_line_is_quoted() {
+    let mut ed = Editor::new(1);
+    ed.load("> alpha\n> beta");
+    run(&mut ed, Command::ToggleQuote { from: 0, to: 14 }).unwrap();
+    assert_eq!(ed.get_text(), "alpha\nbeta");
+}
+
+#[test]
+fn toggle_quote_remove_is_stepped_one_level_per_press() {
+    let mut ed = Editor::new(1);
+    ed.load("> > alpha");
+    run(&mut ed, Command::ToggleQuote { from: 5, to: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "> alpha", "first press: innermost level only");
+    run(&mut ed, Command::ToggleQuote { from: 3, to: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "alpha", "second press: back to plain");
+}
+
+#[test]
+fn toggle_quote_mixed_selection_adds_a_level_to_every_line() {
+    // "beta" is its own paragraph (the blank line ends the quote — a
+    // directly-adjacent unmarked line would be a LAZY CONTINUATION, i.e.
+    // already quoted, and the press would step the quote down instead).
+    let mut ed = Editor::new(1);
+    ed.load("> alpha\n\nbeta");
+    run(&mut ed, Command::ToggleQuote { from: 0, to: 13 }).unwrap();
+    assert_eq!(ed.get_text(), "> > alpha\n> \n> beta");
+}
+
+#[test]
+fn toggle_quote_add_and_remove_round_trip_on_lists_and_headings() {
+    let mut ed = Editor::new(1);
+    let original = "- item\n# head";
+    ed.load(original);
+    run(&mut ed, Command::ToggleQuote { from: 0, to: 13 }).unwrap();
+    assert_eq!(ed.get_text(), "> - item\n> # head");
+    // The quoted constructs survive the round trip byte-identically.
+    let len = ed.doc_len_utf16();
+    run(&mut ed, Command::ToggleQuote { from: 0, to: len }).unwrap();
+    assert_eq!(ed.get_text(), original);
+}
+
+#[test]
+fn toggle_quote_remove_skips_lazy_continuation_lines() {
+    // "lazy" carries quote depth 1 but no marker run of its own; the press
+    // unwinds only the marked line and leaves the lazy line's bytes alone.
+    let mut ed = Editor::new(1);
+    ed.load("> alpha\nlazy");
+    run(&mut ed, Command::ToggleQuote { from: 0, to: 12 }).unwrap();
+    assert_eq!(ed.get_text(), "alpha\nlazy");
+}
+
+#[test]
+fn toggle_quote_all_lazy_selection_is_an_applies_but_no_op() {
+    let mut ed = Editor::new(1);
+    ed.load("> alpha\nlazy");
+    let rev = ed.revision();
+    let (undo_before, _) = ed.history_depths();
+    // The lazy line alone: quoted (depth 1) but marker-less.
+    let change = run(&mut ed, Command::ToggleQuote { from: 9, to: 9 }).unwrap();
+    assert!(change.splices.is_empty());
+    assert_eq!(ed.revision(), rev, "no revision bump for the no-op");
+    assert_eq!(ed.history_depths().0, undo_before, "no undo unit for the no-op");
+}
+
+#[test]
+fn toggle_quote_add_rewrites_the_below_ordered_sibling_it_recontexted() {
+    // Quoting "2. b" interrupts the list; "3. c" directly below would be
+    // lazy-continuation text of the quote's open paragraph (a non-1 ordered
+    // marker cannot start a list there) — the guard rewrites it to "1." so
+    // its itemness survives (run() asserts the whole-document invariant).
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n2. b\n3. c");
+    run(&mut ed, Command::ToggleQuote { from: 6, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n> 2. b\n1. c");
+}
+
+#[test]
+fn toggle_quote_add_below_guard_skips_when_a_blank_line_separates() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha\n\n3. c");
+    run(&mut ed, Command::ToggleQuote { from: 2, to: 2 }).unwrap();
+    // The blank line stops the scan: "3. c" starts its own list regardless.
+    assert_eq!(ed.get_text(), "> alpha\n\n3. c");
+}
+
+#[test]
+fn toggle_quote_remove_rewrites_a_dequoted_non_one_ordered_item_that_no_longer_joins() {
+    // De-quoting "2. b" alone drops it after the remaining quote's open
+    // paragraph, where a non-1 ordered marker cannot start a list — the
+    // digits rewrite to 1 (the moved line is the user's own gesture target,
+    // same contract as outdentList's interruption rewrite).
+    let mut ed = Editor::new(1);
+    ed.load("> 1. a\n> 2. b");
+    run(&mut ed, Command::ToggleQuote { from: 9, to: 9 }).unwrap();
+    assert_eq!(ed.get_text(), "> 1. a\n1. b");
+}
+
+#[test]
+fn toggle_quote_remove_keeps_digits_when_the_dequoted_run_moves_together() {
+    let mut ed = Editor::new(1);
+    ed.load("> 1. a\n> 2. b");
+    run(&mut ed, Command::ToggleQuote { from: 0, to: 13 }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n2. b", "the whole run de-quotes: b still joins a");
+}
+
+#[test]
+fn toggle_quote_is_a_single_undo_unit() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha\nbeta");
+    run(&mut ed, Command::ToggleQuote { from: 0, to: 10 }).unwrap();
+    assert_eq!(ed.get_text(), "> alpha\n> beta");
+    ed.undo().unwrap();
+    assert_eq!(ed.get_text(), "alpha\nbeta", "one undo restores every line");
+}
+
+// --------------------------------------------------- toggleLink (v0.6) --
+
+#[test]
+fn toggle_link_wraps_a_selection_with_the_cursor_in_the_url_slot() {
+    let mut ed = Editor::new(1);
+    ed.load("hello world");
+    let change = run(&mut ed, Command::ToggleLink { from: 6, to: 11 }).unwrap();
+    assert_eq!(ed.get_text(), "hello [world]()");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (14, 14), "cursor between the parens");
+}
+
+#[test]
+fn toggle_link_empty_range_inserts_the_skeleton_with_the_cursor_in_the_text_slot() {
+    let mut ed = Editor::new(1);
+    ed.load("ab");
+    let change = run(&mut ed, Command::ToggleLink { from: 1, to: 1 }).unwrap();
+    assert_eq!(ed.get_text(), "a[]()b");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (2, 2), "cursor between the brackets");
+}
+
+#[test]
+fn toggle_link_unwraps_an_intersected_link_keeping_the_text() {
+    let mut ed = Editor::new(1);
+    ed.load("see [docs](https://x.y) now");
+    let change = run(&mut ed, Command::ToggleLink { from: 6, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "see docs now");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (4, 8), "selection covers the surviving text");
+}
+
+#[test]
+fn toggle_link_unwraps_an_autolink_keeping_the_destination_text() {
+    let mut ed = Editor::new(1);
+    ed.load("go <https://x.y> now");
+    let change = run(&mut ed, Command::ToggleLink { from: 5, to: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "go https://x.y now");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (3, 14));
+}
+
+#[test]
+fn toggle_link_multi_line_range_is_null() {
+    let mut ed = Editor::new(1);
+    ed.load("ab\ncd");
+    assert!(ed.command(Command::ToggleLink { from: 0, to: 4 }).unwrap().is_none());
+    assert_eq!(ed.get_text(), "ab\ncd", "no mutation");
+}
+
+#[test]
+fn toggle_link_refuses_code_contexts() {
+    let mut ed = Editor::new(1);
+    ed.load("`code`");
+    // Endpoint strictly inside the code span's extent.
+    assert!(ed.command(Command::ToggleLink { from: 2, to: 4 }).unwrap().is_none());
+    ed.load("```\nbody\n```");
+    // Range touching a fenced-code line.
+    assert!(ed.command(Command::ToggleLink { from: 5, to: 7 }).unwrap().is_none());
+}
+
+#[test]
+fn toggle_link_wrap_then_unwrap_round_trips_the_text() {
+    let mut ed = Editor::new(1);
+    ed.load("hello world");
+    run(&mut ed, Command::ToggleLink { from: 6, to: 11 }).unwrap();
+    assert_eq!(ed.get_text(), "hello [world]()");
+    // Second toggle from inside the link unwraps (URL slot is empty — the
+    // documented asymmetry: the wrap can't restore a URL the unwrap threw
+    // away, but the TEXT round-trips byte-identically).
+    run(&mut ed, Command::ToggleLink { from: 8, to: 8 }).unwrap();
+    assert_eq!(ed.get_text(), "hello world");
+}
+
+#[test]
+fn toggle_link_is_a_single_undo_unit() {
+    let mut ed = Editor::new(1);
+    ed.load("hello world");
+    run(&mut ed, Command::ToggleLink { from: 6, to: 11 }).unwrap();
+    ed.undo().unwrap();
+    assert_eq!(ed.get_text(), "hello world");
+}
+
+// ------------------------------- toggleBulletList / toggleOrderedList --
+
+#[test]
+fn toggle_bullet_converts_plain_lines() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha\nbeta");
+    let change = run(&mut ed, Command::ToggleBulletList { from: 0, to: 10 }).unwrap();
+    assert_eq!(ed.get_text(), "- alpha\n- beta");
+    // Selection glued: both endpoints shifted right by their line's marker.
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (2, 14));
+}
+
+#[test]
+fn toggle_bullet_strips_an_all_bullet_selection_back_to_plain_lines() {
+    let mut ed = Editor::new(1);
+    ed.load("- alpha\n- beta");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 14 }).unwrap();
+    assert_eq!(ed.get_text(), "alpha\nbeta", "explicit de-listing gesture");
+}
+
+#[test]
+fn toggle_bullet_strip_removes_task_brackets_too() {
+    // Task items are bullet-flavor, so an all-task selection STRIPS —
+    // marker, brackets, and the whitespace between them all go.
+    let mut ed = Editor::new(1);
+    ed.load("- [ ] a\n- [x] b");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 15 }).unwrap();
+    assert_eq!(ed.get_text(), "a\nb");
+}
+
+#[test]
+fn toggle_bullet_strip_removes_nested_leading_indent() {
+    // Leaving 4+ leading spaces behind would re-type the line as indented
+    // code — strip produces genuinely plain lines at any depth.
+    let mut ed = Editor::new(1);
+    ed.load("- a\n    - deep");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 14 }).unwrap();
+    assert_eq!(ed.get_text(), "a\ndeep");
+}
+
+#[test]
+fn toggle_bullet_converts_ordered_items_in_place() {
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n2. b");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 9 }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n- b");
+}
+
+#[test]
+fn toggle_bullet_keeps_task_brackets_when_converting_an_ordered_task() {
+    // Pinned decision: ordered task -> bullet stays a task (now
+    // bullet-flavored); only conversions TO ordered strip brackets.
+    let mut ed = Editor::new(1);
+    ed.load("1. [ ] a");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 8 }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] a");
+}
+
+#[test]
+fn toggle_bullet_mixed_selection_converts_only_the_non_bullet_lines() {
+    let mut ed = Editor::new(1);
+    ed.load("- a\nplain\n1. c");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 14 }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n- plain\n- c");
+}
+
+#[test]
+fn toggle_bullet_adopts_the_runs_bullet_glyph() {
+    // "*" siblings get "*" (a different bullet char would split the list
+    // per CommonMark).
+    let mut ed = Editor::new(1);
+    ed.load("* a\nplain");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 9 }).unwrap();
+    assert_eq!(ed.get_text(), "* a\n* plain");
+}
+
+#[test]
+fn toggle_ordered_converts_plain_lines_with_sequential_digits() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha\nbeta\ngamma");
+    run(&mut ed, Command::ToggleOrderedList { from: 0, to: 16 }).unwrap();
+    assert_eq!(ed.get_text(), "1. alpha\n2. beta\n3. gamma");
+}
+
+#[test]
+fn toggle_ordered_strips_an_all_ordered_selection() {
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n2. b");
+    run(&mut ed, Command::ToggleOrderedList { from: 0, to: 9 }).unwrap();
+    assert_eq!(ed.get_text(), "a\nb");
+}
+
+#[test]
+fn toggle_ordered_replaces_bullet_markers_in_place_keeping_indent() {
+    let mut ed = Editor::new(1);
+    ed.load("- a\n- b");
+    run(&mut ed, Command::ToggleOrderedList { from: 0, to: 7 }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n2. b");
+}
+
+#[test]
+fn toggle_ordered_strips_task_brackets_when_converting() {
+    // Pinned decision: converting to ordered strips the checkbox.
+    let mut ed = Editor::new(1);
+    ed.load("- [ ] a\n- [x] b");
+    run(&mut ed, Command::ToggleOrderedList { from: 0, to: 15 }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n2. b");
+}
+
+#[test]
+fn toggle_ordered_all_ordered_task_selection_strips() {
+    // An ordered task is ordered-flavor, so the toggle semantics see an
+    // all-target selection and STRIP (marker + brackets).
+    let mut ed = Editor::new(1);
+    ed.load("1. [ ] a");
+    run(&mut ed, Command::ToggleOrderedList { from: 0, to: 8 }).unwrap();
+    assert_eq!(ed.get_text(), "a");
+}
+
+#[test]
+fn toggle_ordered_numbering_restarts_per_contiguous_run() {
+    let mut ed = Editor::new(1);
+    ed.load("a\nb\n\nc");
+    run(&mut ed, Command::ToggleOrderedList { from: 0, to: 6 }).unwrap();
+    // The blank line passes through untouched and breaks the run.
+    assert_eq!(ed.get_text(), "1. a\n2. b\n\n1. c");
+}
+
+#[test]
+fn toggle_ordered_untouched_lines_feed_the_counter_and_delimiter() {
+    // Already-ordered lines keep their raw digits (never-rewrite) but the
+    // run adopts value+1 and the ')' flavor so written markers JOIN.
+    let mut ed = Editor::new(1);
+    ed.load("3) a\nplain");
+    run(&mut ed, Command::ToggleOrderedList { from: 0, to: 10 }).unwrap();
+    assert_eq!(ed.get_text(), "3) a\n4) plain");
+}
+
+#[test]
+fn toggle_ordered_seeds_from_the_item_directly_above_the_selection() {
+    let mut ed = Editor::new(1);
+    ed.load("1. a\nplain");
+    run(&mut ed, Command::ToggleOrderedList { from: 6, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n2. plain", "mid-list conversion reads sequentially");
+}
+
+#[test]
+fn toggle_ordered_inside_a_quote_goes_after_the_prefix() {
+    let mut ed = Editor::new(1);
+    ed.load("> alpha\n> beta");
+    run(&mut ed, Command::ToggleOrderedList { from: 0, to: 14 }).unwrap();
+    assert_eq!(ed.get_text(), "> 1. alpha\n> 2. beta");
+}
+
+#[test]
+fn toggle_bullet_on_a_quoted_list_replaces_markers_in_place() {
+    let mut ed = Editor::new(1);
+    ed.load("> 1. a\n> 2. b");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 13 }).unwrap();
+    assert_eq!(ed.get_text(), "> - a\n> - b");
+}
+
+#[test]
+fn toggle_ordered_strip_rewrites_the_below_sibling_it_recontexted() {
+    // Stripping "1. a\n2. b" leaves plain text; "3. c" below cannot start a
+    // list in paragraph-interruption position — the guard rewrites it to
+    // "1." (run() asserts its itemness survives).
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n2. b\n3. c");
+    run(&mut ed, Command::ToggleOrderedList { from: 0, to: 9 }).unwrap();
+    assert_eq!(ed.get_text(), "a\nb\n1. c");
+}
+
+#[test]
+fn toggle_bullet_convert_rewrites_the_below_ordered_sibling() {
+    // Re-flavoring "1. a\n2. b" to bullets closes the ordered list; the
+    // unaffected "3. c" no longer joins and rewrites to "1.".
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n2. b\n3. c");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 9 }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n- b\n1. c");
+}
+
+#[test]
+fn toggle_list_below_guard_skips_when_a_blank_line_separates() {
+    let mut ed = Editor::new(1);
+    ed.load("1. a\n\n3. c");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 4 }).unwrap();
+    assert_eq!(ed.get_text(), "- a\n\n3. c", "blank line already anchors the list below");
+}
+
+#[test]
+fn toggle_ordered_below_guard_no_rewrite_when_the_sibling_still_joins() {
+    // Converting "plain" between "1. a" and "3. c" leaves one contiguous
+    // ordered run — "3. c" joins it (same column, same delimiter), so its
+    // digits stay untouched.
+    let mut ed = Editor::new(1);
+    ed.load("1. a\nplain\n3. c");
+    run(&mut ed, Command::ToggleOrderedList { from: 6, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n2. plain\n3. c");
+}
+
+#[test]
+fn toggle_list_passes_fenced_code_lines_through_untouched() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha\n```\ncode\n```\nbeta");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 23 }).unwrap();
+    assert_eq!(ed.get_text(), "- alpha\n```\ncode\n```\n- beta");
+}
+
+#[test]
+fn toggle_list_is_null_when_nothing_is_convertible() {
+    let mut ed = Editor::new(1);
+    ed.load("```\ncode\n```");
+    assert!(ed
+        .command(Command::ToggleBulletList { from: 5, to: 5 })
+        .unwrap()
+        .is_none());
+    ed.load("\n\n");
+    assert!(ed
+        .command(Command::ToggleOrderedList { from: 0, to: 1 })
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn toggle_bullet_then_toggle_again_round_trips_plain_text() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha\nbeta");
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: 10 }).unwrap();
+    assert_eq!(ed.get_text(), "- alpha\n- beta");
+    let len = ed.doc_len_utf16();
+    run(&mut ed, Command::ToggleBulletList { from: 0, to: len }).unwrap();
+    assert_eq!(ed.get_text(), "alpha\nbeta");
+}
+
+#[test]
+fn toggle_list_commands_are_single_undo_units() {
+    let mut ed = Editor::new(1);
+    ed.load("a\nb\nc");
+    run(&mut ed, Command::ToggleOrderedList { from: 0, to: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "1. a\n2. b\n3. c");
+    ed.undo().unwrap();
+    assert_eq!(ed.get_text(), "a\nb\nc", "one undo restores every line");
+}
+
+#[test]
+fn toggle_ordered_selection_maps_with_the_cursor_glued() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha");
+    let change = run(&mut ed, Command::ToggleOrderedList { from: 2, to: 4 }).unwrap();
+    assert_eq!(ed.get_text(), "1. alpha");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (5, 7), "still covers 'ph'");
+}
+
+// ----------------------------------------------------- insertHr (v0.6) --
+
+#[test]
+fn insert_hr_after_a_paragraph_line_guarantees_blank_lines_and_parses_as_hr() {
+    // THE setext trap: "---" directly under paragraph text is an H2
+    // underline. The splice must produce a shape that reparses as a
+    // ThematicBreak with both paragraphs intact.
+    let mut ed = Editor::new(1);
+    ed.load("para1\npara2");
+    let change = run(&mut ed, Command::InsertHr { pos: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "para1\n\n---\n\npara2");
+    // Reparse assertion: exactly one ThematicBreak node, and the block
+    // structure is Paragraph / ThematicBreak / Paragraph.
+    let hrs = ed
+        .overlay_nodes()
+        .iter()
+        .filter(|n| matches!(n.kind, oxidown_core::parser::NodeKind::ThematicBreak))
+        .count();
+    assert_eq!(hrs, 1, "the inserted dashes parse as a ThematicBreak, not setext");
+    let kinds: Vec<_> = ed.block_index().blocks().iter().map(|b| b.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            oxidown_core::parser::BlockKind::Paragraph,
+            oxidown_core::parser::BlockKind::ThematicBreak,
+            oxidown_core::parser::BlockKind::Paragraph,
+        ]
+    );
+    // Cursor glued: the insertion is at/after pos, so it does not move.
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (2, 2));
+}
+
+#[test]
+fn insert_hr_on_a_blank_line_needs_no_extra_separator_above() {
+    let mut ed = Editor::new(1);
+    ed.load("a\n\nb");
+    run(&mut ed, Command::InsertHr { pos: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "a\n\n---\n\nb");
+    assert!(ed
+        .overlay_nodes()
+        .iter()
+        .any(|n| matches!(n.kind, oxidown_core::parser::NodeKind::ThematicBreak)));
+}
+
+#[test]
+fn insert_hr_at_the_document_end() {
+    let mut ed = Editor::new(1);
+    ed.load("para");
+    run(&mut ed, Command::InsertHr { pos: 4 }).unwrap();
+    assert_eq!(ed.get_text(), "para\n\n---");
+    assert!(ed
+        .overlay_nodes()
+        .iter()
+        .any(|n| matches!(n.kind, oxidown_core::parser::NodeKind::ThematicBreak)));
+}
+
+#[test]
+fn insert_hr_before_an_already_blank_line_below_adds_no_extra_blank() {
+    let mut ed = Editor::new(1);
+    ed.load("para\n\nnext");
+    run(&mut ed, Command::InsertHr { pos: 0 }).unwrap();
+    assert_eq!(ed.get_text(), "para\n\n---\n\nnext");
+}
+
+#[test]
+fn insert_hr_is_null_on_fenced_code_lines() {
+    let mut ed = Editor::new(1);
+    ed.load("```\ncode\n```");
+    assert!(ed.command(Command::InsertHr { pos: 5 }).unwrap().is_none());
+    assert_eq!(ed.get_text(), "```\ncode\n```");
+}
+
+#[test]
+fn insert_hr_is_a_single_undo_unit() {
+    let mut ed = Editor::new(1);
+    ed.load("para1\npara2");
+    run(&mut ed, Command::InsertHr { pos: 2 }).unwrap();
+    ed.undo().unwrap();
+    assert_eq!(ed.get_text(), "para1\npara2");
+}
+
+// ----------------------------------------------- toggleCodeBlock (v0.6) --
+
+#[test]
+fn toggle_code_block_wraps_the_intersecting_lines_with_the_selection_inside() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha\nbeta");
+    let change = run(&mut ed, Command::ToggleCodeBlock { from: 0, to: 10 }).unwrap();
+    assert_eq!(ed.get_text(), "```\nalpha\nbeta\n```");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (4, 14), "selection lands inside the block");
+    // Reparse: the body decorates as code-block lines.
+    let body = ed
+        .overlay_nodes()
+        .iter()
+        .filter(|n| matches!(n.kind, oxidown_core::parser::NodeKind::CodeBlockLine))
+        .count();
+    assert_eq!(body, 2);
+}
+
+#[test]
+fn toggle_code_block_unwraps_an_intersected_block_keeping_the_body() {
+    let mut ed = Editor::new(1);
+    ed.load("```\nbody\n```");
+    run(&mut ed, Command::ToggleCodeBlock { from: 5, to: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "body");
+}
+
+#[test]
+fn toggle_code_block_unwrap_works_from_a_fence_line_touch() {
+    // Block-level reveal semantics: a touch on either fence counts as
+    // inside the block.
+    let mut ed = Editor::new(1);
+    ed.load("before\n\n```\nbody\n```\n\nafter");
+    run(&mut ed, Command::ToggleCodeBlock { from: 9, to: 9 }).unwrap();
+    assert_eq!(ed.get_text(), "before\n\nbody\n\nafter");
+}
+
+#[test]
+fn toggle_code_block_unwraps_an_unterminated_block() {
+    let mut ed = Editor::new(1);
+    ed.load("```\nbody");
+    run(&mut ed, Command::ToggleCodeBlock { from: 5, to: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "body");
+}
+
+#[test]
+fn toggle_code_block_unwraps_an_empty_block() {
+    let mut ed = Editor::new(1);
+    ed.load("```\n```");
+    run(&mut ed, Command::ToggleCodeBlock { from: 2, to: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "");
+}
+
+#[test]
+fn toggle_code_block_is_null_in_quote_context() {
+    // v1 punt, documented: fences-in-quotes need per-line prefix surgery.
+    let mut ed = Editor::new(1);
+    ed.load("> quoted");
+    assert!(ed
+        .command(Command::ToggleCodeBlock { from: 3, to: 3 })
+        .unwrap()
+        .is_none());
+    ed.load("> ```\n> x\n> ```");
+    assert!(ed
+        .command(Command::ToggleCodeBlock { from: 8, to: 8 })
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn toggle_code_block_uses_a_longer_fence_when_the_body_leads_with_backticks() {
+    let mut ed = Editor::new(1);
+    ed.load("``x``");
+    run(&mut ed, Command::ToggleCodeBlock { from: 0, to: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "```\n``x``\n```");
+}
+
+#[test]
+fn toggle_code_block_wrap_then_unwrap_round_trips() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha\nbeta");
+    run(&mut ed, Command::ToggleCodeBlock { from: 0, to: 10 }).unwrap();
+    assert_eq!(ed.get_text(), "```\nalpha\nbeta\n```");
+    run(&mut ed, Command::ToggleCodeBlock { from: 6, to: 6 }).unwrap();
+    assert_eq!(ed.get_text(), "alpha\nbeta");
+}
+
+#[test]
+fn toggle_code_block_is_a_single_undo_unit() {
+    let mut ed = Editor::new(1);
+    ed.load("alpha\nbeta");
+    run(&mut ed, Command::ToggleCodeBlock { from: 0, to: 10 }).unwrap();
+    ed.undo().unwrap();
+    assert_eq!(ed.get_text(), "alpha\nbeta");
 }

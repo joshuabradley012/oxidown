@@ -1,5 +1,5 @@
 /**
- * Oxidown boundary protocol — v0 through v0.3 (M0 base + M1 additions).
+ * Oxidown boundary protocol — v0 through v0.6 (M0 base + M1/M2 additions).
  *
  * Transcribed EXACTLY from docs/boundary-v0.md ("TypeScript interface
  * (authoritative shape)", plus the v0.2 additions and v0.3 amendments). If
@@ -179,6 +179,25 @@ export interface CoreChange {
  * press: `null` when neither construct applies at the target (the view
  * falls back to the default newline); unlike indentList/outdentList it
  * never returns an empty-splice no-op (every applicable case edits).
+ *
+ * v0.6 additions (docs/boundary-v0.md "v0.6 additions"):
+ * - `toggleQuote` — stepped blockquote toggle: add one `> ` level to every
+ *   intersecting line (blank ones included), or remove ONE level when every
+ *   intersecting non-blank line is already quoted (repeated presses unwind
+ *   nesting). Effectively always applies (never `null`; the all-marker-less
+ *   remove case is an indentList-style empty-splice no-op).
+ * - `toggleLink` — wrap the range as `[text](` + `)` with the cursor in the
+ *   URL slot (empty range: `[]()`, cursor in the text slot), or unwrap an
+ *   intersected link (text survives; an autolink sheds its `<`/`>`). `null`
+ *   for multi-line ranges and code contexts.
+ * - `toggleBulletList` / `toggleOrderedList` — line-wise list conversion
+ *   with toggle semantics (an all-target-flavor selection STRIPS back to
+ *   plain lines; task items are bullet-flavor; converting to ordered strips
+ *   task brackets, converting to bullet keeps them). `null` when no
+ *   intersecting line is convertible (all blank/fenced-code).
+ * - `toggleCodeBlock` — wrap the intersecting lines in ``` fences, or
+ *   remove both fence lines of an intersected fenced block (body kept).
+ *   `null` in quote context (v1 punt).
  */
 export type RangeCommandName =
   | "toggleStrong"
@@ -187,7 +206,12 @@ export type RangeCommandName =
   | "toggleCode"
   | "indentList"
   | "outdentList"
-  | "enter";
+  | "enter"
+  | "toggleQuote"
+  | "toggleLink"
+  | "toggleBulletList"
+  | "toggleOrderedList"
+  | "toggleCodeBlock";
 
 export interface OxidownCore {
   /** Create/replace the document. Returns revision 0's successor. */
@@ -259,6 +283,13 @@ export interface OxidownCore {
   command(name: RangeCommandName, from: number, to: number): CoreChange | null;
   command(name: "setHeading", pos: number, level: 0 | 1 | 2 | 3 | 4 | 5 | 6): CoreChange | null;
   command(name: "toggleTask", pos: number): CoreChange | null; // pos anywhere in the list item
+  /**
+   * v0.6: insert a thematic break on its own line after the line containing
+   * `pos`, with blank lines guaranteed above/below so the dashes always
+   * parse as a ThematicBreak (never a setext-H2 underline). `null` only on
+   * fenced-code lines.
+   */
+  command(name: "insertHr", pos: number): CoreChange | null;
 
   /**
    * Streaming ingestion (plan §5.9). An ENTIRE stream session (open→close) is

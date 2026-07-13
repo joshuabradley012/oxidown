@@ -228,15 +228,15 @@ export function adaptWasmCore(inner: WasmCoreInstance): OxidownCore {
       return inner.load(text);
     },
     applyEdit: (baseRevision: number, splices: Splice[], origin: EditOrigin) => {
-      // Validation precedence parity with the mock (mock-core.ts
-      // `applyEdit`): malformed baseRevision → staleness → payload checks.
+      // Contract-pinned validation precedence (docs/boundary-v0.md "Error
+      // handling"): malformed baseRevision → staleness → payload checks.
       // The unpaired-surrogate check MUST run JS-side (before the strings
       // cross the boundary, where lone surrogates silently corrupt), so the
       // two revision checks it must not preempt are replicated here, message
       // parity included; the wasm entry point re-runs both harmlessly. A
       // simultaneously-stale AND payload-malformed call must be
       // StaleRevision (desync-resync class), never InvalidPayload (consumed
-      // no-op class), on both cores.
+      // no-op class).
       if (!Number.isInteger(baseRevision) || baseRevision < 0) {
         throw new Error(
           `InvalidArgs: baseRevision must be a non-negative integer, got ${baseRevision}`,
@@ -324,7 +324,9 @@ const WASM_PKG_PATH = "../../../crates/oxidown-wasm/pkg/oxidown_wasm.js";
 
 /**
  * Try to load the real wasm core. Returns null (with a console.warn) when the
- * wasm pkg has not been built yet — callers should fall back to MockCore.
+ * wasm pkg has not been built yet or fails to load — there is no fallback
+ * core (the retired MockCore is gone), so callers should surface a clear
+ * error to the user instead of constructing an editor.
  */
 export async function loadWasmCore(): Promise<OxidownCore | null> {
   try {
@@ -342,7 +344,7 @@ export async function loadWasmCore(): Promise<OxidownCore | null> {
     // defaults to 1 when omitted).
     const CoreClass = mod.OxidownCore as (new () => WasmCoreInstance) | undefined;
     if (!CoreClass) {
-      console.warn("[oxidown] wasm pkg loaded but has no OxidownCore export; falling back");
+      console.warn("[oxidown] wasm pkg loaded but has no OxidownCore export");
       return null;
     }
     return adaptWasmCore(new CoreClass());

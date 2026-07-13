@@ -361,6 +361,18 @@ impl Editor {
         Ok(byte)
     }
 
+    /// The top-level [`BlockKind`] covering the line starting at
+    /// `line_start`, or `None` for a blank separator line no block spans —
+    /// shared by `setHeading` and `toggleTask`'s promotion path, both of
+    /// which gate on the SAME line-level block classification.
+    fn block_kind_at_line(&self, line_start: usize) -> Option<parser::BlockKind> {
+        self.block_index
+            .blocks()
+            .iter()
+            .find(|b| b.span.start <= line_start && line_start < b.span.end)
+            .map(|b| b.kind)
+    }
+
     fn check_crlf_split(&self, pos: usize, byte: usize) -> Result<(), CoreError> {
         if byte > 0
             && self.text.byte_at(byte) == Some(b'\n')
@@ -410,17 +422,14 @@ impl Editor {
                 }
                 let pos_b = self.command_pos_floor(pos)?;
                 let line = self.text.line_range_at(pos_b);
-                let block_kind = self
-                    .block_index
-                    .blocks()
-                    .iter()
-                    .find(|b| b.span.start <= line.start && line.start < b.span.end)
-                    .map(|b| b.kind);
+                let block_kind = self.block_kind_at_line(line.start);
                 commands::set_heading(&self.overlay, &src, block_kind, line, pos_b, level)
             }
             Command::ToggleTask { pos } => {
                 let pos_b = self.command_pos_floor(pos)?;
-                commands::toggle_task(&self.overlay, self.text.len_bytes(), pos_b)
+                let line = self.text.line_range_at(pos_b);
+                let block_kind = self.block_kind_at_line(line.start);
+                commands::toggle_task(&self.overlay, &src, block_kind, self.text.len_bytes(), pos_b)
             }
             Command::IndentList { from, to } | Command::OutdentList { from, to } => {
                 let a = self.command_pos(from)?;
@@ -437,6 +446,38 @@ impl Editor {
                 let b = self.command_pos(to)?;
                 let (from_b, to_b) = (a.min(b), a.max(b));
                 commands::enter(&self.overlay, &src, from_b, to_b)
+            }
+            Command::ToggleQuote { from, to } => {
+                let a = self.command_pos(from)?;
+                let b = self.command_pos(to)?;
+                let (from_b, to_b) = (a.min(b), a.max(b));
+                commands::toggle_quote(&self.overlay, &src, from_b, to_b)
+            }
+            Command::ToggleLink { from, to } => {
+                let a = self.command_pos(from)?;
+                let b = self.command_pos(to)?;
+                let (from_b, to_b) = (a.min(b), a.max(b));
+                commands::toggle_link(&self.overlay, &src, from_b, to_b)
+            }
+            Command::ToggleBulletList { from, to } | Command::ToggleOrderedList { from, to } => {
+                let a = self.command_pos(from)?;
+                let b = self.command_pos(to)?;
+                let (from_b, to_b) = (a.min(b), a.max(b));
+                if matches!(cmd, Command::ToggleBulletList { .. }) {
+                    commands::toggle_bullet_list(&self.overlay, &src, from_b, to_b)
+                } else {
+                    commands::toggle_ordered_list(&self.overlay, &src, from_b, to_b)
+                }
+            }
+            Command::InsertHr { pos } => {
+                let pos_b = self.command_pos_floor(pos)?;
+                commands::insert_hr(&self.overlay, &src, pos_b)
+            }
+            Command::ToggleCodeBlock { from, to } => {
+                let a = self.command_pos(from)?;
+                let b = self.command_pos(to)?;
+                let (from_b, to_b) = (a.min(b), a.max(b));
+                commands::toggle_code_block(&self.overlay, &src, from_b, to_b)
             }
         };
         // A plan with an empty batch means the command APPLIES but no
@@ -1090,30 +1131,27 @@ impl Editor {
                 n.offset_signed(delta);
             }
 
-            // 3b. Block index: assemble the full new span list (before ++
-            //     fresh ++ shifted-after) and let the ordinary `update`
-            //     re-match IDs — identical stability semantics to a full
-            //     reparse, O(#blocks) with a small constant.
+            // 3b. Block index: windowed update mirroring 3a's overlay splice
+            //     exactly — blocks before `before_len` are left untouched
+            //     (same entries, same ids, no allocation) and blocks from
+            //     `m + 1` on shift in place by `delta` (ids retained); only
+            //     the window `[before_len, m + 1)` is re-matched against the
+            //     freshly parsed window blocks. This is NOT an
+            //     approximation of the old "assemble the full list, run the
+            //     ordinary `update`" approach — see `BlockIndex::update_range`'s
+            //     doc comment for the argument that it produces the exact
+            //     same `(span, id)` result, just without doing O(#blocks)
+            //     work for the untouched majority of the document.
             let blocks = self.block_index.blocks();
             let before_len = blocks.partition_point(|b| b.span.end <= region_start);
-            let mut new_spans: Vec<(parser::BlockKind, std::ops::Range<usize>)> =
-                Vec::with_capacity(blocks.len() + 4);
-            new_spans.extend(blocks[..before_len].iter().map(|b| (b.kind, b.span.clone())));
-            new_spans.extend(
-                parsed
-                    .blocks
-                    .iter()
-                    .filter(|(_, r)| r.end <= p_rel)
-                    .map(|(k, r)| (*k, r.start + region_start..r.end + region_start)),
-            );
-            new_spans.extend(blocks[m + 1..].iter().map(|b| {
-                (
-                    b.kind,
-                    (b.span.start as isize + delta) as usize
-                        ..(b.span.end as isize + delta) as usize,
-                )
-            }));
-            self.block_index.update(new_spans, batch);
+            let fresh_spans: Vec<(parser::BlockKind, std::ops::Range<usize>)> = parsed
+                .blocks
+                .into_iter()
+                .filter(|(_, r)| r.end <= p_rel)
+                .map(|(k, r)| (k, r.start + region_start..r.end + region_start))
+                .collect();
+            self.block_index
+                .update_range(before_len..m + 1, fresh_spans, delta, batch);
             return;
         }
     }
