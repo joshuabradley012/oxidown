@@ -490,6 +490,82 @@ fn block_index_update_scaling_1mb_3mb() {
     }
 }
 
+// ---- (f2) BlockIndex::update_range in isolation — the FIX for (f) --------
+
+/// `research/09-1mb-derisk.md`'s ranked-fix-list item #2, implemented: the
+/// windowed counterpart to (f) above, isolating `BlockIndex::update_range`
+/// alone (no parsing, no `Editor`) for the SAME "typed one character into an
+/// existing paragraph, no block boundary changed" scenario — except the
+/// window handed to `update_range` is the small, realistic one
+/// `reparse_incremental` actually computes (one block of slack before the
+/// edit, converging at the very next old block boundary after it), not the
+/// whole document. §8 of the report measured real convergence windows
+/// averaging ~244 bytes (max 409) on a 1MB document for ordinary keystrokes
+/// — a handful of blocks, not thousands — so this bench's window (2-3
+/// blocks) is the representative case, not a cherry-picked best case.
+#[test]
+#[ignore = "M2 de-risk; run with --release --ignored --nocapture"]
+fn block_index_update_range_scaling_1mb_3mb() {
+    let n = iters(200);
+    println!("\n=== BlockIndex::update_range alone (no parsing), windowed, 300KB/1MB/3MB (release-mode) ===");
+    println!("{:<8} {:>10} {:>8} {:>34}", "size", "blocks", "window", "timing");
+    for &(label, target) in SIZES {
+        let doc = generate_mixed_doc(target);
+        let parsed = parser::parse_document(&doc);
+        let block_count = parsed.blocks.len();
+        let mid_byte = doc.len() / 2;
+        let batch = [ByteSplice { at: mid_byte, delete: 0, insert: "x".into() }];
+        let shifted: Vec<(parser::BlockKind, std::ops::Range<usize>)> = parsed
+            .blocks
+            .iter()
+            .map(|(k, r)| {
+                let shift = |p: usize| if p >= mid_byte { p + 1 } else { p };
+                (*k, shift(r.start)..shift(r.end))
+            })
+            .collect();
+
+        // Mirror `reparse_incremental`'s real window: one block of slack
+        // before the block containing `mid_byte`, converging right at the
+        // end of that same block (inserting one char never moves a block
+        // boundary, so the very next old block end is already a valid
+        // convergence point) — exactly `[containing - 1, containing + 1)`.
+        let containing = parsed.blocks.partition_point(|(_, r)| r.start <= mid_byte) - 1;
+        let prefix_end = containing.saturating_sub(1);
+        let window_end = containing + 1;
+        let fresh_spans = shifted[prefix_end..window_end].to_vec();
+        let window_len = window_end - prefix_end;
+
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut idx = BlockIndex::new(1);
+            idx.update(parsed.blocks.clone(), &[]); // seed (untimed baseline)
+            let fresh = fresh_spans.clone();
+            let t = Instant::now();
+            idx.update_range(prefix_end..window_end, fresh, 1, &batch);
+            samples.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        let s = stats(samples);
+        println!("{label:<8} {:>10} {:>8} {s}", block_count, window_len);
+
+        // TIGHT ceiling (relative to (f)'s 100ms loose convention): a
+        // windowed update over 2-3 blocks should cost low-single-digit
+        // microseconds regardless of document size. 50us is still >10x
+        // headroom over the expected cost, but it sits FAR below (f)'s own
+        // measured full-rematch cost at this size (order of 10s-100s of
+        // us, growing with doc size) — so a regression back to full-doc
+        // rematch (e.g. someone widening the window unconditionally, or
+        // routing this call through `update` again) trips this locally,
+        // unlike (f)'s ceiling which is deliberately loose.
+        assert!(
+            s.p95 < 50.0,
+            "{label} BlockIndex::update_range p95 {:.1}us exceeds the 50us tight ceiling — \
+             this should be ~O(window), not O(doc); a regression to full-document rematch cost \
+             would blow past this by 10-100x (see (f) above for that cost at this size)",
+            s.p95
+        );
+    }
+}
+
 // ---- (g) anchor-mapping cost: apply_edit with 0 vs 1000 live anchors ------
 
 #[test]

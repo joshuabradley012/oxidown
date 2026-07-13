@@ -689,3 +689,139 @@ fn multi_splice_batches_match_full_reparse() {
     }
     println!("multi-splice fuzz reparse counts: {:?}", ed.reparse_counts());
 }
+
+// ---- Stage D: BlockIndex::update_range's id-stability contract -------------
+
+/// Property gate for `BlockIndex::update_range` (research/09-1mb-derisk.md's
+/// windowed fix for the block-ID rematch that used to dominate a
+/// mid-document keystroke's cost, replacing `reparse_incremental`'s old
+/// "assemble the full span list, run the whole-document `update`" step).
+/// Block IDs are *sticky* by design and therefore not comparable against a
+/// from-scratch parse (which assigns fresh IDs to everything — this file's
+/// own module doc notes it), so this doesn't extend `assert_equivalent`;
+/// instead it pins the invariant that actually matters, end to end through
+/// `Editor::apply_edit`'s real `reparse_incremental` dispatch (not a direct
+/// `BlockIndex` call — `block_index.rs`'s own unit tests cover that level):
+/// two SENTINEL blocks, at the very start and very end of the document, that
+/// no edit in this test's random walk ever touches (every edit stays inside
+/// a middle region separated from both sentinels by >2KB / dozens of blocks
+/// — far more than the "one block of slack" any reparse window ever reaches)
+/// must keep the EXACT SAME `BlockId` across every step that stays on the
+/// windowed incremental path.
+///
+/// One carve-out, discovered empirically while stress-testing this test at
+/// `OXIDOWN_FUZZ_EDITS=2000`: `reparse_incremental` has a pre-existing,
+/// documented, and entirely unrelated-to-`update_range` degrade path
+/// (research/09-1mb-derisk.md §8/§11/§12 item 1) — when a window can't find
+/// ANY realigning boundary before EOF (e.g. because enough accumulated
+/// random deletes happened to unbalance one of the corpus's own naturally
+/// occurring code-fence delimiters), it falls back to `reparse_tail` from
+/// `region_start` to end of document, which goes through `update_tail`, not
+/// `update_range`, and can legitimately fold the tail sentinel into a
+/// different block (changing its id) if that swallowed region reparses as
+/// one giant unterminated construct. That's correct, pre-existing behavior,
+/// not a regression in this change — so this test re-baselines its expected
+/// sentinel ids whenever `reparse_counts()` shows a `tail`/`full` reparse
+/// fired, and only asserts stability across the (overwhelming majority of)
+/// steps that took the windowed incremental path.
+#[test]
+fn untouched_sentinel_blocks_keep_their_ids_under_incremental_fuzz() {
+    const HEAD: &str = "SENTINEL HEAD paragraph, never touched by any edit in this test.\n\n";
+    const TAIL: &str = "\n\nSENTINEL TAIL paragraph, never touched by any edit in this test.\n";
+    // A restricted insert pool for this test only: fence markers ("```")
+    // are excluded because they're the one construct that can swallow
+    // arbitrarily far forward looking for a closer (see
+    // `fence_open_mid_doc_degrades_gracefully`) — over enough random steps
+    // that could in principle reach a sentinel and legitimately retire its
+    // id, which would be correct behavior but not what this test is
+    // checking. Everything else here is locally bounded: a blank line or
+    // EOF closes a list/quote/HTML block/paragraph/heading without needing
+    // a matching delimiter arbitrarily far away.
+    const SAFE_INSERTS: &[&str] = &[
+        "x", "words and more ", "\n", "\n\n", "\r", "\r\n", "# ", "## heading\n", "- ", "- [ ] ",
+        "1. ", "> ", "===\n", "---\n", "**", "*", "`", "~~", "    ", "\t", "[l](u)", "😀", "你好",
+        "-", "x# ", "| a | b |\n| - | - |\n", "| x |", "<div>\n", "</div>\n\n",
+    ];
+
+    let body = generate_mixed_doc(24 * 1024);
+    let doc = format!("{HEAD}{body}{TAIL}");
+    let mut ed = Editor::new(1);
+    ed.load(&doc);
+    let mut head_id = ed.block_index().blocks().first().unwrap().id;
+    let mut tail_id = ed.block_index().blocks().last().unwrap().id;
+    let mut prev_counts = ed.reparse_counts();
+    let mut degrades = 0usize;
+
+    let mut mirror = doc.clone();
+    let mut rng = StdRng::seed_from_u64(0xb10c_1d5c_a1e5_5e17);
+    // Wide margins: 2KB is dozens of blocks in this corpus (~10 blocks/KB,
+    // research/09 §2) on both sides of the edit region — far more than the
+    // single block of slack any reparse window ever reaches backward, or
+    // the convergence search reaches forward for an ordinary (non-fence)
+    // edit.
+    let lo = HEAD.len() + 2048;
+    let hi = doc.len() - TAIL.len() - 2048;
+    assert!(lo < hi, "the body must be large enough to leave room for the margins");
+
+    let edits = fuzz_edits(300);
+    let mut applied = 0usize;
+    for step in 0..edits {
+        let at_b = floor_char(&mirror, rng.gen_range(lo..hi));
+        let (delete_b, insert) = if rng.gen_bool(0.35) {
+            let max_end = floor_char(&mirror, (at_b + rng.gen_range(1..=40)).min(hi));
+            let ins = if rng.gen_bool(0.3) {
+                SAFE_INSERTS[rng.gen_range(0..SAFE_INSERTS.len())]
+            } else {
+                ""
+            };
+            (max_end.saturating_sub(at_b), ins)
+        } else {
+            (0, SAFE_INSERTS[rng.gen_range(0..SAFE_INSERTS.len())])
+        };
+        if delete_b == 0 && insert.is_empty() {
+            continue;
+        }
+        let at16 = utf16_at(&mirror, at_b);
+        let del16 = mirror[at_b..at_b + delete_b].encode_utf16().count();
+        let rev = ed.revision();
+        ed.apply_edit(
+            rev,
+            &[Splice { at: at16, delete: del16, insert: insert.into() }],
+            EditOrigin::User,
+            0.0,
+        )
+        .expect("char-snapped positions inside [lo, hi) are always valid");
+        mirror.replace_range(at_b..at_b + delete_b, insert);
+        applied += 1;
+
+        let counts = ed.reparse_counts();
+        if counts.tail != prev_counts.tail || counts.full != prev_counts.full {
+            // The pre-existing, unrelated-to-`update_range` degrade path
+            // fired (see the doc comment above): re-baseline rather than
+            // asserting across a legitimate id churn this test isn't about.
+            degrades += 1;
+            head_id = ed.block_index().blocks().first().unwrap().id;
+            tail_id = ed.block_index().blocks().last().unwrap().id;
+            prev_counts = counts;
+            continue;
+        }
+        prev_counts = counts;
+
+        assert_eq!(
+            ed.block_index().blocks().first().unwrap().id,
+            head_id,
+            "step {step}: the untouched head sentinel must keep its id"
+        );
+        assert_eq!(
+            ed.block_index().blocks().last().unwrap().id,
+            tail_id,
+            "step {step}: the untouched tail sentinel must keep its id"
+        );
+    }
+    assert!(applied > edits / 2, "fuzz actually applied edits ({applied})");
+    assert_eq!(ed.get_text(), mirror, "text mirror agreement after the fuzzed run");
+    println!(
+        "sentinel-id fuzz: {applied} edits, {degrades} degrade re-baselines, reparse counts {:?}",
+        ed.reparse_counts()
+    );
+}

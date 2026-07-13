@@ -146,6 +146,99 @@ impl BlockIndex {
         self.blocks.truncate(split);
         self.blocks.extend(matched);
     }
+
+    /// Windowed fast path for `reparse_incremental`'s block-index step
+    /// (`editor.rs` step 3b): mirrors the overlay's prefix/fresh/suffix
+    /// splice (step 3a) instead of routing through the whole-document
+    /// [`BlockIndex::update`]. `old_window` indexes into the CURRENT
+    /// `self.blocks` (pre-call): blocks strictly before `old_window.start`
+    /// are left completely alone — same `Block` entries, same IDs, no
+    /// allocation, no call into [`mapping::map_range_shrink`]; blocks in
+    /// `old_window` are re-matched against `fresh_spans` (already in
+    /// document/absolute byte coordinates) using the exact same
+    /// [`match_spans`] heuristic `update` uses, just restricted to that
+    /// sub-slice; blocks from `old_window.end` on have their spans shifted
+    /// IN PLACE by `suffix_delta` (`batch`'s net byte delta,
+    /// `Σ insert.len() - delete`), IDs retained, no rematch.
+    ///
+    /// `old_window` and `fresh_spans` are exactly what `reparse_incremental`
+    /// already computes for the overlay splice (the window
+    /// `[before_len, m + 1)` and the freshly parsed window blocks, offset to
+    /// absolute coordinates) — see its doc comment for the "one block of
+    /// slack" / convergence-point argument this relies on.
+    ///
+    /// ## Why this produces exactly what `update` would have
+    ///
+    /// `update` maps EVERY old block through `batch` and hands the whole
+    /// mapped-old list plus the whole new-spans list to [`match_spans`]'s
+    /// two-pointer overlap merge. Splitting that single call into three
+    /// independent pieces is only valid if no edge (candidate ID donation)
+    /// can ever cross a piece boundary — otherwise a window match could
+    /// "steal" an ID that the full computation would have awarded to a
+    /// prefix/suffix block, or vice versa. Two boundary facts, both
+    /// load-bearing invariants of `reparse_incremental`'s own window
+    /// selection (not reproved here — see its doc comment), rule that out:
+    ///
+    /// * **prefix boundary.** `old_window.start` is chosen so every prefix
+    ///   block's span ends at or before `region_start`, which is itself at
+    ///   or before every splice in `batch` (`reparse_incremental`'s "one
+    ///   block of slack" window start). A span entirely before every splice
+    ///   maps through [`mapping::map_range_shrink`] to ITSELF, unchanged
+    ///   (`Bias::After`/`Bias::Before` only ever move a position at or past
+    ///   the first splice they touch) — so the prefix's mapped-old spans are
+    ///   bit-for-bit the prefix's stored spans, which is exactly what this
+    ///   function passes through. Since `fresh_spans`' own first span starts
+    ///   at/after `region_start` (it comes from parsing the slice
+    ///   `[region_start, ..)`), no prefix span and no fresh span can overlap
+    ///   — the prefix's candidate edges in a full `match_spans` call are
+    ///   confined to (prefix-old, prefix-new) pairs, each a perfect,
+    ///   unambiguous self-match (identical range, no competing candidate).
+    /// * **suffix boundary.** `old_window.end` is chosen so `blocks[m]`
+    ///   (the last window block) ends exactly at `p_pre`, an old block end
+    ///   at/after `batch`'s last splice — so every suffix block's span
+    ///   starts at/after `p_pre`, at/after every splice in `batch`. A
+    ///   position at/after every splice maps through `map_range_shrink` to
+    ///   itself shifted by the batch's full net delta (each splice
+    ///   contributes its own `insert.len() - delete` once, whether via the
+    ///   ordinary "splice entirely before" arm or, for a position landing
+    ///   exactly on a trailing pure insertion, the bias-driven absorb arm —
+    ///   both land on the same total): exactly `suffix_delta`, exactly what
+    ///   this function applies in place. `fresh_spans`' own last span ends
+    ///   at `p_pre`'s image, at or before every (shifted) suffix span's
+    ///   start, so again no cross-boundary overlap is possible.
+    ///
+    /// With no edges crossing either boundary, the full computation's edge
+    /// set is exactly the union of the three pieces' edge sets — so
+    /// matching them independently (or, for prefix/suffix, not matching at
+    /// all, since their only possible edge is the trivial self-match)
+    /// yields identical `(span, id)` results to calling `update` on the
+    /// assembled `before ++ fresh ++ shifted-after` list. Pinned by
+    /// `tests/reparse_equivalence.rs`'s sentinel-block property fuzz and by
+    /// this module's own `update_range_matches_full_update_on_the_same_edit`
+    /// tests.
+    pub fn update_range(
+        &mut self,
+        old_window: Range<usize>,
+        fresh_spans: Vec<(BlockKind, Range<usize>)>,
+        suffix_delta: isize,
+        batch: &[ByteSplice],
+    ) {
+        debug_assert!(
+            old_window.start <= old_window.end && old_window.end <= self.blocks.len(),
+            "old_window {old_window:?} out of bounds for {} blocks",
+            self.blocks.len()
+        );
+        let mapped_old: Vec<(Range<usize>, BlockId)> = self.blocks[old_window.clone()]
+            .iter()
+            .map(|b| (mapping::map_range_shrink(&b.span, batch), b.id))
+            .collect();
+        let matched = match_spans(&mapped_old, fresh_spans, self.replica, &mut self.next_counter);
+        for b in &mut self.blocks[old_window.end..] {
+            b.span.start = (b.span.start as isize + suffix_delta) as usize;
+            b.span.end = (b.span.end as isize + suffix_delta) as usize;
+        }
+        self.blocks.splice(old_window, matched);
+    }
 }
 
 /// Linear-time overlap matcher — see the module docs for the semantics.
@@ -537,5 +630,169 @@ mod tests {
         assert_eq!(idx.blocks().len(), 3);
         assert_eq!(idx.blocks()[1].id, tail_id, "original tail keeps its id");
         assert_ne!(idx.blocks()[2].id, tail_id, "new block gets a fresh id");
+    }
+
+    // ---- update_range: windowed fast path (mirrors reparse_incremental's
+    // step 3b; research/09-1mb-derisk.md's "FIXED" item) --------------------
+
+    /// Five distinct top-level blocks; the edit below lands entirely inside
+    /// block 2's text and replaces a marker with a blank line, splitting it
+    /// in two — exercising a window that both shrinks a slack block's
+    /// neighbor untouched AND changes the block COUNT inside the window,
+    /// while blocks 0 (prefix) and 3/4 (suffix) sit outside it.
+    fn five_block_doc() -> String {
+        "block0 text\n\nblock1 text\n\nblock2 firstpart SPLIT_MARKER secondpart\n\n\
+         block3 text\n\nblock4 text\n"
+            .to_string()
+    }
+
+    #[test]
+    fn update_range_leaves_prefix_blocks_byte_for_byte_untouched() {
+        let mut idx = BlockIndex::new(1);
+        let text = five_block_doc();
+        reparse(&mut idx, &text, &[]);
+        assert_eq!(idx.blocks().len(), 5);
+        let block0_before = idx.blocks()[0].clone();
+
+        let at = text.find("SPLIT_MARKER").unwrap();
+        let batch = [sp(at, "SPLIT_MARKER".len(), "\n\n")];
+        let after_text = format!("{}{}{}", &text[..at], "\n\n", &text[at + "SPLIT_MARKER".len()..]);
+        let delta: isize = "\n\n".len() as isize - "SPLIT_MARKER".len() as isize;
+        let new_blocks = parser::parse_document(&after_text).blocks;
+
+        // Window = [1, 3): block1 (one block of slack) + block2 (the edited
+        // block); block0 is entirely outside it.
+        idx.update_range(1..3, new_blocks[1..4].to_vec(), delta, &batch);
+
+        assert_eq!(
+            idx.blocks()[0], block0_before,
+            "a block strictly before the window keeps its exact (id, span) entry, \
+             untouched by the edit or by any remapping"
+        );
+    }
+
+    #[test]
+    fn update_range_shifts_suffix_spans_in_place_and_keeps_ids() {
+        let mut idx = BlockIndex::new(1);
+        let text = five_block_doc();
+        reparse(&mut idx, &text, &[]);
+        let block3_id = idx.blocks()[3].id;
+        let block4_id = idx.blocks()[4].id;
+        let block3_span_before = idx.blocks()[3].span.clone();
+        let block4_span_before = idx.blocks()[4].span.clone();
+
+        let at = text.find("SPLIT_MARKER").unwrap();
+        let batch = [sp(at, "SPLIT_MARKER".len(), "\n\n")];
+        let after_text = format!("{}{}{}", &text[..at], "\n\n", &text[at + "SPLIT_MARKER".len()..]);
+        let delta: isize = "\n\n".len() as isize - "SPLIT_MARKER".len() as isize;
+        let new_blocks = parser::parse_document(&after_text).blocks;
+
+        idx.update_range(1..3, new_blocks[1..4].to_vec(), delta, &batch);
+
+        assert_eq!(idx.blocks().len(), 6, "block2 split into two, one net new block");
+        assert_eq!(idx.blocks()[4].id, block3_id, "suffix block keeps its id");
+        assert_eq!(idx.blocks()[5].id, block4_id, "suffix block keeps its id");
+        assert_eq!(
+            idx.blocks()[4].span,
+            (block3_span_before.start as isize + delta) as usize
+                ..(block3_span_before.end as isize + delta) as usize,
+            "suffix span shifts by exactly the batch's net delta, in place"
+        );
+        assert_eq!(
+            idx.blocks()[5].span,
+            (block4_span_before.start as isize + delta) as usize
+                ..(block4_span_before.end as isize + delta) as usize,
+        );
+    }
+
+    #[test]
+    fn update_range_rematches_a_split_inside_the_window_like_update_does() {
+        let mut idx = BlockIndex::new(1);
+        let text = five_block_doc();
+        reparse(&mut idx, &text, &[]);
+        let block1_id = idx.blocks()[1].id;
+        let block2_id = idx.blocks()[2].id;
+
+        let at = text.find("SPLIT_MARKER").unwrap();
+        let batch = [sp(at, "SPLIT_MARKER".len(), "\n\n")];
+        let after_text = format!("{}{}{}", &text[..at], "\n\n", &text[at + "SPLIT_MARKER".len()..]);
+        let delta: isize = "\n\n".len() as isize - "SPLIT_MARKER".len() as isize;
+        let new_blocks = parser::parse_document(&after_text).blocks;
+
+        idx.update_range(1..3, new_blocks[1..4].to_vec(), delta, &batch);
+
+        assert_eq!(idx.blocks()[1].id, block1_id, "the slack block inside the window keeps its id");
+        // block2 split into blocks[2] ("...firstpart") and blocks[3]
+        // ("secondpart..."): exactly one keeps block2's old id (the
+        // larger-overlap piece — "firstpart" here), the other is fresh.
+        let split_ids = [idx.blocks()[2].id, idx.blocks()[3].id];
+        assert_eq!(
+            split_ids.iter().filter(|&&id| id == block2_id).count(),
+            1,
+            "exactly one half of the split keeps block2's old id: {split_ids:?}"
+        );
+    }
+
+    #[test]
+    fn update_range_matches_full_update_on_the_same_edit() {
+        // The equivalence claim `update_range`'s doc comment argues for,
+        // pinned directly: driving the SAME edit through the OLD "assemble
+        // before ++ fresh ++ shifted-after, call `update`" shape and through
+        // `update_range` must produce byte-for-byte, id-for-id identical
+        // results.
+        let mut idx_full = BlockIndex::new(1);
+        let mut idx_windowed = BlockIndex::new(1);
+        let text = five_block_doc();
+        reparse(&mut idx_full, &text, &[]);
+        reparse(&mut idx_windowed, &text, &[]);
+        assert_eq!(idx_full.blocks(), idx_windowed.blocks());
+
+        let at = text.find("SPLIT_MARKER").unwrap();
+        let batch = [sp(at, "SPLIT_MARKER".len(), "\n\n")];
+        let after_text = format!("{}{}{}", &text[..at], "\n\n", &text[at + "SPLIT_MARKER".len()..]);
+        let delta: isize = "\n\n".len() as isize - "SPLIT_MARKER".len() as isize;
+        let new_blocks = parser::parse_document(&after_text).blocks;
+        assert_eq!(new_blocks.len(), 6, "block2 splits into two paragraphs");
+
+        idx_full.update(new_blocks.clone(), &batch);
+        idx_windowed.update_range(1..3, new_blocks[1..4].to_vec(), delta, &batch);
+
+        assert_eq!(
+            idx_full.blocks(),
+            idx_windowed.blocks(),
+            "windowed update_range must match the full assemble-and-update path exactly"
+        );
+    }
+
+    #[test]
+    fn update_range_matches_full_update_when_the_window_touches_a_deleted_block() {
+        // A second equivalence case with a DIFFERENT shape: the window's
+        // last block is fully deleted (collapses to a point for matching
+        // purposes, per the module docs) right at the window/suffix
+        // boundary — the scenario the module doc's overlap-scoring section
+        // calls out as needing the `(false, n)` vs `(true, n)` ranking, now
+        // checked across the window/suffix split too.
+        let mut idx_full = BlockIndex::new(1);
+        let mut idx_windowed = BlockIndex::new(1);
+        let text = "block0 text\n\nblock1 text\n\nblock2 doomed\n\nblock3 text\n\nblock4 text\n";
+        reparse(&mut idx_full, text, &[]);
+        reparse(&mut idx_windowed, text, &[]);
+
+        // Delete "block2 doomed\n\n" entirely (block 2 fully collapses).
+        let at = text.find("block2").unwrap();
+        let del_len = "block2 doomed\n\n".len();
+        let batch = [sp(at, del_len, "")];
+        let after_text = format!("{}{}", &text[..at], &text[at + del_len..]);
+        let delta: isize = -(del_len as isize);
+        let new_blocks = parser::parse_document(&after_text).blocks;
+        assert_eq!(new_blocks.len(), 4, "block2 disappears entirely");
+
+        idx_full.update(new_blocks.clone(), &batch);
+        // Window = [1, 3): block1 (slack) + block2 (deleted); fresh spans
+        // for that window = just the new block1 (new_blocks[1], since
+        // block2 contributes nothing).
+        idx_windowed.update_range(1..3, new_blocks[1..2].to_vec(), delta, &batch);
+
+        assert_eq!(idx_full.blocks(), idx_windowed.blocks());
     }
 }

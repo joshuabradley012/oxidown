@@ -1090,30 +1090,27 @@ impl Editor {
                 n.offset_signed(delta);
             }
 
-            // 3b. Block index: assemble the full new span list (before ++
-            //     fresh ++ shifted-after) and let the ordinary `update`
-            //     re-match IDs — identical stability semantics to a full
-            //     reparse, O(#blocks) with a small constant.
+            // 3b. Block index: windowed update mirroring 3a's overlay splice
+            //     exactly — blocks before `before_len` are left untouched
+            //     (same entries, same ids, no allocation) and blocks from
+            //     `m + 1` on shift in place by `delta` (ids retained); only
+            //     the window `[before_len, m + 1)` is re-matched against the
+            //     freshly parsed window blocks. This is NOT an
+            //     approximation of the old "assemble the full list, run the
+            //     ordinary `update`" approach — see `BlockIndex::update_range`'s
+            //     doc comment for the argument that it produces the exact
+            //     same `(span, id)` result, just without doing O(#blocks)
+            //     work for the untouched majority of the document.
             let blocks = self.block_index.blocks();
             let before_len = blocks.partition_point(|b| b.span.end <= region_start);
-            let mut new_spans: Vec<(parser::BlockKind, std::ops::Range<usize>)> =
-                Vec::with_capacity(blocks.len() + 4);
-            new_spans.extend(blocks[..before_len].iter().map(|b| (b.kind, b.span.clone())));
-            new_spans.extend(
-                parsed
-                    .blocks
-                    .iter()
-                    .filter(|(_, r)| r.end <= p_rel)
-                    .map(|(k, r)| (*k, r.start + region_start..r.end + region_start)),
-            );
-            new_spans.extend(blocks[m + 1..].iter().map(|b| {
-                (
-                    b.kind,
-                    (b.span.start as isize + delta) as usize
-                        ..(b.span.end as isize + delta) as usize,
-                )
-            }));
-            self.block_index.update(new_spans, batch);
+            let fresh_spans: Vec<(parser::BlockKind, std::ops::Range<usize>)> = parsed
+                .blocks
+                .into_iter()
+                .filter(|(_, r)| r.end <= p_rel)
+                .map(|(k, r)| (k, r.start + region_start..r.end + region_start))
+                .collect();
+            self.block_index
+                .update_range(before_len..m + 1, fresh_spans, delta, batch);
             return;
         }
     }

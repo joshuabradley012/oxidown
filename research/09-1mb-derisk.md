@@ -197,6 +197,10 @@ directly, which `editor.rs`'s own step-3b doc comment doesn't distinguish from t
 small constant" is accurate, but reads as a minor addendum to step 3a's overlay-shift discussion,
 when in measured fact it's the *larger* of the two terms).
 
+**FIXED (2026-07-03)** — see §12 item 2 for the windowed `BlockIndex::update_range` fix and
+before/after numbers; this section's numbers are left as originally measured (the "before" half
+of that comparison).
+
 ---
 
 ## 5. Numbers: `decorations()`, ~3k-CU middle viewport — confirmed flat, no regression
@@ -423,6 +427,50 @@ sense; everything else in this report is a percentage-point margin story, not a 
    30-45x even at 3MB, §11), but the first thing to optimize (e.g., re-match only blocks inside
    the reparse window, splicing the untouched before/after block sublists through unmatched) if
    documents grow past the range this spike covers. **Not required for the 1MB/3MB M2 gate.**
+
+   > **FIXED — after numbers (2026-07-03).** Implemented exactly the lever named above:
+   > `BlockIndex::update_range` (`block_index.rs`), a windowed counterpart to `update` wired into
+   > `reparse_incremental`'s step 3b in place of the old "assemble before ++ fresh ++
+   > shifted-after, call the whole-document `update`" construction. Blocks before the window keep
+   > their `Block` entries and IDs untouched (no allocation, no rematch call); blocks in the
+   > window are rematched with the exact same `match_spans` heuristic, restricted to that
+   > sub-slice; blocks after the window shift their spans in place by the batch's net delta, IDs
+   > retained. Proven (not just tested) equivalent to the old whole-list `update` call: the
+   > "one block of slack" window-start and "old block end past the dirty region" convergence-point
+   > invariants `reparse_incremental` already establishes for the overlay splice mean no candidate
+   > match edge can ever cross a window boundary, so splitting the single `match_spans` call into
+   > independent prefix/window/suffix pieces changes nothing about the result — see
+   > `BlockIndex::update_range`'s doc comment for the full argument. `update` itself is untouched
+   > and still used for `load`/full reparse.
+   >
+   > Isolated bench (`perf_1mb_derisk.rs`, `block_index_update_range_scaling_1mb_3mb`, realistic
+   > 2-block window, two runs, release mode):
+   >
+   > | size | `update` (unchanged, mean / p95) | `update_range` (new, mean / p95) | speedup (mean) |
+   > |---|--:|--:|--:|
+   > | ~300KB | 22.8-23.1 / 23.4-25.4µs | 0.5 / 0.5-0.6µs | ~46x |
+   > | ~1MB | 74.1-80.7 / 79.8-87.1µs | 2.1-2.2 / 2.2µs | ~36x |
+   > | ~3MB | 214.6-221.0 / 230.0-241.2µs | 6.2 / 6.2-6.3µs | ~35x |
+   >
+   > End-to-end `apply_edit` (mid-document, `apply_edit_position_scaling_1mb_3mb`, two runs):
+   >
+   > | size | BEFORE (§3, mean) | AFTER (mean) | speedup | new `update_range` share of total |
+   > |---|--:|--:|--:|--:|
+   > | ~300KB | 38.2-38.6µs | 14.1-14.2µs | ~2.7x | ~3.5% |
+   > | ~1MB | 118.6-119.9µs | 40.4-41.7µs | ~2.9x | ~5.2-5.4% |
+   > | ~3MB | 361.4-368.6µs | 118.4-119.0µs | ~3.1x | ~5.2% |
+   >
+   > The dominant ~58-62% term is gone, not just shrunk — `apply_edit` at the worst (start) position
+   > drops similarly (~2x: 3MB start mean 482.8-483.5µs → 231.3-236.9µs). What remains is almost
+   > entirely item #3 below (the overlay suffix shift), unchanged by this fix. A tight perf
+   > assertion (50µs p95, vs. `update`'s own 100-220µs measured cost at the same sizes) was added
+   > alongside the isolated bench specifically so a regression back to full-document rematch trips
+   > locally. Full workspace tests (debug + release), clippy `--all-targets -D warnings`, and all
+   > four `--ignored` perf suites stay green; the fuzzed `reparse_equivalence` gate was extended
+   > with an id-stability property test (`untouched_sentinel_blocks_keep_their_ids_under_incremental_fuzz`)
+   > since block IDs aren't comparable against a from-scratch parse. Diff confined to
+   > `crates/oxidown-core/{src/block_index.rs,src/editor.rs,tests/perf_1mb_derisk.rs,tests/reparse_equivalence.rs}`;
+   > the wasm boundary is untouched (`BlockIndex` was already internal, not exposed over it).
 3. **[Same status as #2, smaller share] The overlay `Vec`'s suffix offset-shift.** ~38-43% of a
    mid-document keystroke (the remainder of §3's `apply_edit` cost after subtracting §4's
    isolated `BlockIndex::update` number), ~2-2.4ns/node — editor.rs's own doc comment already
