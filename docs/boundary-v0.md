@@ -4,9 +4,10 @@ The minimum contract between `oxidown-core` and a platform view, for the M0 spik
 This document is authoritative: if the Rust core and the TypeScript view disagree, the one that
 matches this file wins; if this file is wrong, change it in the same PR as the code.
 
-Current contract version: **v0.4** — the base v0 sections below are followed by the v0.1
-clarifications, the v0.2 (M1) additions, and inline v0.3/v0.4 amendments; the "v0.3 changelog"
-and "v0.4 changelog" sections at the end enumerate exactly what each version comprises.
+Current contract version: **v0.5** — the base v0 sections below are followed by the v0.1
+clarifications, the v0.2 (M1) additions, and inline v0.3/v0.4/v0.5 amendments; the "v0.3
+changelog", "v0.4 changelog", and "v0.5 changelog" sections at the end enumerate exactly what
+each version comprises.
 
 **Testing strategy.** The Rust/wasm core (`crates/oxidown-wasm`, wrapped by
 `packages/oxidown-view-cm6/src/wasm-core.ts`) is the ONLY implementation of this contract — there
@@ -394,7 +395,7 @@ implement the stay-at-`p` behavior.
 ```ts
 command(name: "toggleStrong"|"toggleEm"|"toggleStrike"|"toggleCode", from: number, to: number): CoreChange | null;
 command(name: "setHeading", pos: number, level: 0|1|2|3|4|5|6): CoreChange | null;   // 0 = paragraph
-command(name: "toggleTask", pos: number): CoreChange | null;  // pos anywhere in the list item
+command(name: "toggleTask", pos: number): CoreChange | null;  // flips an existing task, else PROMOTES the line — see "toggleTask" below
 command(name: "indentList"|"outdentList", from: number, to: number): CoreChange | null;
 command(name: "enter", from: number, to: number): CoreChange | null;  // v0.3 addition — see "enter" below
 ```
@@ -437,7 +438,7 @@ trimming rather than refusal:
 - Cursor-only toggles (`from == to`) and `toggleCode` are unchanged — code spans have no
   flanking rules; the code planner's existing padding treatment stands.
 
-### `setHeading` (v0.4 clarifications)
+### `setHeading` (v0.4 clarifications, v0.5 amendment)
 
 - The list-item gate applies at any quote depth: `setHeading` inside a blockquote strips the
   `>` prefix before classifying the target line, so a quoted list item (`> - item`) refuses
@@ -445,6 +446,59 @@ trimming rather than refusal:
   the gate and the marker was swallowed as literal heading text.
 - Level 0 (heading → paragraph) removes EVERY delimiter span, an ATX closing hash run included:
   `# foo #` → `foo`, not `foo #`. Releveling (1–6) keeps the closing run, as before.
+- **Idempotent press toggles back to a paragraph (v0.5 amendment).** `setHeading(pos, N)` where
+  the line is ALREADY exactly level `N` (1–6) behaves exactly like level 0: it removes the
+  heading, ALL delimiter spans included. This closes a toolbar-parity gap — clicking H2 on a
+  line that is already an H2 used to be a silent no-op (`null`); it now returns the line to a
+  paragraph, matching the idempotent-toggle behavior every other formatting button already has.
+  "Already level `N`" compares the parsed heading node's OWN level, not a byte-identical prefix
+  match, so an irregularly-spaced `"##  x"` (an extra inner space beyond the one required after
+  the hashes) still counts as "already level 2" and clears fully — only the delimiter span
+  itself is removed; any extra whitespace beyond it is content and is untouched, same as it
+  always was for level 0. A DIFFERENT level still replaces the opening delimiter as before
+  (never treated as a toggle); level 0 is unchanged (always clears, regardless of the line's
+  current level).
+
+### `toggleTask` (v0.5 amendment — Obsidian parity)
+
+`pos` anywhere in an EXISTING task item still flips exactly the `[ ]`/`[x]` checkbox byte
+(unchanged: `[X]` also toggles off to `[ ]`, and this path never moves the cursor). What changed
+is what happens when `pos` does NOT resolve inside an existing task item: v0.2–v0.4 refused
+(`null`) there; v0.5 PROMOTES the line containing `pos` into a task instead, matching Obsidian's
+"Toggle checkbox status" command, which converts a plain bullet into a checkbox rather than
+no-op'ing (research/07 §1.6):
+
+- **Non-task list item** (bullet or ordered, any nesting depth, any quote depth): the `"[ ] "`
+  run is inserted right after the marker token — after the marker's required single space when
+  the item has content (the ordinary case), or with its OWN leading space when the marker has
+  none (a bare empty item, e.g. `"-"`) so the result is still valid GFM task syntax
+  (`"- [ ] "`) rather than the unrecognized `"-[ ] "`. This is resolved per LINE — the line
+  carrying its own marker — not the whole possibly-multi-line item; a cursor on a plain list
+  item's CONTINUATION line does not promote (the same line-oriented v1 scope every other
+  line-based command in this contract has; the flip path above already covers "anywhere in the
+  item" for the EXISTING-task case, which remains the contract's pinned guarantee for that case).
+- **Plain paragraph or blockquote-content line** (seen through any quote prefix, exactly like
+  `setHeading`'s own gate; not blank): `"- [ ] "` is inserted at the content start, i.e. right
+  after the quote prefix — empty at top level, preserved verbatim when quoted
+  (`"> text"` → `"> - [ ] text"`).
+- **Blank line** (including an empty quote line, e.g. `">"`): also promotes, `"- [ ] "` inserted
+  after any quote prefix. This is MORE permissive than `setHeading`'s own blank-line refusal —
+  deliberately: Obsidian promotes a blank line too, and a toolbar button that sometimes silently
+  does nothing on an empty line is a worse experience than a predictable empty task item.
+- **Still `null`** on headings, fenced/indented code lines, thematic breaks, and every other
+  block kind a checkbox makes no sense on (tables, HTML blocks, footnote definitions, or a
+  continuation line inside some OTHER list item) — the same conservative set `setHeading`
+  refuses, since a checkbox on a heading or inside a fence is exactly as nonsensical as a hash
+  run would be there.
+
+Selection after a promotion maps the original `pos` forward through the inserted text
+(after-biased): the insertion always lands at/before `pos`, so the character immediately after
+the cursor is unchanged — the cursor stays with its content, shifted right by the inserted
+marker/checkbox bytes, rather than landing mid-syntax between the new marker and the new
+checkbox. One undo unit, same as every other command. The whole-document itemness invariant
+(indentList/outdentList's own acceptance bar) holds here too, in its ADDITIVE direction:
+a promotion may give a line itemness it didn't have, but never costs any OTHER line the
+itemness it already had.
 
 ### `indentList` / `outdentList`
 
@@ -899,3 +953,23 @@ The full list:
 - **Perf-gate enforcement note** — CI gates the loose perf ceilings (`perf_smoke`,
   `stream_perf`); the 1ms contract budget stays a local trip-wire (`perf_baseline`,
   informational in CI). See "Performance budget".
+
+---
+
+# v0.5 changelog
+
+**The current version of this contract is v0.5** (M2 web-editor-beta dogfooding fixes). Same
+in-place convention: each item lives inline above, tagged "(v0.5 amendment)". The full list:
+
+- **`toggleTask` promotes instead of refusing** — `pos` outside any existing task item used to
+  return `null` unconditionally (a documented v1 limitation); it now promotes the line containing
+  `pos` into a task item — a non-task list item gets `"[ ] "` inserted after its marker, a plain
+  paragraph/blockquote-content line or a blank line gets a fresh `"- [ ] "` marker — matching
+  Obsidian's "Toggle checkbox status" behavior (research/07 §1.6). Still `null` on headings,
+  code/fence lines, thematic breaks, and other block kinds a checkbox makes no sense on. See
+  "`toggleTask` (v0.5 amendment — Obsidian parity)" under Commands.
+- **`setHeading` same-level press toggles back to a paragraph** — `setHeading(pos, N)` where the
+  line is already exactly level `N` used to no-op (`null`); it now removes the heading exactly
+  like level 0 does, making the toolbar's H1–H6 buttons idempotent presses. A different level
+  still replaces the prefix as before; level 0 is unchanged. See "`setHeading` (v0.4
+  clarifications, v0.5 amendment)" under Commands.

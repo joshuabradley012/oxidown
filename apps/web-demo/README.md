@@ -70,8 +70,12 @@ Clicking it never moves the text cursor. **Mod-Shift-Enter** and **Mod-L**
 (Obsidian's own "Toggle checkbox status" hotkey) toggle the task on the
 cursor's line from the keyboard; Mod-L always consumes the keystroke (the
 browser would otherwise grab Cmd/Ctrl-L for the address bar) even when the
-cursor isn't on a task item — unlike Obsidian, running it on a plain bullet
-does not (yet) convert the line into a task.
+cursor isn't on a task item. The toolbar checkbox button, and both of these
+shortcuts, now match Obsidian fully: running any of them on a plain bullet
+or ordered item **promotes** it into a task (`"- item"` → `"- [ ] item"`),
+and on a plain paragraph or blank line **converts** it into one
+(`"text"` → `"- [ ] text"`) — only headings, code/fence lines, and
+thematic breaks still leave the command a no-op.
 
 ### Reveal / conceal behavior
 

@@ -78,12 +78,67 @@
 //! have written hashes into the item's line). Level 0 removes an existing
 //! heading's delimiter spans — ALL of them, an ATX closing hash run
 //! included (`"# foo #"` → `"foo"`); `None` if there is no heading.
+//! **Same-level press toggles back to a paragraph (v0.5 amendment):**
+//! `setHeading(pos, N)` where the line is ALREADY exactly level `N`
+//! (compared via the parsed `Heading` node's own level, not a byte-identical
+//! prefix match — an irregular `"##  x"` at level 2 still counts as "already
+//! level 2") removes the heading exactly like `level 0` does. This makes the
+//! toolbar's H1–H6 buttons idempotent presses (Obsidian parity: pressing the
+//! same heading level again clears it) instead of silently no-op'ing. A
+//! DIFFERENT level still replaces the opening delimiter as before; level 0
+//! is unchanged (always clears, regardless of current level).
 //!
 //! ## toggleTask
 //!
-//! `pos` anywhere in the list item (the parser records each task item's
-//! full extent). Flips exactly one byte: the `[ ]`/`[x]` checkbox interior.
-//! `[X]` (capital) also toggles off to `[ ]`.
+//! `pos` anywhere in an EXISTING task item (the parser records each task
+//! item's full extent) flips exactly one byte: the `[ ]`/`[x]` checkbox
+//! interior. `[X]` (capital) also toggles off to `[ ]`.
+//!
+//! **Promotion (v0.5 amendment — Obsidian parity, research/07 §1.6):**
+//! when `pos` does not resolve inside an existing task item, the command
+//! PROMOTES the line containing `pos` into a task instead of refusing,
+//! matching Obsidian's "Toggle checkbox status" behavior of converting a
+//! plain bullet into a checkbox rather than no-op'ing:
+//!
+//! * **Non-task list item** (bullet or ordered, any nesting depth, any
+//!   quote depth — found via the shared `parser::scan_marker` lexer, the
+//!   same one `marker_token_width`/`line_marker` use): the `"[ ] "` run is
+//!   inserted right after the marker token — after the required single
+//!   space when one is present (the ordinary case, since CommonMark
+//!   requires content to be separated from the marker by whitespace), or
+//!   with its own leading space when the marker has none (an empty item,
+//!   `"-"` with nothing after it) so the result is still valid GFM task
+//!   syntax (`"- [ ] "`, ready for content) rather than the unrecognized
+//!   `"-[ ] "`. Resolved per LINE (the line carrying its OWN marker), not
+//!   the whole possibly-multi-line item — a cursor on a plain list item's
+//!   CONTINUATION line does not promote (same v1 scope limit as
+//!   `indentList`/`outdentList`/`enter`'s own line-oriented model; the
+//!   flip path above already handles "anywhere in the item" for the
+//!   EXISTING-task case, which is the contract's stated guarantee).
+//! * **Plain paragraph/blockquote-content line** (the LINE's block, seen
+//!   through any quote prefix exactly like `setHeading`'s gate, is a
+//!   Paragraph or BlockQuote, and the line isn't blank): `"- [ ] "` is
+//!   inserted at the content start — right after the quote prefix, which is
+//!   empty at top level and preserved verbatim when quoted (`"> text"` →
+//!   `"> - [ ] text"`).
+//! * **Blank line** (including a quote line with empty content, e.g. `">"`):
+//!   also gets `"- [ ] "` inserted after any quote prefix. This is MORE
+//!   permissive than `setHeading`'s own blank-line refusal — a deliberate
+//!   difference: Obsidian's checkbox toggle promotes a blank line too, and
+//!   a toolbar button that sometimes silently does nothing on an empty line
+//!   is a worse experience than a predictable empty task item.
+//! * **Still `None`** on headings, fenced/indented code lines, thematic
+//!   breaks, and any other block kind a plain checkbox makes no sense on
+//!   (tables, HTML blocks, footnote definitions) — the same conservative
+//!   set `setHeading` refuses, since a checkbox on a heading or inside a
+//!   fence is exactly as nonsensical as a hash run would be there.
+//!
+//! Selection after a promotion maps the ORIGINAL `pos` forward through the
+//! inserted text ([`mapping::Bias::After`]): the insertion always lands
+//! at/before `pos`, so the character immediately after the cursor is
+//! unchanged — the cursor stays glued to its content, now shifted right by
+//! the inserted marker/checkbox bytes, rather than ending up stranded
+//! mid-syntax between the new marker and the new checkbox.
 //!
 //! ## indentList / outdentList
 //!
@@ -699,6 +754,17 @@ fn strip_spans(kind: InlineKind, src: &SrcBytes, node: &Node) -> (Range<usize>, 
     }
 }
 
+/// The ATX level (1..=6) of an overlay `Heading` node, or `None` for any
+/// other node kind — a small typed accessor so `set_heading`'s same-level
+/// toggle-back check (v0.5) reads the parsed level rather than re-deriving
+/// it from delimiter bytes.
+fn existing_level(node: &Node) -> Option<u8> {
+    match node.kind {
+        NodeKind::Heading(level) => Some(level),
+        _ => None,
+    }
+}
+
 pub fn set_heading(
     nodes: &[Node],
     src: &SrcBytes,
@@ -773,9 +839,16 @@ pub fn set_heading(
 
     let batch = match (existing, level) {
         (None, 0) => return None, // nothing to remove
-        (Some(node), 0) => {
-            // Level 0 deletes ALL delimiter spans — an ATX closing hash run
-            // included (`"# foo #"` → `"foo"`, not `"foo #"`). Delimiter
+        (Some(node), n) if n == 0 || Some(n) == existing_level(node) => {
+            // Level 0 deletes ALL delimiter spans unconditionally — an ATX
+            // closing hash run included (`"# foo #"` → `"foo"`, not
+            // `"foo #"`). A press at the line's CURRENT level (v0.5
+            // amendment) toggles back to a paragraph the SAME way: an
+            // idempotent H2 press clears the heading instead of no-op'ing,
+            // matching the toolbar's Obsidian-parity expectation. Compared
+            // via the parsed `Heading` node's own level, not a
+            // byte-identical prefix match — an irregular `"##  x"` (extra
+            // inner space) still counts as "already level 2". Delimiter
             // spans are position-ordered (opening run first), so the batch
             // is ascending as the apply path requires.
             node.delims.iter().map(del).collect()
@@ -783,9 +856,6 @@ pub fn set_heading(
         (Some(node), n) => {
             let d = node.delims[0].clone();
             let prefix = format!("{} ", "#".repeat(n as usize));
-            if src.slice_eq(d.start..d.end, &prefix) {
-                return None; // already at this level, byte-identically
-            }
             vec![ByteSplice {
                 at: d.start,
                 delete: d.end - d.start,
@@ -817,22 +887,86 @@ pub fn set_heading(
     })
 }
 
-pub fn toggle_task(nodes: &[Node], doc_len: usize, pos_b: usize) -> Option<CommandPlan> {
-    let widget = nodes.iter().rfind(|n| {
+pub fn toggle_task(
+    nodes: &[Node],
+    src: &SrcBytes,
+    block_kind: Option<BlockKind>,
+    doc_len: usize,
+    pos_b: usize,
+) -> Option<CommandPlan> {
+    // Flip: `pos` anywhere inside an EXISTING task item's full extent
+    // (multi-line items included — the contract's "pos anywhere in the list
+    // item" guarantee is pinned to this path).
+    if let Some(widget) = nodes.iter().rfind(|n| {
         matches!(n.kind, NodeKind::TaskWidget { .. })
             && n.item_extent.as_ref().is_some_and(|item| {
                 item.start <= pos_b
                     && (pos_b < item.end || (pos_b == item.end && item.end == doc_len))
             })
-    })?;
-    let checked = matches!(widget.kind, NodeKind::TaskWidget { checked: true });
+    }) {
+        let checked = matches!(widget.kind, NodeKind::TaskWidget { checked: true });
+        return Some(CommandPlan {
+            batch: vec![ByteSplice {
+                at: widget.extent.start + 1,
+                delete: 1,
+                insert: if checked { " " } else { "x" }.into(),
+            }],
+            selection: None, // 1-for-1 byte swap: the view's cursor is unaffected
+        });
+    }
+
+    // Promote (v0.5 amendment, see the module doc comment's "## toggleTask"
+    // section for the full rationale): `pos` didn't resolve inside any
+    // existing task item above, so try to turn the LINE containing it into
+    // one instead of refusing.
+    let line = line_containing(src, pos_b);
+
+    // A non-task list item (bullet or ordered, any depth, any quote depth):
+    // insert `"[ ] "` right after the marker token. `line_marker` locates
+    // the marker's own glyph start exactly like `indentList`/`outdentList`
+    // do; `scan_marker` (the crate's one marker lexer) then classifies its
+    // trailing whitespace so the checkbox lands after the required space
+    // when one exists, or brings its own so the result is still valid GFM
+    // task syntax when the item is empty (`"-"` → `"- [ ] "`, not the
+    // unrecognized `"-[ ] "`).
+    if let Some((item_start, _)) = line_marker(nodes, src, &line) {
+        let shape = parser::scan_marker(|i| src.get(i), item_start)?;
+        let (at, insert) = if shape.has_trailing_space {
+            (shape.glyph_end + 1, "[ ] ".to_string())
+        } else {
+            (shape.glyph_end, " [ ] ".to_string())
+        };
+        let batch = vec![ins(at, insert)];
+        let cursor = mapping::map_pos(pos_b, &batch, Bias::After);
+        return Some(CommandPlan {
+            batch,
+            selection: Some((cursor, cursor)),
+        });
+    }
+
+    // Otherwise: a plain paragraph/blockquote-content line, or a blank one
+    // (including an empty quote line, `">"`), promotes with a fresh
+    // `"- [ ] "` marker — same block-kind gate as `setHeading` (Paragraph or
+    // BlockQuote; `None` covers a blockless blank line between blocks), PLUS
+    // an explicit blank-line allowance `setHeading` does NOT have: a blank
+    // line always promotes (Obsidian does; a toolbar button that sometimes
+    // silently no-ops on an empty line is worse than a predictable empty
+    // task item). Headings, fenced/indented code, thematic breaks, and any
+    // other block kind (tables, HTML blocks, footnote definitions, or a
+    // continuation line inside some OTHER list item) fall through to `None`
+    // — a checkbox makes no sense there, same as `setHeading`'s hash run.
+    let (_, quote_end) = quote_context(nodes, line.start);
+    let blank = is_blank(src, quote_end..line.end);
+    let applies = matches!(block_kind, Some(BlockKind::Paragraph) | Some(BlockKind::BlockQuote))
+        || (blank && block_kind.is_none());
+    if !applies {
+        return None;
+    }
+    let batch = vec![ins(quote_end, "- [ ] ".to_string())];
+    let cursor = mapping::map_pos(pos_b, &batch, Bias::After);
     Some(CommandPlan {
-        batch: vec![ByteSplice {
-            at: widget.extent.start + 1,
-            delete: 1,
-            insert: if checked { " " } else { "x" }.into(),
-        }],
-        selection: None, // 1-for-1 byte swap: the view's cursor is unaffected
+        batch,
+        selection: Some((cursor, cursor)),
     })
 }
 

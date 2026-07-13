@@ -1243,17 +1243,17 @@ function commandKeymap(core: OxidownCore): Extension {
  *   hotkey — research/07 §1.6 — and unconditionally eats the browser's own
  *   Cmd/Ctrl-L location-bar shortcut, applicable or not).
  *
- * **toggleTask on a non-task list item (v1 punt, documented here since it's
- * an easy Obsidian-parity assumption to get wrong):** Obsidian's "Toggle
- * checkbox status" run on a plain bullet CONVERTS it into a task item
- * (research/07 §1.6). Oxidown's core does not do this in v1 — `toggle_task`
- * (crates/oxidown-core/src/commands.rs) only flips an EXISTING `[ ]`/`[x]`
- * widget; a plain bullet (or any non-list-item line) has no such widget, so
- * the command returns `null` and both bindings above no-op (falling through
- * for Mod-Shift-Enter; silently consumed for Mod-L, per its own
- * preventDefault note). Bullet-to-task promotion is a reasonable future
- * addition but is out of scope here — it would be a core-side change, not a
- * view-side one.
+ * **toggleTask on a non-task target (v0.5, Obsidian parity):** Obsidian's
+ * "Toggle checkbox status" run on a plain bullet CONVERTS it into a task
+ * item (research/07 §1.6) rather than no-op'ing, and `toggle_task`
+ * (crates/oxidown-core/src/commands.rs) now matches — see the module doc
+ * comment's "## toggleTask" section there, and docs/boundary-v0.md's
+ * `toggleTask` (v0.5 amendment) entry, for the exact promotion rules (a
+ * non-task list item, a plain paragraph/blockquote line, or a blank line
+ * all promote; headings/fences/hr stay `null`). Both bindings above need NO
+ * changes for this — they already forward whatever `core.command("toggleTask",
+ * pos)` returns, so a promotion CoreChange applies through the exact same
+ * `applyCoreChange` path a flip does.
  *
  * Exported standalone so it can be composed elsewhere; included in
  * `oxidown()` by default.

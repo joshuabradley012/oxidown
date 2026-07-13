@@ -361,6 +361,18 @@ impl Editor {
         Ok(byte)
     }
 
+    /// The top-level [`BlockKind`] covering the line starting at
+    /// `line_start`, or `None` for a blank separator line no block spans —
+    /// shared by `setHeading` and `toggleTask`'s promotion path, both of
+    /// which gate on the SAME line-level block classification.
+    fn block_kind_at_line(&self, line_start: usize) -> Option<parser::BlockKind> {
+        self.block_index
+            .blocks()
+            .iter()
+            .find(|b| b.span.start <= line_start && line_start < b.span.end)
+            .map(|b| b.kind)
+    }
+
     fn check_crlf_split(&self, pos: usize, byte: usize) -> Result<(), CoreError> {
         if byte > 0
             && self.text.byte_at(byte) == Some(b'\n')
@@ -410,17 +422,14 @@ impl Editor {
                 }
                 let pos_b = self.command_pos_floor(pos)?;
                 let line = self.text.line_range_at(pos_b);
-                let block_kind = self
-                    .block_index
-                    .blocks()
-                    .iter()
-                    .find(|b| b.span.start <= line.start && line.start < b.span.end)
-                    .map(|b| b.kind);
+                let block_kind = self.block_kind_at_line(line.start);
                 commands::set_heading(&self.overlay, &src, block_kind, line, pos_b, level)
             }
             Command::ToggleTask { pos } => {
                 let pos_b = self.command_pos_floor(pos)?;
-                commands::toggle_task(&self.overlay, self.text.len_bytes(), pos_b)
+                let line = self.text.line_range_at(pos_b);
+                let block_kind = self.block_kind_at_line(line.start);
+                commands::toggle_task(&self.overlay, &src, block_kind, self.text.len_bytes(), pos_b)
             }
             Command::IndentList { from, to } | Command::OutdentList { from, to } => {
                 let a = self.command_pos(from)?;

@@ -90,19 +90,22 @@ fn assert_enter_itemness(before: &str, after: &str, splices: &[Splice], from: us
 /// Run a command and verify the returned splices transform the mirror into
 /// the core's text (the "splices are what the VIEW needs" requirement).
 ///
-/// For indentList/outdentList this additionally asserts the WHOLE-DOCUMENT
-/// itemness invariant — the acceptance bar for the paragraph-interruption
-/// guards: every line that parsed as a list item BEFORE the command still
-/// parses as a list item AFTER it (marker digits may differ; itemness may
-/// not). Neither command adds or removes lines, so line indices correspond.
+/// For indentList/outdentList/toggleTask this additionally asserts the
+/// WHOLE-DOCUMENT itemness invariant — for indent/outdent it's the
+/// acceptance bar for the paragraph-interruption guards (every line that
+/// parsed as a list item BEFORE the command still parses as one AFTER it;
+/// marker digits may differ, itemness may not); for toggleTask (v0.5
+/// promotion) it's the corresponding "promotions only ADD itemness" bar —
+/// no line that was already an item loses it. None of the three commands
+/// add or remove PHYSICAL LINES, so line indices correspond before/after.
 fn run(ed: &mut Editor, cmd: Command) -> Option<CoreChange> {
     let before_text = ed.get_text();
     let mut mirror = before_text.clone();
-    let is_nest = matches!(
+    let checks_itemness = matches!(
         cmd,
-        Command::IndentList { .. } | Command::OutdentList { .. }
+        Command::IndentList { .. } | Command::OutdentList { .. } | Command::ToggleTask { .. }
     );
-    let items_before = is_nest.then(|| item_line_indices(&mirror));
+    let items_before = checks_itemness.then(|| item_line_indices(&mirror));
     let change = ed.command(cmd).unwrap()?;
     apply_to_mirror(&mut mirror, &change.splices);
     assert_eq!(
@@ -714,12 +717,45 @@ fn set_heading_zero_removes_prefix() {
 }
 
 #[test]
-fn set_heading_same_level_is_noop_null() {
+fn set_heading_same_level_toggles_back_to_paragraph() {
+    // Bug 2 (v0.5 amendment): pressing the SAME heading level again removes
+    // the heading instead of no-op'ing, exactly like level 0 — an idempotent
+    // toolbar press, matching Obsidian's toggle behavior.
+    for level in 1u8..=6 {
+        let prefix = "#".repeat(level as usize);
+        let doc = format!("{prefix} title\n");
+        let mut ed = Editor::new(1);
+        ed.load(&doc);
+        let pos = prefix.len() + 1; // inside "title"
+        run(&mut ed, Command::SetHeading { pos, level }).unwrap();
+        assert_eq!(ed.get_text(), "title\n", "level {level}");
+    }
+}
+
+#[test]
+fn set_heading_same_level_toggle_is_irregular_whitespace_tolerant() {
+    // The same-level comparison reads the parsed `Heading` node's own level,
+    // not a byte-identical prefix match — an irregular "##  x" (extra inner
+    // space, only the FIRST of which is the delimiter's required space)
+    // still counts as "already level 2" and toggles back (the delimiter
+    // span itself — "## " — is removed; the extra space is content, same as
+    // the pre-existing level-0 removal path, and stays).
+    let mut ed = Editor::new(1);
+    ed.load("##  x\n");
+    run(&mut ed, Command::SetHeading { pos: 4, level: 2 }).unwrap();
+    assert_eq!(ed.get_text(), " x\n");
+}
+
+#[test]
+fn set_heading_different_level_still_replaces_not_toggles() {
+    // Control: a DIFFERENT level always replaces the prefix (never treated
+    // as a toggle-back), same as before this change.
     let mut ed = Editor::new(1);
     ed.load("## title\n");
     let rev = ed.revision();
-    assert!(ed.command(Command::SetHeading { pos: 4, level: 2 }).unwrap().is_none());
-    assert_eq!(ed.revision(), rev, "no-op must not burn a revision");
+    run(&mut ed, Command::SetHeading { pos: 4, level: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "### title\n");
+    assert_ne!(ed.revision(), rev);
 }
 
 #[test]
@@ -915,12 +951,113 @@ fn toggle_task_capital_x_unchecks() {
     assert_eq!(ed.get_text(), "- [ ] done\n");
 }
 
+// ------------------------------------------------- toggleTask promotion --
+// Bug 1 (v0.5 amendment): toggleTask on a non-task target now PROMOTES
+// instead of refusing (Obsidian parity, research/07 §1.6). `run()` also
+// asserts the whole-doc itemness invariant for every case here — a
+// promotion may ADD itemness to the target line, but must never cost any
+// OTHER line its own.
+
 #[test]
-fn toggle_task_outside_any_task_is_null() {
+fn toggle_task_promotes_a_plain_bullet_and_ordered_item() {
     let mut ed = Editor::new(1);
-    ed.load("- plain item\n\nparagraph\n");
-    assert!(ed.command(Command::ToggleTask { pos: 3 }).unwrap().is_none());
-    assert!(ed.command(Command::ToggleTask { pos: 16 }).unwrap().is_none());
+    ed.load("- plain item\n");
+    run(&mut ed, Command::ToggleTask { pos: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] plain item\n");
+
+    let mut ed = Editor::new(1);
+    ed.load("1. plain item\n");
+    run(&mut ed, Command::ToggleTask { pos: 4 }).unwrap();
+    assert_eq!(ed.get_text(), "1. [ ] plain item\n");
+}
+
+#[test]
+fn toggle_task_promotes_a_nested_bullet_without_disturbing_the_parent() {
+    let mut ed = Editor::new(1);
+    ed.load("- parent\n  - child\n");
+    run(&mut ed, Command::ToggleTask { pos: 14 }).unwrap();
+    assert_eq!(ed.get_text(), "- parent\n  - [ ] child\n");
+}
+
+#[test]
+fn toggle_task_promotes_a_quoted_bullet() {
+    let mut ed = Editor::new(1);
+    ed.load("> - item\n");
+    run(&mut ed, Command::ToggleTask { pos: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "> - [ ] item\n");
+}
+
+#[test]
+fn toggle_task_promotes_a_plain_paragraph() {
+    let mut ed = Editor::new(1);
+    ed.load("paragraph\n");
+    run(&mut ed, Command::ToggleTask { pos: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] paragraph\n");
+}
+
+#[test]
+fn toggle_task_promotes_a_quoted_paragraph_preserving_the_prefix() {
+    let mut ed = Editor::new(1);
+    ed.load("> quoted text\n");
+    run(&mut ed, Command::ToggleTask { pos: 5 }).unwrap();
+    assert_eq!(ed.get_text(), "> - [ ] quoted text\n");
+}
+
+#[test]
+fn toggle_task_promotes_a_blank_line() {
+    // Obsidian promotes a blank line rather than no-op'ing — more permissive
+    // than setHeading's own blank-line refusal (deliberate, v0.5).
+    let mut ed = Editor::new(1);
+    ed.load("a\n\nb\n");
+    run(&mut ed, Command::ToggleTask { pos: 2 }).unwrap();
+    assert_eq!(ed.get_text(), "a\n- [ ] \nb\n");
+}
+
+#[test]
+fn toggle_task_promotes_an_empty_document() {
+    let mut ed = Editor::new(1);
+    ed.load("");
+    run(&mut ed, Command::ToggleTask { pos: 0 }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] ");
+}
+
+#[test]
+fn toggle_task_still_null_on_heading_fence_and_hr() {
+    for (doc, pos) in [("# heading\n", 3usize), ("```\ncode\n```\n", 5), ("---\n", 1)] {
+        let mut ed = Editor::new(1);
+        ed.load(doc);
+        let rev = ed.revision();
+        assert!(
+            ed.command(Command::ToggleTask { pos }).unwrap().is_none(),
+            "{doc:?}"
+        );
+        assert_eq!(ed.get_text(), doc, "no mutation for {doc:?}");
+        assert_eq!(ed.revision(), rev, "no revision bump for {doc:?}");
+    }
+}
+
+#[test]
+fn toggle_task_promotion_is_a_single_undo_unit() {
+    let mut ed = Editor::new(1);
+    ed.load("- plain item\n");
+    run(&mut ed, Command::ToggleTask { pos: 3 }).unwrap();
+    assert_eq!(ed.get_text(), "- [ ] plain item\n");
+    ed.undo().unwrap();
+    assert_eq!(ed.get_text(), "- plain item\n", "undo restores the plain bullet in one step");
+}
+
+#[test]
+fn toggle_task_promotion_maps_selection_to_stay_with_its_character() {
+    // Bias::After: the insertion always lands at/before `pos`, so the
+    // character immediately after the (collapsed) cursor is unchanged —
+    // typing right where the user clicked still lands in "item", not
+    // stranded between the new marker and the new checkbox.
+    let mut ed = Editor::new(1);
+    ed.load("- item\n");
+    let change = ed.command(Command::ToggleTask { pos: 2 }).unwrap().unwrap();
+    assert_eq!(ed.get_text(), "- [ ] item\n");
+    let sel = change.selection.unwrap();
+    assert_eq!((sel.anchor, sel.head), (6, 6), "cursor lands right before \"item\"");
 }
 
 #[test]

@@ -1142,7 +1142,10 @@ describe("Mod-L / Ctrl-L keymap (Obsidian-parity toggleTask + browser shortcut c
     view.destroy();
   });
 
-  it("does nothing on a plain bullet — documented v1 behavior: no bullet-to-task promotion (wasm)", async () => {
+  it("promotes a plain bullet into a task, then flips it on a second press (v0.5, Obsidian parity) (wasm)", async () => {
+    // Bug 1 / v0.5: toggleTask used to refuse (null) here — the checkbox
+    // button/keybinding did nothing on a non-task line. It now promotes,
+    // matching Obsidian's "Toggle checkbox status".
     const core = makeWasmCore();
     const doc = "- plain bullet\nelsewhere";
     const view = makeView(doc, core);
@@ -1151,8 +1154,31 @@ describe("Mod-L / Ctrl-L keymap (Obsidian-parity toggleTask + browser shortcut c
     view.contentDOM.dispatchEvent(modLKey());
     await flush();
 
-    expect(view.state.doc.toString()).toBe(doc);
-    expect(core.getText()).toBe(doc);
+    expect(view.state.doc.toString()).toBe("- [ ] plain bullet\nelsewhere");
+    expect(core.getText()).toBe(view.state.doc.toString());
+
+    // The promoted line is now a real task item: the second press FLIPS it,
+    // exactly like the pre-existing flip path.
+    view.contentDOM.dispatchEvent(modLKey());
+    await flush();
+    expect(view.state.doc.toString()).toBe("- [x] plain bullet\nelsewhere");
+    view.destroy();
+  });
+
+  it("promotes a plain paragraph into a task end-to-end through the keymap — toolbar-path parity (v0.5) (wasm)", async () => {
+    // Drives the SAME core.command('toggleTask', pos) → applyCoreChange path
+    // the toolbar's checkbox button uses (apps/web-demo/src/main.ts
+    // runToggleTaskBtn), just via the Mod-L keybinding instead of a click.
+    const core = makeWasmCore();
+    const doc = "plain paragraph";
+    const view = makeView(doc, core);
+    view.dispatch({ selection: { anchor: 3 } });
+
+    view.contentDOM.dispatchEvent(modLKey());
+    await flush();
+
+    expect(view.state.doc.toString()).toBe("- [ ] plain paragraph");
+    expect(core.getText()).toBe(view.state.doc.toString());
     view.destroy();
   });
 });

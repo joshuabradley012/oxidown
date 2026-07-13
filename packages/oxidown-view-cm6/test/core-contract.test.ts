@@ -987,14 +987,18 @@ describe("core command (v0.2)", () => {
     expect(core.getText()).toBe("hello world");
   });
 
-  it("setHeading sets, no-ops when already at the level, and clears back to a paragraph", () => {
+  it("setHeading sets, toggles back to a paragraph on a same-level press, and level 0 clears", () => {
     const { core } = makeCore("Title\n\ntail");
     const c1 = core.command("setHeading", 2, 2);
     expect(c1).not.toBeNull();
     expect(core.getText()).toBe("## Title\n\ntail");
-    expect(core.command("setHeading", 2, 2)).toBeNull(); // already level 2: no-op
-    core.command("setHeading", 2, 0);
+    // Bug 2 / v0.5: a press at the CURRENT level toggles back to a
+    // paragraph instead of no-op'ing (toolbar idempotence).
+    const c2 = core.command("setHeading", 2, 2);
+    expect(c2).not.toBeNull();
     expect(core.getText()).toBe("Title\n\ntail");
+    // level 0 on a plain paragraph is still a no-op null.
+    expect(core.command("setHeading", 2, 0)).toBeNull();
   });
 
   it("toggleTask flips the checkbox in place and is idempotent", () => {
@@ -1006,9 +1010,15 @@ describe("core command (v0.2)", () => {
     expect(core.getText()).toBe("- [ ] buy milk");
   });
 
-  it("toggleTask returns null when not inside a task item", () => {
+  it("toggleTask promotes a plain paragraph into a task instead of refusing (v0.5, Obsidian parity)", () => {
     const { core } = makeCore("plain paragraph");
-    expect(core.command("toggleTask", 3)).toBeNull();
+    const c1 = core.command("toggleTask", 3);
+    expect(c1).not.toBeNull();
+    expect(core.getText()).toBe("- [ ] plain paragraph");
+    // And the promoted item now flips like any other task.
+    const c2 = core.command("toggleTask", 3 + "- [ ] ".length);
+    expect(c2).not.toBeNull();
+    expect(core.getText()).toBe("- [x] plain paragraph");
   });
 
   it("an unknown command name THROWS InvalidCommand, never null", () => {
